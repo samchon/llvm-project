@@ -34,6 +34,8 @@ void BackgroundQueue::work(std::function<void()> OnIdle) {
       std::pop_heap(Queue.begin(), Queue.end());
       Task = std::move(Queue.back());
       Queue.pop_back();
+      if (Task->Key)
+        ActiveKeys.insert(Task->Key);
       notifyProgress();
     }
 
@@ -47,6 +49,21 @@ void BackgroundQueue::work(std::function<void()> OnIdle) {
     {
       std::unique_lock<std::mutex> Lock(Mu);
       ++Stat.Completed;
+      if (Task->Key)
+        ActiveKeys.erase(Task->Key);
+      if (Task->Key && Task->Repeatable) {
+        SeenKeys.erase(Task->Key);
+        auto Deferred = DeferredRepeats.find(Task->Key);
+        if (Deferred != DeferredRepeats.end()) {
+          BackgroundQueue::Task Next = std::move(Deferred->second);
+          DeferredRepeats.erase(Deferred);
+          if (adjust(Next)) {
+            Queue.push_back(std::move(Next));
+            std::push_heap(Queue.begin(), Queue.end());
+            ++Stat.Enqueued;
+          }
+        }
+      }
       if (Stat.Active == 1 && Queue.empty()) {
         // We just finished the last item, the queue is going idle.
         assert(ShouldStop || Stat.Completed == Stat.Enqueued);
@@ -75,13 +92,14 @@ void BackgroundQueue::stop() {
 
 // Tweaks the priority of a newly-enqueued task, or returns false to cancel it.
 bool BackgroundQueue::adjust(Task &T) {
-  // It is tempting to drop duplicates of queued tasks, and merely deprioritize
-  // duplicates of completed tasks (i.e. reindexing on CDB changes). But:
-  //  - the background indexer doesn't support reindexing well, e.g. staleness
-  //    is checked at *enqueue* time only, and doesn't account for compile flags
-  //  - reindexing on compile flags is often a poor use of CPU in practice
-  if (T.Key && !SeenKeys.insert(T.Key).second)
+  // Non-repeatable tasks preserve the historical once-per-process behavior.
+  // Repeatable graph-index work is released after it runs. A source/CDB event
+  // received while it is active is retained as one coalesced rerun.
+  if (T.Key && !SeenKeys.insert(T.Key).second) {
+    if (T.Repeatable && ActiveKeys.contains(T.Key))
+      DeferredRepeats.insert_or_assign(T.Key, std::move(T));
     return false;
+  }
   T.QueuePri = std::max(T.QueuePri, Boosts.lookup(T.Tag));
   return true;
 }

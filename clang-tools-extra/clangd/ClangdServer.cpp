@@ -938,8 +938,20 @@ void ClangdServer::outgoingCalls(
 }
 
 void ClangdServer::onFileEvent(const DidChangeWatchedFilesParams &Params) {
-  // FIXME: Do nothing for now. This will be used for indexing and potentially
-  // invalidating other caches.
+  if (!BackgroundIdx)
+    return;
+  std::vector<std::string> ChangedFiles;
+  ChangedFiles.reserve(Params.changes.size());
+  for (const auto &Change : Params.changes)
+    ChangedFiles.push_back(Change.uri.file().str());
+  BackgroundIdx->enqueueGraphDependents(ChangedFiles);
+}
+
+void ClangdServer::graphSnapshot(const GraphSnapshotParams &Params,
+                                 Callback<llvm::json::Value> CB) const {
+  if (!BackgroundIdx)
+    return CB(error("samchon/graphSnapshot requires background indexing"));
+  CB(BackgroundIdx->graphSnapshot(Params));
 }
 
 void ClangdServer::workspaceSymbols(

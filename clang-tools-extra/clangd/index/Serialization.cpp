@@ -457,7 +457,7 @@ readCompileCommand(Reader CmdReader, llvm::ArrayRef<llvm::StringRef> Strings) {
 // The current versioning scheme is simple - non-current versions are rejected.
 // If you make a breaking change, bump this version number to invalidate stored
 // data. Later we may want to support some backward compatibility.
-constexpr static uint32_t Version = 20;
+constexpr static uint32_t Version = 21;
 
 llvm::Expected<IndexFileIn> readRIFF(llvm::StringRef Data,
                                      SymbolOrigin Origin) {
@@ -546,6 +546,15 @@ llvm::Expected<IndexFileIn> readRIFF(llvm::StringRef Data,
     Result.Cmd->CommandLine.reserve(Cmd.CommandLine.size());
     for (llvm::StringRef C : Cmd.CommandLine)
       Result.Cmd->CommandLine.emplace_back(C);
+  }
+  if (Chunks.count("grph")) {
+    auto Parsed = llvm::json::parse(Chunks.lookup("grph"));
+    if (!Parsed)
+      return error("malformed graph section: {0}", Parsed.takeError());
+    llvm::json::Path::Root Root("GraphTU");
+    if (!fromJSON(*Parsed, Result.Graphs, Root))
+      return error("malformed graph section: {0}",
+                   llvm::toString(Root.getError()));
   }
   return std::move(Result);
 }
@@ -667,6 +676,17 @@ void writeRIFF(const IndexFileOut &Data, llvm::raw_ostream &OS) {
       writeCompileCommand(InternedCmd, Strings, CmdOS);
     }
     RIFF.Chunks.push_back({riff::fourCC("cmdl"), CmdlSection});
+  }
+
+  std::string GraphSection;
+  if (Data.Graphs) {
+    llvm::raw_string_ostream GraphOS(GraphSection);
+    llvm::json::Array Graphs;
+    Graphs.reserve(Data.Graphs->size());
+    for (const auto &Graph : *Data.Graphs)
+      Graphs.push_back(toJSON(Graph));
+    GraphOS << llvm::json::Value(std::move(Graphs));
+    RIFF.Chunks.push_back({riff::fourCC("grph"), GraphSection});
   }
 
   OS << RIFF;

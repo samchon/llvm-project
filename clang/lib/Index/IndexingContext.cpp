@@ -371,9 +371,11 @@ bool IndexingContext::handleDeclOccurrence(const Decl *D, SourceLocation Loc,
                                            const Expr *OrigE,
                                            const Decl *OrigD,
                                            const DeclContext *ContainerDC) {
-  if (D->isImplicit() && !isa<ObjCMethodDecl>(D))
+  if (D->isImplicit() && !isa<ObjCMethodDecl>(D) &&
+      !DataConsumer.shouldIndexImplicitSymbols())
     return true;
-  if (!isa<NamedDecl>(D) || shouldSkipNamelessDecl(cast<NamedDecl>(D)))
+  if (!isa<NamedDecl>(D) || (shouldSkipNamelessDecl(cast<NamedDecl>(D)) &&
+                             !DataConsumer.shouldIndexUnnamedSymbols()))
     return true;
 
   SourceManager &SM = Ctx->getSourceManager();

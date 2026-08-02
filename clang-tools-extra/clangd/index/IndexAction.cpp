@@ -44,8 +44,9 @@ std::optional<std::string> toURI(OptionalFileEntryRef File) {
 // self edges.
 struct IncludeGraphCollector : public PPCallbacks {
 public:
-  IncludeGraphCollector(const SourceManager &SM, IncludeGraph &IG)
-      : SM(SM), IG(IG) {}
+  IncludeGraphCollector(const SourceManager &SM, IncludeGraph &IG,
+                        SymbolCollector *Collector)
+      : SM(SM), IG(IG), Collector(Collector) {}
 
   // Populates everything except direct includes for a node, which represents
   // edges in the include graph and populated in inclusion directive.
@@ -81,6 +82,7 @@ public:
     if (FileID == SM.getMainFileID())
       Node.Flags |= IncludeGraphNode::SourceFlag::IsTU;
     Node.URI = I->getKey();
+    Collector->recordGraphSource(FileID, Node.URI, Node.Flags);
   }
 
   // Add edges from including files to includes.
@@ -103,6 +105,8 @@ public:
     auto NodeForIncluding = IG.try_emplace(*IncludingURI);
 
     NodeForIncluding.first->getValue().DirectIncludes.push_back(NodeForInclude);
+    Collector->recordGraphInclude(HashLoc, FileName, IsAngled, File,
+                                  ModuleImported);
   }
 
   // Sanity check to ensure we have already populated a skipped file.
@@ -122,6 +126,7 @@ public:
 private:
   const SourceManager &SM;
   IncludeGraph &IG;
+  SymbolCollector *Collector;
 };
 
 // Wraps the index action and reports index data after each translation unit.
@@ -133,11 +138,13 @@ public:
               std::function<void(SymbolSlab)> SymbolsCallback,
               std::function<void(RefSlab)> RefsCallback,
               std::function<void(RelationSlab)> RelationsCallback,
-              std::function<void(IncludeGraph)> IncludeGraphCallback)
+              std::function<void(IncludeGraph)> IncludeGraphCallback,
+              std::function<void(GraphTU)> GraphCallback)
       : SymbolsCallback(SymbolsCallback), RefsCallback(RefsCallback),
         RelationsCallback(RelationsCallback),
-        IncludeGraphCallback(IncludeGraphCallback), Collector(C),
-        PI(std::move(PI)), Opts(Opts) {
+        IncludeGraphCallback(IncludeGraphCallback),
+        GraphCallback(GraphCallback), Collector(C), PI(std::move(PI)),
+        Opts(Opts) {
     this->Opts.ShouldTraverseDecl = [this](const Decl *D) {
       // Many operations performed during indexing is linear in terms of depth
       // of the decl (USR generation, name lookups, figuring out role of a
@@ -163,7 +170,8 @@ public:
     PI->record(CI.getPreprocessor());
     if (IncludeGraphCallback != nullptr)
       CI.getPreprocessor().addPPCallbacks(
-          std::make_unique<IncludeGraphCollector>(CI.getSourceManager(), IG));
+          std::make_unique<IncludeGraphCollector>(CI.getSourceManager(), IG,
+                                                  Collector.get()));
 
     return index::createIndexingASTConsumer(Collector, Opts,
                                             CI.getPreprocessorPtr());
@@ -184,12 +192,19 @@ public:
     return true;
   }
 
+  bool BeginSourceFileAction(CompilerInstance &CI) override {
+    Collector->initializeGraphCompilation(CI);
+    return true;
+  }
+
   void EndSourceFileAction() override {
     SymbolsCallback(Collector->takeSymbols());
     if (RefsCallback != nullptr)
       RefsCallback(Collector->takeRefs());
     if (RelationsCallback != nullptr)
       RelationsCallback(Collector->takeRelations());
+    if (GraphCallback != nullptr)
+      GraphCallback(Collector->takeGraph());
     if (IncludeGraphCallback != nullptr) {
 #ifndef NDEBUG
       // This checks if all nodes are initialized.
@@ -205,6 +220,7 @@ private:
   std::function<void(RefSlab)> RefsCallback;
   std::function<void(RelationSlab)> RelationsCallback;
   std::function<void(IncludeGraph)> IncludeGraphCallback;
+  std::function<void(GraphTU)> GraphCallback;
   std::shared_ptr<SymbolCollector> Collector;
   std::unique_ptr<include_cleaner::PragmaIncludes> PI;
   index::IndexingOptions Opts;
@@ -218,12 +234,18 @@ std::unique_ptr<FrontendAction> createStaticIndexingAction(
     std::function<void(SymbolSlab)> SymbolsCallback,
     std::function<void(RefSlab)> RefsCallback,
     std::function<void(RelationSlab)> RelationsCallback,
-    std::function<void(IncludeGraph)> IncludeGraphCallback) {
+    std::function<void(IncludeGraph)> IncludeGraphCallback,
+    std::function<void(GraphTU)> GraphCallback) {
   index::IndexingOptions IndexOpts;
   IndexOpts.SystemSymbolFilter =
       index::IndexingOptions::SystemSymbolFilterKind::All;
   // We index function-local classes and its member functions only.
   IndexOpts.IndexFunctionLocals = true;
+  if (Opts.CollectGraph) {
+    IndexOpts.IndexImplicitInstantiation = true;
+    IndexOpts.IndexParametersInDeclarations = true;
+    IndexOpts.IndexTemplateParameters = true;
+  }
   // We need to delay indexing so instantiations of function bodies become
   // available, this is so we can find constructor calls through `make_unique`.
   IndexOpts.DeferIndexingToEndOfTranslationUnit = true;
@@ -237,10 +259,10 @@ std::unique_ptr<FrontendAction> createStaticIndexingAction(
   }
   auto PragmaIncludes = std::make_unique<include_cleaner::PragmaIncludes>();
   Opts.PragmaIncludes = PragmaIncludes.get();
-  return std::make_unique<IndexAction>(std::make_shared<SymbolCollector>(Opts),
-                                       std::move(PragmaIncludes), IndexOpts,
-                                       SymbolsCallback, RefsCallback,
-                                       RelationsCallback, IncludeGraphCallback);
+  return std::make_unique<IndexAction>(
+      std::make_shared<SymbolCollector>(Opts), std::move(PragmaIncludes),
+      IndexOpts, SymbolsCallback, RefsCallback, RelationsCallback,
+      IncludeGraphCallback, GraphCallback);
 }
 
 } // namespace clangd

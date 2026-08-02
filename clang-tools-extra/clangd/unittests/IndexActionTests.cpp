@@ -89,7 +89,8 @@ public:
         Opts, [&](SymbolSlab S) { IndexFile.Symbols = std::move(S); },
         [&](RefSlab R) { IndexFile.Refs = std::move(R); },
         [&](RelationSlab R) { IndexFile.Relations = std::move(R); },
-        [&](IncludeGraph IG) { IndexFile.Sources = std::move(IG); });
+        [&](IncludeGraph IG) { IndexFile.Sources = std::move(IG); },
+        [&](GraphTU Graph) { IndexFile.Graphs.push_back(std::move(Graph)); });
 
     std::vector<std::string> Args = {"index_action", "-fsyntax-only",
                                      "-xc++",        "-std=c++11",
@@ -145,6 +146,93 @@ TEST_F(IndexActionTest, CollectIncludeGraph) {
                   Pair(toUri(Level2HeaderPath),
                        AllOf(Not(isTU()), includesAre({}),
                              hasDigest(digest(Level2HeaderCode))))));
+}
+
+TEST_F(IndexActionTest, CollectCompleteGraphFacts) {
+  Opts.CollectGraph = true;
+  const std::string Header = testPath("graph.h");
+  const std::string Main = testPath("graph.cpp");
+  addFile(Header, R"cpp(
+#define GRAPH_WRAP(x) x
+struct Base { virtual void run(); };
+struct Derived : Base { void run() override; };
+)cpp");
+  addFile(Main, R"cpp(
+#include "graph.h"
+static int hidden;
+void Derived::run() { int local = GRAPH_WRAP(hidden); }
+Derived make() { return Derived{}; }
+)cpp");
+
+  IndexFileIn Indexed = runIndexingAction(Main);
+  ASSERT_EQ(1u, Indexed.Graphs.size());
+  const GraphTU &Graph = Indexed.Graphs.front();
+  EXPECT_EQ("cpp", Graph.Language);
+  EXPECT_EQ(toUri(Main), Graph.MainFileURI);
+  EXPECT_EQ(2u, Graph.Sources.size());
+  EXPECT_THAT(
+      Graph.Includes,
+      Contains(AllOf(testing::Field(&GraphInclude::SourceURI, toUri(Main)),
+                     testing::Field(&GraphInclude::TargetURI, toUri(Header)))));
+  size_t MacroOccurrences = 0;
+  std::string MacroID;
+  for (const auto &Macro : Graph.Macros) {
+    if (Macro.Name != "GRAPH_WRAP")
+      continue;
+    ++MacroOccurrences;
+    if (MacroID.empty())
+      MacroID = Macro.ID;
+    else
+      EXPECT_EQ(MacroID, Macro.ID);
+  }
+  EXPECT_GE(MacroOccurrences, 2u);
+  EXPECT_TRUE(llvm::all_of(Graph.Macros, [](const GraphMacro &Macro) {
+    return Macro.Definition.valid();
+  }));
+  EXPECT_TRUE(llvm::any_of(Graph.Symbols, [](const GraphSymbol &Symbol) {
+    return Symbol.Name == "hidden" && Symbol.Internal;
+  }));
+  EXPECT_TRUE(llvm::any_of(Graph.Symbols, [](const GraphSymbol &Symbol) {
+    return Symbol.Name == "local" && Symbol.Local;
+  }));
+  EXPECT_TRUE(llvm::any_of(Graph.Relations, [](const GraphRelation &Relation) {
+    return Relation.Roles &
+           static_cast<uint32_t>(index::SymbolRole::RelationBaseOf);
+  }));
+  EXPECT_TRUE(llvm::any_of(Graph.Relations, [](const GraphRelation &Relation) {
+    return Relation.Roles &
+           static_cast<uint32_t>(index::SymbolRole::RelationOverrideOf);
+  }));
+  EXPECT_TRUE(
+      llvm::any_of(Graph.Occurrences, [](const GraphOccurrence &Occurrence) {
+        return Occurrence.Roles &
+               static_cast<uint32_t>(index::SymbolRole::Read);
+      }));
+  EXPECT_TRUE(llvm::all_of(Graph.Symbols, [](const GraphSymbol &Symbol) {
+    return !Symbol.Declaration.valid() ||
+           Symbol.Declaration.EndColumn >= Symbol.Declaration.StartColumn;
+  }));
+}
+
+TEST(GraphTest, CommandDigestNormalizesEquivalentInputSpelling) {
+  tooling::CompileCommand Native;
+  Native.Directory = "C:/project";
+  Native.Filename = "C:/project/main.cpp";
+  Native.CommandLine = {"clang++", "-DVALUE=a\\b", "--",
+                        "C:\\project\\main.cpp"};
+  tooling::CompileCommand Slashes = Native;
+  Slashes.CommandLine.back() = "C:/project/main.cpp";
+#ifdef _WIN32
+  EXPECT_EQ(graphCommandDigest(Native), graphCommandDigest(Slashes));
+  Slashes.Directory = "c:\\PROJECT";
+  Slashes.Filename = "c:\\PROJECT\\main.cpp";
+  Slashes.CommandLine.back() = "c:\\PROJECT\\main.cpp";
+  EXPECT_EQ(graphCommandDigest(Native), graphCommandDigest(Slashes));
+#else
+  EXPECT_NE(graphCommandDigest(Native), graphCommandDigest(Slashes));
+#endif
+  Slashes.CommandLine[1] = "-DVALUE=a/b";
+  EXPECT_NE(graphCommandDigest(Native), graphCommandDigest(Slashes));
 }
 
 TEST_F(IndexActionTest, IncludeGraphSelfInclude) {

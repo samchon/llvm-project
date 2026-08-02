@@ -25,6 +25,7 @@
 #define LLVM_CLANG_TOOLS_EXTRA_CLANGD_INDEX_SERIALIZATION_H
 
 #include "Headers.h"
+#include "index/Graph.h"
 #include "index/Index.h"
 #include "index/Symbol.h"
 #include "clang/Tooling/CompilationDatabase.h"
@@ -48,6 +49,9 @@ struct IndexFileIn {
   std::optional<IncludeGraph> Sources;
   // This contains only the Directory and CommandLine.
   std::optional<tooling::CompileCommand> Cmd;
+  // Complete graph views for every compile command of this main file. This is
+  // present only in the main-file shard.
+  std::vector<GraphTU> Graphs;
 };
 // Parse an index file. The input must be a RIFF or YAML file.
 llvm::Expected<IndexFileIn> readIndexFile(llvm::StringRef, SymbolOrigin);
@@ -62,6 +66,7 @@ struct IndexFileOut {
   // TODO: Support serializing Dex posting lists.
   IndexFileFormat Format = IndexFileFormat::RIFF;
   const tooling::CompileCommand *Cmd = nullptr;
+  const std::vector<GraphTU> *Graphs = nullptr;
 
   IndexFileOut() = default;
   IndexFileOut(const IndexFileIn &I)
@@ -69,7 +74,8 @@ struct IndexFileOut {
         Refs(I.Refs ? &*I.Refs : nullptr),
         Relations(I.Relations ? &*I.Relations : nullptr),
         Sources(I.Sources ? &*I.Sources : nullptr),
-        Cmd(I.Cmd ? &*I.Cmd : nullptr) {}
+        Cmd(I.Cmd ? &*I.Cmd : nullptr),
+        Graphs(I.Graphs.empty() ? nullptr : &I.Graphs) {}
 };
 // Serializes an index file.
 llvm::raw_ostream &operator<<(llvm::raw_ostream &OS, const IndexFileOut &O);

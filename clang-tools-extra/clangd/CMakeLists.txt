@@ -123,6 +123,7 @@ add_clang_library(clangDaemon STATIC
   index/BackgroundRebuild.cpp
   index/CanonicalIncludes.cpp
   index/FileIndex.cpp
+  index/Graph.cpp
   index/Index.cpp
   index/IndexAction.cpp
   index/MemIndex.cpp

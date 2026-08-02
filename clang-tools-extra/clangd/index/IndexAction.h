@@ -28,7 +28,8 @@ std::unique_ptr<FrontendAction> createStaticIndexingAction(
     std::function<void(SymbolSlab)> SymbolsCallback,
     std::function<void(RefSlab)> RefsCallback,
     std::function<void(RelationSlab)> RelationsCallback,
-    std::function<void(IncludeGraph)> IncludeGraphCallback);
+    std::function<void(IncludeGraph)> IncludeGraphCallback,
+    std::function<void(GraphTU)> GraphCallback = nullptr);
 
 } // namespace clangd
 } // namespace clang

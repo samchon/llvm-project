@@ -44,6 +44,13 @@ public:
   virtual std::optional<tooling::CompileCommand>
   getCompileCommand(PathRef File) const = 0;
 
+  /// Returns every known-good command for this file. Most clangd clients need
+  /// one representative command and continue to call getCompileCommand().
+  /// Bulk graph indexing uses all commands so a TU/header can retain distinct
+  /// language, target, and preprocessor views.
+  virtual std::vector<tooling::CompileCommand>
+  getCompileCommands(PathRef File) const;
+
   /// Finds the closest project to \p File.
   virtual std::optional<ProjectInfo> getProjectInfo(PathRef File) const {
     return std::nullopt;
@@ -88,6 +95,9 @@ public:
 
   std::optional<tooling::CompileCommand>
   getCompileCommand(PathRef File) const override;
+
+  std::vector<tooling::CompileCommand>
+  getCompileCommands(PathRef File) const override;
 
   std::optional<ProjectInfo> getProjectInfo(PathRef File) const override;
 
@@ -141,6 +151,9 @@ public:
   /// Might trigger OnCommandChanged, if CDB wasn't broadcasted yet.
   std::optional<tooling::CompileCommand>
   getCompileCommand(PathRef File) const override;
+
+  std::vector<tooling::CompileCommand>
+  getCompileCommands(PathRef File) const override;
 
   /// Returns the path to first directory containing a compilation database in
   /// \p File's parents.
@@ -216,6 +229,8 @@ public:
 
   std::optional<tooling::CompileCommand>
   getCompileCommand(PathRef File) const override;
+  std::vector<tooling::CompileCommand>
+  getCompileCommands(PathRef File) const override;
   tooling::CompileCommand getFallbackCommand(PathRef File) const override;
 
   /// Sets or clears the compilation command for a particular file.

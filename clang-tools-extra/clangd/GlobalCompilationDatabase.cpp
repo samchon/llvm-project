@@ -73,6 +73,16 @@ GlobalCompilationDatabase::getFallbackCommand(PathRef File) const {
   return Cmd;
 }
 
+std::vector<tooling::CompileCommand>
+GlobalCompilationDatabase::getCompileCommands(PathRef File) const {
+  auto Command = getCompileCommand(File);
+  if (!Command)
+    return {};
+  std::vector<tooling::CompileCommand> Result;
+  Result.push_back(std::move(*Command));
+  return Result;
+}
+
 // Loads and caches the CDB from a single directory.
 //
 // This class is threadsafe, which is to say we have independent locks for each
@@ -364,6 +374,15 @@ DirectoryBasedGlobalCompilationDatabase::
 
 std::optional<tooling::CompileCommand>
 DirectoryBasedGlobalCompilationDatabase::getCompileCommand(PathRef File) const {
+  auto Commands = getCompileCommands(File);
+  if (Commands.empty())
+    return std::nullopt;
+  return std::move(Commands.front());
+}
+
+std::vector<tooling::CompileCommand>
+DirectoryBasedGlobalCompilationDatabase::getCompileCommands(
+    PathRef File) const {
   CDBLookupRequest Req;
   Req.FileName = File;
   Req.ShouldBroadcast = true;
@@ -374,14 +393,11 @@ DirectoryBasedGlobalCompilationDatabase::getCompileCommand(PathRef File) const {
   auto Res = lookupCDB(Req);
   if (!Res) {
     log("Failed to find compilation database for {0}", File);
-    return std::nullopt;
+    return {};
   }
 
   auto Candidates = Res->CDB->getCompileCommands(File);
-  if (!Candidates.empty())
-    return std::move(Candidates.front());
-
-  return std::nullopt;
+  return Candidates;
 }
 
 std::vector<DirectoryBasedGlobalCompilationDatabase::DirectoryCache *>
@@ -784,14 +800,25 @@ OverlayCDB::OverlayCDB(const GlobalCompilationDatabase *Base,
 
 std::optional<tooling::CompileCommand>
 OverlayCDB::getCompileCommand(PathRef File) const {
-  std::optional<tooling::CompileCommand> Cmd;
+  auto Commands = getCompileCommands(File);
+  if (Commands.empty())
+    return std::nullopt;
+  return std::move(Commands.front());
+}
+
+std::vector<tooling::CompileCommand>
+OverlayCDB::getCompileCommands(PathRef File) const {
+  std::vector<tooling::CompileCommand> CommandsForFile;
+  bool IsOverride = false;
   {
     std::lock_guard<std::mutex> Lock(Mutex);
     auto It = Commands.find(removeDots(File));
-    if (It != Commands.end())
-      Cmd = It->second;
+    if (It != Commands.end()) {
+      CommandsForFile.push_back(It->second);
+      IsOverride = true;
+    }
   }
-  if (Cmd) {
+  if (IsOverride) {
     // FS used for expanding response files.
     // FIXME: ExpandResponseFiles appears not to provide the usual
     // thread-safety guarantees, as the access to FS is not locked!
@@ -804,16 +831,16 @@ OverlayCDB::getCompileCommand(PathRef File) const {
     // Compile command pushed via LSP protocol may have response files that need
     // to be expanded before further processing. For CDB for files it happens in
     // the main CDB when reading it from the JSON file.
-    tooling::addExpandedResponseFiles(Cmd->CommandLine, Cmd->Directory,
+    tooling::addExpandedResponseFiles(CommandsForFile.front().CommandLine,
+                                      CommandsForFile.front().Directory,
                                       Tokenizer, *FS);
   }
-  if (!Cmd)
-    Cmd = DelegatingCDB::getCompileCommand(File);
-  if (!Cmd)
-    return std::nullopt;
+  if (!IsOverride)
+    CommandsForFile = DelegatingCDB::getCompileCommands(File);
   if (Mangler)
-    Mangler(*Cmd, File);
-  return Cmd;
+    for (auto &Command : CommandsForFile)
+      Mangler(Command, File);
+  return CommandsForFile;
 }
 
 tooling::CompileCommand OverlayCDB::getFallbackCommand(PathRef File) const {
@@ -885,6 +912,13 @@ DelegatingCDB::getCompileCommand(PathRef File) const {
   if (!Base)
     return std::nullopt;
   return Base->getCompileCommand(File);
+}
+
+std::vector<tooling::CompileCommand>
+DelegatingCDB::getCompileCommands(PathRef File) const {
+  if (!Base)
+    return {};
+  return Base->getCompileCommands(File);
 }
 
 std::optional<ProjectInfo> DelegatingCDB::getProjectInfo(PathRef File) const {

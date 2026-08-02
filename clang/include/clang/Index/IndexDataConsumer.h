@@ -38,6 +38,11 @@ public:
 
   virtual void setPreprocessor(std::shared_ptr<Preprocessor> PP) {}
 
+  /// Graph exporters need compiler-owned identities for anonymous and implicit
+  /// declarations. Ordinary index consumers retain the historical filtering.
+  virtual bool shouldIndexUnnamedSymbols() const { return false; }
+  virtual bool shouldIndexImplicitSymbols() const { return false; }
+
   /// \returns true to continue indexing, or false to abort.
   virtual bool handleDeclOccurrence(const Decl *D, SymbolRoleSet Roles,
                                     ArrayRef<SymbolRelation> Relations,

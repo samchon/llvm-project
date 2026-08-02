@@ -30,11 +30,15 @@
 #include "clang/AST/DeclTemplate.h"
 #include "clang/AST/DeclarationName.h"
 #include "clang/AST/Expr.h"
+#include "clang/AST/PrettyPrinter.h"
 #include "clang/Basic/FileEntry.h"
 #include "clang/Basic/LangOptions.h"
+#include "clang/Basic/Module.h"
 #include "clang/Basic/SourceLocation.h"
 #include "clang/Basic/SourceManager.h"
+#include "clang/Frontend/CompilerInstance.h"
 #include "clang/Index/IndexSymbol.h"
+#include "clang/Index/USRGeneration.h"
 #include "clang/Lex/Preprocessor.h"
 #include "clang/Lex/Token.h"
 #include "clang/Tooling/Inclusions/HeaderAnalysis.h"
@@ -42,6 +46,7 @@
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/StringExtras.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/Casting.h"
 #include "llvm/Support/ErrorHandling.h"
@@ -503,6 +508,274 @@ void SymbolCollector::initialize(ASTContext &Ctx) {
       std::make_unique<CodeCompletionTUInfo>(CompletionAllocator);
 }
 
+void SymbolCollector::initializeGraphCompilation(const CompilerInstance &CI) {
+  if (!Opts.CollectGraph)
+    return;
+  Graph.TargetTriple = CI.getTarget().getTriple().str();
+  Graph.Language = CI.getLangOpts().CPlusPlus ? "cpp" : "c";
+}
+
+std::optional<GraphRange>
+SymbolCollector::graphTokenRange(SourceLocation Loc) const {
+  if (!Opts.CollectGraph || !ASTCtx || !HeaderFileURIs || Loc.isInvalid())
+    return std::nullopt;
+  const auto &SM = ASTCtx->getSourceManager();
+  Loc = SM.getFileLoc(Loc);
+  auto FE = SM.getFileEntryRefForID(SM.getFileID(Loc));
+  if (!FE)
+    return std::nullopt;
+  auto Positions = getTokenRange(Loc, SM, ASTCtx->getLangOpts());
+  GraphRange Result;
+  Result.FileURI = HeaderFileURIs->toURI(*FE);
+  Result.StartLine = Positions.first.line();
+  Result.StartColumn = Positions.first.column();
+  Result.EndLine = Positions.second.line();
+  Result.EndColumn = Positions.second.column();
+  return Result;
+}
+
+std::optional<GraphRange>
+SymbolCollector::graphSourceRange(SourceRange Range) const {
+  if (!Opts.CollectGraph || !ASTCtx || !HeaderFileURIs || Range.isInvalid())
+    return std::nullopt;
+  const auto &SM = ASTCtx->getSourceManager();
+  auto FileRange =
+      toHalfOpenFileRange(SM, ASTCtx->getLangOpts(), std::move(Range));
+  if (!FileRange)
+    return std::nullopt;
+  auto Begin = SM.getFileLoc(FileRange->getBegin());
+  auto FE = SM.getFileEntryRefForID(SM.getFileID(Begin));
+  if (!FE)
+    return std::nullopt;
+  auto Positions =
+      halfOpenToRange(SM, CharSourceRange::getCharRange(FileRange->getBegin(),
+                                                        FileRange->getEnd()));
+  GraphRange Result;
+  Result.FileURI = HeaderFileURIs->toURI(*FE);
+  Result.StartLine = Positions.start.line;
+  Result.StartColumn = Positions.start.character;
+  Result.EndLine = Positions.end.line;
+  Result.EndColumn = Positions.end.character;
+  return Result;
+}
+
+std::string SymbolCollector::graphUSR(const Decl *D) const {
+  if (!D)
+    return {};
+  if (const auto *ND = dyn_cast<NamedDecl>(D);
+      ND && ND->getDeclName().isEmpty()) {
+    auto Range = graphTokenRange(ND->getLocation());
+    std::string Owner = "translation-unit";
+    if (const auto *OwnerDecl = dyn_cast<Decl>(ND->getDeclContext()))
+      if (const auto *OwnerNamed = dyn_cast<NamedDecl>(OwnerDecl))
+        Owner = graphUSR(OwnerNamed);
+    return (llvm::Twine("c:@anonymous@") + ND->getDeclKindName() + "|owner=" +
+            Owner + "|file=" + (Range ? Range->FileURI : "builtin") +
+            "|ordinal=" + llvm::Twine(graphDeclOrdinal(*ND)))
+        .str();
+  }
+  llvm::SmallString<128> USR;
+  if (!index::generateUSRForDecl(D, USR))
+    return USR.str().str();
+  auto Range = graphTokenRange(D->getLocation());
+  return (llvm::Twine("c:@anonymous@") + D->getDeclKindName() + "@" +
+          (Range ? Range->FileURI : "builtin") + "@" +
+          llvm::Twine(Range ? Range->StartLine : 0) + ":" +
+          llvm::Twine(Range ? Range->StartColumn : 0))
+      .str();
+}
+
+unsigned SymbolCollector::graphDeclOrdinal(const NamedDecl &ND) const {
+  const Decl *Target = ND.getCanonicalDecl();
+  unsigned Ordinal = 0;
+  llvm::DenseSet<const Decl *> Seen;
+  for (const Decl *Sibling : ND.getDeclContext()->decls()) {
+    const auto *Named = dyn_cast<NamedDecl>(Sibling);
+    if (!Named || Named->getKind() != ND.getKind() ||
+        Named->getDeclName() != ND.getDeclName())
+      continue;
+    const Decl *Canonical = Named->getCanonicalDecl();
+    if (!Seen.insert(Canonical).second)
+      continue;
+    if (Canonical == Target)
+      return Ordinal;
+    ++Ordinal;
+  }
+  return Ordinal;
+}
+
+std::string SymbolCollector::graphID(const Decl *D) const {
+  if (!D)
+    return {};
+  const auto *ND = dyn_cast<NamedDecl>(D);
+  std::string USR = graphUSR(D);
+  if (!ND)
+    return USR;
+  const bool NeedsFile = index::isFunctionLocalSymbol(ND) ||
+                         !ND->isExternallyVisible() ||
+                         ND->getDeclName().isEmpty();
+  if (!NeedsFile)
+    return USR;
+  auto Range = graphTokenRange(ND->getLocation());
+  std::string Result;
+  if (index::isFunctionLocalSymbol(ND)) {
+    Result = (llvm::Twine("c:@local@") + ND->getDeclKindName() +
+              "|name=" + ND->getNameAsString() +
+              "|ordinal=" + llvm::Twine(graphDeclOrdinal(*ND)))
+                 .str();
+  } else {
+    Result = USR;
+  }
+  Result += "|file=";
+  Result += Range ? Range->FileURI : "builtin";
+  if (const auto *OwnerDC = ND->getParentFunctionOrMethod())
+    if (const auto *Owner = dyn_cast<Decl>(OwnerDC))
+      Result += "|owner=" + graphUSR(Owner);
+  return Result;
+}
+
+std::string SymbolCollector::graphMacroUSR(llvm::StringRef Name,
+                                           const MacroInfo *MI) const {
+  if (!MI || !ASTCtx)
+    return {};
+  llvm::SmallString<128> USR;
+  if (index::generateUSRForMacro(Name, MI->getDefinitionLoc(),
+                                 ASTCtx->getSourceManager(), USR))
+    return {};
+  return USR.str().str();
+}
+
+std::string SymbolCollector::graphMacroID(llvm::StringRef Name,
+                                          const MacroInfo *MI) {
+  auto Range = MI ? graphTokenRange(MI->getDefinitionLoc()) : std::nullopt;
+  std::string File = Range ? Range->FileURI : "builtin";
+  unsigned Ordinal = 0;
+  if (MI) {
+    auto Existing = GraphMacroOrdinals.find(MI);
+    if (Existing != GraphMacroOrdinals.end()) {
+      Ordinal = Existing->second;
+    } else {
+      std::string Family = File + "\n" + Name.str();
+      Ordinal = GraphNextMacroOrdinal[Family]++;
+      GraphMacroOrdinals[MI] = Ordinal;
+    }
+  }
+  return (llvm::Twine("c:@macro@") + Name + "|file=" + File +
+          "|ordinal=" + llvm::Twine(Ordinal))
+      .str();
+}
+
+void SymbolCollector::collectGraphDecl(
+    const NamedDecl &ND, index::SymbolRoleSet Roles,
+    ArrayRef<index::SymbolRelation> Relations, SourceLocation Loc,
+    index::IndexDataConsumer::ASTNodeInfo ASTNode) {
+  if (!Opts.CollectGraph || !ASTCtx)
+    return;
+  const Decl *OccurrenceDecl = ASTNode.OrigD ? ASTNode.OrigD : &ND;
+  const std::string ID = graphID(&ND);
+  const std::string USR = graphUSR(&ND);
+  if (ID.empty() || USR.empty())
+    return;
+
+  auto [It, Inserted] = GraphSymbolByID.try_emplace(ID, Graph.Symbols.size());
+  GraphSymbol *Symbol = nullptr;
+  if (Inserted) {
+    GraphSymbol Value;
+    Value.ID = ID;
+    Value.USR = USR;
+    Value.Name = ND.getNameAsString();
+    Value.Anonymous = Value.Name.empty();
+    if (Value.Anonymous)
+      Value.Name =
+          (llvm::Twine("(anonymous ") + ND.getDeclKindName() + ")").str();
+    Value.QualifiedName = printQualifiedName(ND);
+    if (const auto *Owner = dyn_cast_or_null<NamedDecl>(ASTNode.Parent))
+      Value.OwnerUSR = graphID(Owner);
+    else if (const auto *OwnerDC = ND.getParentFunctionOrMethod())
+      if (const auto *Owner = dyn_cast<Decl>(OwnerDC))
+        Value.OwnerUSR = graphID(Owner);
+    auto Info = index::getSymbolInfo(&ND);
+    Value.Kind = static_cast<uint32_t>(Info.Kind);
+    Value.SubKind = static_cast<uint32_t>(Info.SubKind);
+    Value.Properties = static_cast<uint32_t>(Info.Properties);
+    Value.Local = index::isFunctionLocalSymbol(&ND);
+    Value.Internal = !ND.isExternallyVisible();
+    Value.Exported = ND.isExternallyVisible();
+    PrintingPolicy Policy(ASTCtx->getLangOpts());
+    Policy.SuppressScope = false;
+    if (const auto *FD = dyn_cast<FunctionDecl>(&ND))
+      Value.Signature = FD->getType().getAsString(Policy);
+    else if (const auto *VD = dyn_cast<ValueDecl>(&ND))
+      Value.Signature = VD->getType().getAsString(Policy);
+    for (const auto *Attribute : OccurrenceDecl->attrs()) {
+      GraphAttribute Fact;
+      Fact.Name = Attribute->getSpelling();
+      if (auto Range = graphSourceRange(Attribute->getRange()))
+        Fact.Range = std::move(*Range);
+      Value.Attributes.push_back(std::move(Fact));
+    }
+    Graph.Symbols.push_back(std::move(Value));
+  }
+  Symbol = &Graph.Symbols[It->second];
+
+  if (Roles & static_cast<unsigned>(index::SymbolRole::Declaration))
+    if (auto Range = graphSourceRange(OccurrenceDecl->getSourceRange()))
+      Symbol->Declaration = std::move(*Range);
+  if (Roles & static_cast<unsigned>(index::SymbolRole::Definition))
+    if (auto Range = graphSourceRange(OccurrenceDecl->getSourceRange()))
+      Symbol->Definition = std::move(*Range);
+  if (!Symbol->Declaration.valid() && Symbol->Definition.valid())
+    Symbol->Declaration = Symbol->Definition;
+
+  GraphOccurrence Occurrence;
+  Occurrence.ID = ID;
+  Occurrence.USR = USR;
+  Occurrence.Roles = Roles;
+  Occurrence.TargetKind = static_cast<uint32_t>(index::getSymbolInfo(&ND).Kind);
+  if (const auto *Container = dyn_cast_or_null<NamedDecl>(ASTNode.Parent))
+    Occurrence.ContainerID = graphID(Container);
+  const auto &SM = ASTCtx->getSourceManager();
+  if (auto Range = graphTokenRange(SM.getSpellingLoc(Loc)))
+    Occurrence.Spelling = std::move(*Range);
+  if (auto Range = graphTokenRange(SM.getExpansionLoc(Loc)))
+    Occurrence.Expansion = std::move(*Range);
+  Graph.Occurrences.push_back(std::move(Occurrence));
+
+  for (const auto &Related : Relations) {
+    const std::string ObjectID = graphID(Related.RelatedSymbol);
+    if (ObjectID.empty())
+      continue;
+    GraphRelation Relation;
+    Relation.SubjectID = ID;
+    Relation.ObjectID = ObjectID;
+    Relation.Roles = Related.Roles;
+    if (auto Range = graphTokenRange(SM.getExpansionLoc(Loc)))
+      Relation.Evidence = std::move(*Range);
+    Graph.Relations.push_back(std::move(Relation));
+  }
+}
+
+void SymbolCollector::collectGraphMacro(const IdentifierInfo *Name,
+                                        const MacroInfo *MI,
+                                        index::SymbolRoleSet Roles,
+                                        SourceLocation Loc) {
+  if (!Opts.CollectGraph || !ASTCtx || !Name || !MI)
+    return;
+  GraphMacro Macro;
+  Macro.USR = graphMacroUSR(Name->getName(), MI);
+  Macro.ID = graphMacroID(Name->getName(), MI);
+  Macro.Name = Name->getName().str();
+  Macro.Roles = Roles;
+  const auto &SM = ASTCtx->getSourceManager();
+  if (auto Range = graphTokenRange(MI->getDefinitionLoc()))
+    Macro.Definition = std::move(*Range);
+  if (auto Range = graphTokenRange(SM.getSpellingLoc(Loc)))
+    Macro.Spelling = std::move(*Range);
+  if (auto Range = graphTokenRange(SM.getExpansionLoc(Loc)))
+    Macro.Expansion = std::move(*Range);
+  Graph.Macros.push_back(std::move(Macro));
+}
+
 bool SymbolCollector::shouldCollectSymbol(const NamedDecl &ND,
                                           const ASTContext &ASTCtx,
                                           const Options &Opts,
@@ -642,6 +915,8 @@ bool SymbolCollector::handleDeclOccurrence(
   const NamedDecl *ND = dyn_cast<NamedDecl>(D);
   if (!ND)
     return true;
+
+  collectGraphDecl(*ND, Roles, Relations, Loc, ASTNode);
 
   auto ID = getSymbolIDCached(ND);
   if (!ID)
@@ -795,6 +1070,7 @@ bool SymbolCollector::handleMacroOccurrence(const IdentifierInfo *Name,
       SM.isWrittenInCommandLineFile(DefLoc) ||
       Name->getName() == "__GCC_HAVE_DWARF2_CFI_ASM")
     return true;
+  collectGraphMacro(Name, MI, Roles, Loc);
 
   auto ID = getSymbolIDCached(Name->getName(), MI, SM);
   if (!ID)
@@ -872,6 +1148,61 @@ bool SymbolCollector::handleMacroOccurrence(const IdentifierInfo *Name,
   setIncludeLocation(S, DefLoc, include_cleaner::Macro{Name, DefLoc});
   Symbols.insert(S);
   return true;
+}
+
+bool SymbolCollector::handleModuleOccurrence(const ImportDecl *ImportD,
+                                             const Module *Mod,
+                                             index::SymbolRoleSet Roles,
+                                             SourceLocation Loc) {
+  if (!Opts.CollectGraph || !Mod)
+    return true;
+  GraphModule Module;
+  Module.Name = Mod->getFullModuleName();
+  Module.Roles = Roles;
+  if (auto Range = graphTokenRange(Loc))
+    Module.Evidence = std::move(*Range);
+  Graph.Modules.push_back(std::move(Module));
+  return true;
+}
+
+void SymbolCollector::recordGraphInclude(SourceLocation HashLoc,
+                                         llvm::StringRef FileName,
+                                         bool IsAngled,
+                                         OptionalFileEntryRef File,
+                                         bool ModuleImported) {
+  if (!Opts.CollectGraph || !ASTCtx || !HeaderFileURIs || !File)
+    return;
+  const auto &SM = ASTCtx->getSourceManager();
+  auto Including = SM.getFileEntryRefForID(SM.getFileID(HashLoc));
+  if (!Including)
+    return;
+  GraphInclude Include;
+  Include.SourceURI = HeaderFileURIs->toURI(*Including);
+  Include.TargetURI = HeaderFileURIs->toURI(*File);
+  Include.Spelling = FileName.str();
+  Include.Angled = IsAngled;
+  Include.ModuleImported = ModuleImported;
+  if (auto Range = graphTokenRange(HashLoc))
+    Include.Evidence = std::move(*Range);
+  Graph.Includes.push_back(std::move(Include));
+}
+
+void SymbolCollector::recordGraphSource(FileID FID, llvm::StringRef URI,
+                                        IncludeGraphNode::SourceFlag Flags) {
+  if (!Opts.CollectGraph || !ASTCtx || FID.isInvalid())
+    return;
+  bool Invalid = false;
+  llvm::StringRef Contents =
+      ASTCtx->getSourceManager().getBufferData(FID, &Invalid);
+  if (Invalid)
+    return;
+  GraphSource Source;
+  Source.URI = URI.str();
+  Source.Digest = graphDigest(Contents);
+  Source.Flags = static_cast<uint32_t>(Flags);
+  Graph.Sources.push_back(std::move(Source));
+  if (Flags & IncludeGraphNode::SourceFlag::IsTU)
+    Graph.MainFileURI = URI.str();
 }
 
 void SymbolCollector::processRelations(

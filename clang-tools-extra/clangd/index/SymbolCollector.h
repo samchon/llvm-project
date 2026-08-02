@@ -9,8 +9,10 @@
 #define LLVM_CLANG_TOOLS_EXTRA_CLANGD_INDEX_SYMBOLCOLLECTOR_H
 
 #include "CollectMacros.h"
+#include "Headers.h"
 #include "clang-include-cleaner/Record.h"
 #include "clang-include-cleaner/Types.h"
+#include "index/Graph.h"
 #include "index/Ref.h"
 #include "index/Relation.h"
 #include "index/Symbol.h"
@@ -36,6 +38,7 @@
 #include <utility>
 
 namespace clang {
+class CompilerInstance;
 namespace clangd {
 
 /// Collect declarations (symbols) from an AST.
@@ -104,6 +107,9 @@ public:
     /// If this is set, only collect symbols/references from a file if
     /// `FileFilter(SM, FID)` is true. If not set, all files are indexed.
     std::function<bool(const SourceManager &, FileID)> FileFilter = nullptr;
+    /// Retain the complete Clang occurrence stream for graph export without
+    /// changing the ordinary clangd symbol/search slabs.
+    bool CollectGraph = false;
   };
 
   SymbolCollector(Options Opts);
@@ -135,6 +141,9 @@ public:
   }
   void setPreprocessor(Preprocessor &PP) { this->PP = &PP; }
 
+  bool shouldIndexUnnamedSymbols() const override { return Opts.CollectGraph; }
+  bool shouldIndexImplicitSymbols() const override { return Opts.CollectGraph; }
+
   bool
   handleDeclOccurrence(const Decl *D, index::SymbolRoleSet Roles,
                        ArrayRef<index::SymbolRelation> Relations,
@@ -145,11 +154,22 @@ public:
                              index::SymbolRoleSet Roles,
                              SourceLocation Loc) override;
 
+  bool handleModuleOccurrence(const ImportDecl *ImportD, const Module *Mod,
+                              index::SymbolRoleSet Roles,
+                              SourceLocation Loc) override;
+
   void handleMacros(const MainFileMacros &MacroRefsToIndex);
 
   SymbolSlab takeSymbols() { return std::move(Symbols).build(); }
   RefSlab takeRefs() { return std::move(Refs).build(); }
   RelationSlab takeRelations() { return std::move(Relations).build(); }
+  GraphTU takeGraph() { return std::move(Graph); }
+  void initializeGraphCompilation(const CompilerInstance &CI);
+  void recordGraphInclude(SourceLocation HashLoc, llvm::StringRef FileName,
+                          bool IsAngled, OptionalFileEntryRef File,
+                          bool ModuleImported);
+  void recordGraphSource(FileID FID, llvm::StringRef URI,
+                         IncludeGraphNode::SourceFlag Flags);
 
   /// Returns true if we are interested in references and declarations from \p
   /// FID. If this function return false, bodies of functions inside those files
@@ -220,6 +240,23 @@ private:
     bool Spelled;
   };
   void addRef(SymbolID ID, const SymbolRef &SR);
+  void collectGraphDecl(const NamedDecl &ND, index::SymbolRoleSet Roles,
+                        ArrayRef<index::SymbolRelation> Relations,
+                        SourceLocation Loc,
+                        index::IndexDataConsumer::ASTNodeInfo ASTNode);
+  void collectGraphMacro(const IdentifierInfo *Name, const MacroInfo *MI,
+                         index::SymbolRoleSet Roles, SourceLocation Loc);
+  std::optional<GraphRange> graphTokenRange(SourceLocation Loc) const;
+  std::optional<GraphRange> graphSourceRange(SourceRange Range) const;
+  std::string graphUSR(const Decl *D) const;
+  std::string graphID(const Decl *D) const;
+  unsigned graphDeclOrdinal(const NamedDecl &D) const;
+  std::string graphMacroUSR(llvm::StringRef Name, const MacroInfo *MI) const;
+  std::string graphMacroID(llvm::StringRef Name, const MacroInfo *MI);
+  GraphTU Graph;
+  llvm::StringMap<size_t> GraphSymbolByID;
+  llvm::DenseMap<const MacroInfo *, unsigned> GraphMacroOrdinals;
+  llvm::StringMap<unsigned> GraphNextMacroOrdinal;
   // Symbols referenced from the current TU, flushed on finish().
   llvm::DenseSet<SymbolID> ReferencedSymbols;
   // Maps canonical declaration provided by clang to canonical declaration for

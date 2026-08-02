@@ -253,6 +253,62 @@ TEST(SerializationTest, BinaryConversions) {
               UnorderedElementsAreArray(yamlFromRelations(*In->Relations)));
 }
 
+TEST(SerializationTest, CompleteGraphRoundTrip) {
+  IndexFileIn Input;
+  SymbolSlab::Builder Symbols;
+  Input.Symbols = std::move(Symbols).build();
+  RefSlab::Builder Refs;
+  Input.Refs = std::move(Refs).build();
+  RelationSlab::Builder Relations;
+  Input.Relations = std::move(Relations).build();
+  GraphTU Graph;
+  Graph.MainFileURI = "file:///workspace/main.cpp";
+  Graph.MainFile = "/workspace/main.cpp";
+  Graph.Directory = "/workspace";
+  Graph.CommandLine = {"clang++", "-DMODE=1", "main.cpp"};
+  Graph.CommandDigest = graphDigest("command");
+  Graph.TargetTriple = "x86_64-unknown-linux-gnu";
+  Graph.Language = "cpp";
+  Graph.Sources.push_back({Graph.MainFileURI, graphDigest("int main();"), 1});
+  GraphSymbol Symbol;
+  Symbol.USR = "c:@F@main#";
+  Symbol.ID = Symbol.USR;
+  Symbol.Name = "main";
+  Symbol.QualifiedName = "main";
+  Symbol.Kind = static_cast<uint32_t>(index::SymbolKind::Function);
+  Symbol.Definition = {Graph.MainFileURI, 0, 4, 0, 8};
+  Graph.Symbols.push_back(Symbol);
+  GraphOccurrence Occurrence;
+  Occurrence.USR = Symbol.USR;
+  Occurrence.ID = Symbol.ID;
+  Occurrence.Roles = static_cast<uint32_t>(index::SymbolRole::Definition);
+  Occurrence.Spelling = Symbol.Definition;
+  Occurrence.Expansion = Symbol.Definition;
+  Graph.Occurrences.push_back(Occurrence);
+  GraphDiagnostic Diagnostic;
+  Diagnostic.Message = "example";
+  Diagnostic.Code = "clang:1";
+  Diagnostic.Severity = "warning";
+  Diagnostic.Range = Symbol.Definition;
+  Graph.Diagnostics.push_back(Diagnostic);
+  Input.Graphs.push_back(Graph);
+
+  IndexFileOut Output(Input);
+  Output.Format = IndexFileFormat::RIFF;
+  auto Parsed = readIndexFile(llvm::to_string(Output));
+  ASSERT_TRUE(bool(Parsed)) << Parsed.takeError();
+  ASSERT_EQ(1u, Parsed->Graphs.size());
+  const auto &RoundTrip = Parsed->Graphs.front();
+  EXPECT_EQ(Graph.MainFileURI, RoundTrip.MainFileURI);
+  EXPECT_EQ(Graph.CommandLine, RoundTrip.CommandLine);
+  EXPECT_EQ(Graph.Sources.front().Digest, RoundTrip.Sources.front().Digest);
+  EXPECT_EQ(Graph.Symbols.front().ID, RoundTrip.Symbols.front().ID);
+  EXPECT_EQ(Graph.Occurrences.front().Roles,
+            RoundTrip.Occurrences.front().Roles);
+  EXPECT_EQ(Graph.Diagnostics.front().Message,
+            RoundTrip.Diagnostics.front().Message);
+}
+
 TEST(SerializationTest, SrcsTest) {
   auto In = readIndexFile(YAML);
   EXPECT_TRUE(bool(In)) << In.takeError();

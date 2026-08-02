@@ -2,6 +2,7 @@
 #include "CompileCommands.h"
 #include "Config.h"
 #include "Headers.h"
+#include "Protocol.h"
 #include "SyncAPI.h"
 #include "TestFS.h"
 #include "TestTU.h"
@@ -14,7 +15,10 @@
 #include "llvm/Support/ScopedPrinter.h"
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
+#include <chrono>
+#include <condition_variable>
 #include <deque>
+#include <mutex>
 
 using ::testing::_;
 using ::testing::AllOf;
@@ -49,6 +53,21 @@ MATCHER(hadErrors, "") {
 }
 
 MATCHER_P(numReferences, N, "") { return arg.References == N; }
+
+void expectContentModified(llvm::Expected<llvm::json::Value> Result) {
+  ASSERT_FALSE(Result);
+  bool Matched = false;
+  llvm::handleAllErrors(
+      Result.takeError(),
+      [&](const LSPError &Error) {
+        Matched = true;
+        EXPECT_EQ(ErrorCode::ContentModified, Error.Code);
+      },
+      [&](const llvm::ErrorInfoBase &Error) {
+        ADD_FAILURE() << "expected ContentModified, got: " << Error.message();
+      });
+  EXPECT_TRUE(Matched);
+}
 
 class MemoryShardStorage : public BackgroundIndexStorage {
   mutable std::mutex StorageMu;
@@ -89,6 +108,40 @@ public:
 class BackgroundIndexTest : public ::testing::Test {
 protected:
   BackgroundIndexTest() { BackgroundQueue::preventThreadStarvationInTests(); }
+};
+
+class MultiCommandCDB : public GlobalCompilationDatabase {
+public:
+  std::optional<tooling::CompileCommand>
+  getCompileCommand(PathRef File) const override {
+    auto All = getCompileCommands(File);
+    if (All.empty())
+      return std::nullopt;
+    return All.front();
+  }
+
+  std::vector<tooling::CompileCommand>
+  getCompileCommands(PathRef File) const override {
+    auto It = Commands.find(File);
+    return It == Commands.end() ? std::vector<tooling::CompileCommand>()
+                                : It->second;
+  }
+
+  llvm::StringMap<std::vector<tooling::CompileCommand>> Commands;
+};
+
+class InferringCDB : public MultiCommandCDB {
+public:
+  std::vector<tooling::CompileCommand>
+  getCompileCommands(PathRef File) const override {
+    auto Exact = MultiCommandCDB::getCompileCommands(File);
+    if (!Exact.empty() || Commands.empty())
+      return Exact;
+    tooling::CompileCommand Inferred = Commands.begin()->second.front();
+    Inferred.Filename = File.str();
+    Inferred.CommandLine.back() = File.str();
+    return {std::move(Inferred)};
+  }
 };
 
 TEST_F(BackgroundIndexTest, NoCrashOnErrorFile) {
@@ -191,8 +244,7 @@ TEST_F(BackgroundIndexTest, IndexTwoFiles) {
   MemoryShardStorage MSS(Storage, CacheHits);
   OverlayCDB CDB(/*Base=*/nullptr);
   BackgroundIndex::Options Opts;
-  BackgroundIndex Idx(
-      FS, CDB, [&](llvm::StringRef) { return &MSS; }, Opts);
+  BackgroundIndex Idx(FS, CDB, [&](llvm::StringRef) { return &MSS; }, Opts);
 
   tooling::CompileCommand Cmd;
   Cmd.Filename = testPath("root/A.cc");
@@ -366,8 +418,7 @@ TEST_F(BackgroundIndexTest, MainFileRefs) {
   MemoryShardStorage MSS(Storage, CacheHits);
   OverlayCDB CDB(/*Base=*/nullptr);
   BackgroundIndex::Options Opts;
-  BackgroundIndex Idx(
-      FS, CDB, [&](llvm::StringRef) { return &MSS; }, Opts);
+  BackgroundIndex Idx(FS, CDB, [&](llvm::StringRef) { return &MSS; }, Opts);
 
   tooling::CompileCommand Cmd;
   Cmd.Filename = testPath("root/A.cc");
@@ -796,10 +847,378 @@ TEST_F(BackgroundIndexTest, Reindex) {
   CDB.setCompileCommand(testPath("A.cc"), Cmd);
   ASSERT_TRUE(Idx.blockUntilIdleForTest());
 
-  // Currently, we will never index the same main file again.
-  EXPECT_EQ(1u, runFuzzyFind(Idx, "theOldFunction").size());
-  EXPECT_EQ(0u, runFuzzyFind(Idx, "theNewFunction").size());
-  EXPECT_EQ(OldShard, Storage.lookup(testPath("A.cc")));
+  EXPECT_EQ(0u, runFuzzyFind(Idx, "theOldFunction").size());
+  EXPECT_EQ(1u, runFuzzyFind(Idx, "theNewFunction").size());
+  EXPECT_NE(OldShard, Storage.lookup(testPath("A.cc")));
+}
+
+TEST_F(BackgroundIndexTest, ColdGraphSnapshotIsRetryable) {
+  MockFS FS;
+  llvm::StringMap<std::string> Storage;
+  size_t CacheHits = 0;
+  MemoryShardStorage MSS(Storage, CacheHits);
+  OverlayCDB CDB(/*Base=*/nullptr);
+  BackgroundIndex Idx(FS, CDB, [&](llvm::StringRef) { return &MSS; }, {});
+  expectContentModified(Idx.graphSnapshot({}));
+}
+
+TEST_F(BackgroundIndexTest, WatchedMetadataIsNotATranslationUnit) {
+  MockFS FS;
+  llvm::StringMap<std::string> Storage;
+  size_t CacheHits = 0;
+  MemoryShardStorage MSS(Storage, CacheHits);
+  InferringCDB CDB;
+  const std::string Source = testPath("main.cpp");
+  const std::string Database = testPath("compile_commands.json");
+  FS.Files[Source] = "int main() { return 0; }";
+  FS.Files[Database] = "[]";
+  tooling::CompileCommand Command;
+  Command.Directory = testRoot();
+  Command.Filename = Source;
+  Command.CommandLine = {"clang++", "-fsyntax-only", Source};
+  CDB.Commands[Source] = {Command};
+  BackgroundIndex Idx(FS, CDB, [&](llvm::StringRef) { return &MSS; }, {});
+  Idx.enqueue({Source});
+  ASSERT_TRUE(Idx.blockUntilIdleForTest());
+
+  Idx.enqueueGraphDependents(std::vector<std::string>{Database});
+  ASSERT_TRUE(Idx.blockUntilIdleForTest());
+  auto Snapshot = Idx.graphSnapshot({});
+  ASSERT_TRUE(bool(Snapshot)) << llvm::toString(Snapshot.takeError());
+  ASSERT_TRUE(Snapshot->getAsObject()->getArray("manifest"));
+  EXPECT_EQ(1u, Snapshot->getAsObject()->getArray("manifest")->size());
+}
+
+TEST_F(BackgroundIndexTest, GraphSnapshotUsesTranslationUnitContext) {
+  MockFS FS;
+  llvm::StringMap<std::string> Storage;
+  size_t CacheHits = 0;
+  MemoryShardStorage MSS(Storage, CacheHits);
+  const std::string Source = testPath("context.cpp");
+  FS.Files[Source] = "int configured();";
+  tooling::CompileCommand Command;
+  Command.Directory = testRoot();
+  Command.Filename = Source;
+  Command.CommandLine = {"clang++", "-fsyntax-only", Source};
+  OverlayCDB CDB(/*Base=*/nullptr, /*FallbackFlags=*/{},
+                 CommandMangler::forTests());
+  CDB.setCompileCommand(Source, Command);
+  BackgroundIndex::Options Opts;
+  Opts.ContextProvider = [](PathRef Path) {
+    Config C;
+    if (!Path.empty())
+      C.CompileFlags.Edits.push_back([](std::vector<std::string> &Arguments) {
+        Arguments.insert(Arguments.begin() + 1, "-DGRAPH_CONTEXT");
+      });
+    return Context::current().derive(Config::Key, std::move(C));
+  };
+  BackgroundIndex Idx(
+      FS, CDB, [&](llvm::StringRef) { return &MSS; }, std::move(Opts));
+  Idx.enqueue({Source});
+  ASSERT_TRUE(Idx.blockUntilIdleForTest());
+
+  auto Snapshot = Idx.graphSnapshot({});
+  ASSERT_TRUE(bool(Snapshot)) << llvm::toString(Snapshot.takeError());
+  ASSERT_TRUE(Snapshot->getAsObject()->getArray("manifest"));
+  EXPECT_EQ(1u, Snapshot->getAsObject()->getArray("manifest")->size());
+}
+
+TEST_F(BackgroundIndexTest, EquivalentMainFileSpellingsShareOneShard) {
+  MockFS FS;
+  llvm::StringMap<std::string> Storage;
+  size_t CacheHits = 0;
+  MemoryShardStorage MSS(Storage, CacheHits);
+  InferringCDB CDB;
+  const std::string Native = testPath("same.cpp");
+  const std::string Slashes = llvm::sys::path::convert_to_slash(Native);
+  FS.Files[Native] = "int same();";
+  tooling::CompileCommand Command;
+  Command.Directory = testRoot();
+  Command.Filename = Native;
+  Command.CommandLine = {"clang++", "-fsyntax-only", Native};
+  CDB.Commands[Native] = {Command};
+  {
+    BackgroundIndex Idx(FS, CDB, [&](llvm::StringRef) { return &MSS; }, {});
+    Idx.enqueue({Native});
+    ASSERT_TRUE(Idx.blockUntilIdleForTest());
+  }
+  auto Persisted = MSS.loadShard(Native);
+  ASSERT_TRUE(Persisted);
+  ASSERT_EQ(1u, Persisted->Graphs.size());
+  Persisted->Graphs.front().MainFile = Slashes;
+  Storage[Native] = llvm::to_string(IndexFileOut(*Persisted));
+  FS.Files[Native] = "int changed();";
+
+  {
+    BackgroundIndex Idx(FS, CDB, [&](llvm::StringRef) { return &MSS; }, {});
+    Idx.enqueue({Native});
+    ASSERT_TRUE(Idx.blockUntilIdleForTest());
+    auto Snapshot = Idx.graphSnapshot({});
+    ASSERT_TRUE(bool(Snapshot)) << llvm::toString(Snapshot.takeError());
+    ASSERT_TRUE(Snapshot->getAsObject()->getArray("manifest"));
+    EXPECT_EQ(1u, Snapshot->getAsObject()->getArray("manifest")->size());
+  }
+}
+
+TEST_F(BackgroundIndexTest, QueuedDiscoveryIsRetryable) {
+  MockFS FS;
+  llvm::StringMap<std::string> Storage;
+  size_t CacheHits = 0;
+  MemoryShardStorage MSS(Storage, CacheHits);
+  OverlayCDB CDB(/*Base=*/nullptr);
+  const std::string A = testPath("A.cc");
+  const std::string B = testPath("B.cc");
+  FS.Files[A] = "int a();";
+  tooling::CompileCommand Command;
+  Command.Directory = testRoot();
+  Command.Filename = A;
+  Command.CommandLine = {"clang++", "-fsyntax-only", A};
+  CDB.setCompileCommand(A, Command);
+
+  std::mutex GateMu;
+  std::condition_variable GateCV;
+  bool BlockDiscovery = false;
+  bool DiscoveryEntered = false;
+  bool ReleaseDiscovery = false;
+  BackgroundIndex::Options Opts;
+  Opts.ThreadPoolSize = 1;
+  Opts.ContextProvider = [&](PathRef Path) {
+    if (Path.empty()) {
+      std::unique_lock<std::mutex> Lock(GateMu);
+      if (BlockDiscovery) {
+        DiscoveryEntered = true;
+        GateCV.notify_all();
+        GateCV.wait(Lock, [&] { return ReleaseDiscovery; });
+      }
+    }
+    return Context::current().clone();
+  };
+  BackgroundIndex Idx(
+      FS, CDB, [&](llvm::StringRef) { return &MSS; }, std::move(Opts));
+  Idx.enqueue({A});
+  ASSERT_TRUE(Idx.blockUntilIdleForTest());
+  ASSERT_TRUE(bool(Idx.graphSnapshot({})));
+
+  FS.Files[B] = "int b();";
+  Command.Filename = B;
+  Command.CommandLine.back() = B;
+  CDB.setCompileCommand(B, Command);
+  {
+    std::lock_guard<std::mutex> Lock(GateMu);
+    BlockDiscovery = true;
+  }
+  Idx.enqueue({B});
+  bool Entered = false;
+  {
+    std::unique_lock<std::mutex> Lock(GateMu);
+    Entered = GateCV.wait_for(Lock, std::chrono::seconds(5),
+                              [&] { return DiscoveryEntered; });
+  }
+  if (Entered)
+    expectContentModified(Idx.graphSnapshot({}));
+  {
+    std::lock_guard<std::mutex> Lock(GateMu);
+    ReleaseDiscovery = true;
+  }
+  GateCV.notify_all();
+  ASSERT_TRUE(Entered);
+  ASSERT_TRUE(Idx.blockUntilIdleForTest());
+  auto Snapshot = Idx.graphSnapshot({});
+  ASSERT_TRUE(bool(Snapshot)) << llvm::toString(Snapshot.takeError());
+  ASSERT_TRUE(Snapshot->getAsObject()->getArray("manifest"));
+  EXPECT_EQ(2u, Snapshot->getAsObject()->getArray("manifest")->size());
+}
+
+TEST_F(BackgroundIndexTest, CompleteMultiConfigurationGraphSnapshot) {
+  MockFS FS;
+  llvm::StringMap<std::string> Storage;
+  size_t CacheHits = 0;
+  MemoryShardStorage MSS(Storage, CacheHits);
+  MultiCommandCDB CDB;
+  const std::string File = testPath("dual.h");
+  FS.Files[File] =
+      "#ifdef LEGACY_FIRST\nint legacyFirst();\n#else\nint legacySecond();\n"
+      "#endif\n#ifdef __cplusplus\nclass Dual {};\n#else\nstruct Dual;\n"
+      "#endif";
+
+  tooling::CompileCommand C;
+  C.Filename = File;
+  C.Directory = testRoot();
+  C.CommandLine = {"clang", "-xc", "-DLEGACY_FIRST", "-fsyntax-only", File};
+  tooling::CompileCommand CXX = C;
+  CXX.CommandLine = {"clang++", "-xc++", "-fsyntax-only", File};
+  CDB.Commands[File] = {C, CXX};
+
+  BackgroundIndex Idx(FS, CDB, [&](llvm::StringRef) { return &MSS; }, {});
+  Idx.enqueue({File});
+  ASSERT_TRUE(Idx.blockUntilIdleForTest());
+
+  // Multi-configuration graph indexing must not change the representative
+  // command that owns clangd's ordinary symbol slabs.
+  EXPECT_EQ(1u, runFuzzyFind(Idx, "legacyFirst").size());
+  EXPECT_EQ(0u, runFuzzyFind(Idx, "legacySecond").size());
+
+  auto MainShard = MSS.loadShard(File);
+  ASSERT_TRUE(MainShard);
+  ASSERT_EQ(2u, MainShard->Graphs.size());
+  EXPECT_THAT(MainShard->Graphs,
+              UnorderedElementsAre(testing::Field(&GraphTU::Language, "c"),
+                                   testing::Field(&GraphTU::Language, "cpp")));
+  EXPECT_NE(MainShard->Graphs[0].CommandDigest,
+            MainShard->Graphs[1].CommandDigest);
+
+  auto First = Idx.graphSnapshot({});
+  ASSERT_TRUE(bool(First)) << llvm::toString(First.takeError());
+  auto *FirstObject = First->getAsObject();
+  ASSERT_TRUE(FirstObject);
+  ASSERT_TRUE(FirstObject->getArray("manifest"));
+  EXPECT_EQ(2u, FirstObject->getArray("manifest")->size());
+  ASSERT_TRUE(FirstObject->getArray("upserts"));
+  EXPECT_EQ(2u, FirstObject->getArray("upserts")->size());
+  for (const auto &Encoded : *FirstObject->getArray("upserts")) {
+    const auto *Shard = Encoded.getAsObject();
+    ASSERT_TRUE(Shard);
+    const auto *Coverage = Shard->getArray("coverage");
+    ASSERT_TRUE(Coverage);
+    ASSERT_EQ(15u, Coverage->size());
+    std::map<std::string, std::string> States;
+    for (const auto &EncodedRow : *Coverage) {
+      const auto *Row = EncodedRow.getAsObject();
+      ASSERT_TRUE(Row);
+      ASSERT_TRUE(Row->getString("family"));
+      ASSERT_TRUE(Row->getString("state"));
+      States[Row->getString("family")->str()] = Row->getString("state")->str();
+    }
+    EXPECT_EQ((std::map<std::string, std::string>{
+                  {"accesses", "complete"},
+                  {"calls", "partial"},
+                  {"contains", "complete"},
+                  {"decorates", "unsupported"},
+                  {"dispatches", "partial"},
+                  {"exports", "partial"},
+                  {"extends", "complete"},
+                  {"implements", "partial"},
+                  {"imports", "complete"},
+                  {"instantiates", "partial"},
+                  {"overrides", "complete"},
+                  {"references", "complete"},
+                  {"renders", "unsupported"},
+                  {"tests", "unsupported"},
+                  {"type_ref", "complete"},
+              }),
+              States);
+  }
+  auto Generation = FirstObject->getString("generation");
+  ASSERT_TRUE(Generation);
+
+  GraphSnapshotParams Params;
+  Params.KnownGeneration = Generation->str();
+  auto Noop = Idx.graphSnapshot(Params);
+  ASSERT_TRUE(bool(Noop)) << llvm::toString(Noop.takeError());
+  ASSERT_TRUE(Noop->getAsObject()->getArray("upserts"));
+  EXPECT_TRUE(Noop->getAsObject()->getArray("upserts")->empty());
+  EXPECT_EQ(Noop->getAsObject()->getString("baseGeneration"), Generation);
+
+  CDB.Commands[File][1].CommandLine.push_back("-DCOMMAND_MOVED");
+  expectContentModified(Idx.graphSnapshot({}));
+}
+
+TEST_F(BackgroundIndexTest, GraphSnapshotDeletesAreCanonical) {
+  MockFS FS;
+  llvm::StringMap<std::string> Storage;
+  size_t CacheHits = 0;
+  MemoryShardStorage MSS(Storage, CacheHits);
+  MultiCommandCDB CDB;
+  const std::string Removed = testPath("removed.cc");
+  const std::string Retained = testPath("retained.cc");
+  FS.Files[Removed] = "int removed();";
+  FS.Files[Retained] = "int retained();";
+
+  tooling::CompileCommand First;
+  First.Filename = Removed;
+  First.Directory = testRoot();
+  First.CommandLine = {"clang++", "-DFIRST", "-fsyntax-only", Removed};
+  tooling::CompileCommand Second = First;
+  Second.CommandLine = {"clang++", "-DSECOND", "-fsyntax-only", Removed};
+  tooling::CompileCommand Keep = First;
+  Keep.Filename = Retained;
+  Keep.CommandLine = {"clang++", "-fsyntax-only", Retained};
+  CDB.Commands[Removed] = {First, Second};
+  CDB.Commands[Retained] = {Keep};
+
+  BackgroundIndex Idx(FS, CDB, [&](llvm::StringRef) { return &MSS; }, {});
+  Idx.enqueue({Removed, Retained});
+  ASSERT_TRUE(Idx.blockUntilIdleForTest());
+  auto Initial = Idx.graphSnapshot({});
+  ASSERT_TRUE(bool(Initial)) << llvm::toString(Initial.takeError());
+  auto Generation = Initial->getAsObject()->getString("generation");
+  ASSERT_TRUE(Generation);
+
+  CDB.Commands.erase(Removed);
+  Idx.enqueue({Removed});
+  ASSERT_TRUE(Idx.blockUntilIdleForTest());
+  GraphSnapshotParams Params;
+  Params.KnownGeneration = Generation->str();
+  auto Delta = Idx.graphSnapshot(Params);
+  ASSERT_TRUE(bool(Delta)) << llvm::toString(Delta.takeError());
+  const auto *Deletes = Delta->getAsObject()->getArray("deletes");
+  ASSERT_TRUE(Deletes);
+  ASSERT_EQ(2u, Deletes->size());
+  ASSERT_TRUE((*Deletes)[0].getAsString());
+  ASSERT_TRUE((*Deletes)[1].getAsString());
+  EXPECT_LT(*(*Deletes)[0].getAsString(), *(*Deletes)[1].getAsString());
+}
+
+TEST_F(BackgroundIndexTest, FailedRefreshPreservesPublishedGraph) {
+  MockFS FS;
+  llvm::StringMap<std::string> Storage;
+  size_t CacheHits = 0;
+  MemoryShardStorage MSS(Storage, CacheHits);
+  OverlayCDB CDB(/*Base=*/nullptr);
+  const std::string File = testPath("A.cc");
+  FS.Files[File] = "int stable();";
+  tooling::CompileCommand Cmd;
+  Cmd.Filename = File;
+  Cmd.Directory = testRoot();
+  Cmd.CommandLine = {"clang++", "-fsyntax-only", File};
+  CDB.setCompileCommand(File, Cmd);
+  BackgroundIndex Idx(FS, CDB, [&](llvm::StringRef) { return &MSS; }, {});
+  Idx.enqueue({File});
+  ASSERT_TRUE(Idx.blockUntilIdleForTest());
+  std::string Published = Storage.lookup(File);
+  ASSERT_FALSE(Published.empty());
+  auto StableShard = MSS.loadShard(File);
+  ASSERT_TRUE(StableShard);
+  ASSERT_EQ(1u, StableShard->Graphs.size());
+  const std::string StableCommand = StableShard->Graphs.front().CommandDigest;
+
+  FS.Files[File] = "int moved();";
+  expectContentModified(Idx.graphSnapshot({}));
+
+  FS.Files[File] = "int broken(";
+  Idx.enqueueGraphDependents(std::vector<std::string>{File});
+  ASSERT_TRUE(Idx.blockUntilIdleForTest());
+  // The ordinary erroneous shard is still updated as clangd historically did,
+  // but its graph lane retains the last complete generation.
+  EXPECT_NE(Published, Storage.lookup(File));
+  EXPECT_EQ(0u, runFuzzyFind(Idx, "stable").size());
+  auto BrokenShard = MSS.loadShard(File);
+  ASSERT_TRUE(BrokenShard);
+  ASSERT_EQ(1u, BrokenShard->Graphs.size());
+  EXPECT_EQ(StableCommand, BrokenShard->Graphs.front().CommandDigest);
+  EXPECT_FALSE(BrokenShard->Graphs.front().HadErrors);
+  EXPECT_TRUE(llvm::any_of(
+      BrokenShard->Graphs.front().Symbols,
+      [](const GraphSymbol &Symbol) { return Symbol.Name == "stable"; }));
+  auto Rejected = Idx.graphSnapshot({});
+  EXPECT_FALSE(bool(Rejected));
+  if (!Rejected) {
+    bool WasLSPError = false;
+    llvm::handleAllErrors(
+        Rejected.takeError(), [&](const LSPError &) { WasLSPError = true; },
+        [](const llvm::ErrorInfoBase &) {});
+    EXPECT_FALSE(WasLSPError);
+  }
 }
 
 class BackgroundIndexRebuilderTest : public testing::Test {
@@ -968,6 +1387,26 @@ TEST(BackgroundQueueTest, Duplicates) {
 
   // This could reasonably be "ABB BBA", if we had good *re*indexing support.
   EXPECT_EQ("ABB BB", Sequence);
+}
+
+TEST(BackgroundQueueTest, RepeatWhileActive) {
+  BackgroundQueue Q;
+  std::string Sequence;
+  BackgroundQueue::Task First([&] {
+    Sequence.push_back('A');
+    BackgroundQueue::Task Again([&] { Sequence.push_back('A'); });
+    Again.Key = 1;
+    Again.Repeatable = true;
+    Q.push(std::move(Again));
+  });
+  First.Key = 1;
+  First.Repeatable = true;
+  Q.push(std::move(First));
+  Q.work([&] {
+    if (Sequence.size() == 2)
+      Q.stop();
+  });
+  EXPECT_EQ("AA", Sequence);
 }
 
 TEST(BackgroundQueueTest, Progress) {

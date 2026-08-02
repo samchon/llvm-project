@@ -192,7 +192,7 @@ public:
   /// background index. The request fails while indexing is incomplete, after
   /// an analysis error, or if source/CDB state moves during validation.
   llvm::Expected<llvm::json::Value>
-  graphSnapshot(const GraphSnapshotParams &Params) const;
+  graphSnapshot(const GraphSnapshotParams &Params);
 
   /// Reindexes every known translation unit that contains one of ChangedFiles.
   void enqueueGraphDependents(llvm::ArrayRef<std::string> ChangedFiles);
@@ -221,6 +221,7 @@ private:
     IndexFileIn Index;
     llvm::StringMap<ShardVersion> ShardVersionsSnapshot;
     bool HadErrors = false;
+    uint64_t SemanticMillis = 0;
   };
 
   llvm::Expected<IndexResult> index(tooling::CompileCommand);
@@ -238,10 +239,48 @@ private:
   size_t GraphDiscoveryPending = 0;
   llvm::StringSet<> GraphPending;
   llvm::StringMap<std::string> GraphFailures;
+  llvm::StringMap<std::string> GraphFailureTUs;
+  llvm::StringMap<std::vector<std::string>> GraphFailureInputs;
+  llvm::StringMap<std::map<std::string, uint64_t>> GraphSemanticMillis;
   uint64_t GraphRevision = 0;
   mutable uint64_t GraphSequence = 0;
   mutable std::string PublishedGeneration;
   mutable llvm::StringMap<std::string> PublishedManifest;
+  struct GraphSnapshotShardCache {
+    std::string MainKey;
+    std::string MainFile;
+    std::string Directory;
+    std::string CommandDigest;
+    std::string Key;
+    std::string Digest;
+    std::string CheckerDigest;
+    std::string InterfaceFingerprint;
+    std::vector<GraphSource> Sources;
+    uint64_t SemanticMillis = 0;
+  };
+  struct GraphSnapshotCache {
+    uint64_t Revision = 0;
+    std::string UniverseDigest;
+    std::string Generation;
+    std::vector<GraphSnapshotShardCache> Shards;
+    std::vector<std::string> Targets;
+    std::vector<std::string> Configurations;
+    std::vector<std::string> WorkspaceRoots;
+    std::vector<std::string> Toolchains;
+    uint64_t ShardMillis = 0;
+  };
+  struct GraphSnapshotPlan {
+    std::string Token;
+    std::optional<std::string> BaseGeneration;
+    uint64_t Sequence = 0;
+    std::vector<size_t> Upserts;
+    std::vector<std::string> Deletes;
+    uint64_t SemanticMillis = 0;
+    uint64_t ShardMillis = 0;
+    bool CacheHit = false;
+  };
+  mutable std::optional<GraphSnapshotCache> CachedGraphSnapshot;
+  mutable std::optional<GraphSnapshotPlan> ActiveGraphSnapshotPlan;
 
   BackgroundIndexStorage::Factory IndexStorageFactory;
   // Tries to load shards for the MainFiles and their dependencies.

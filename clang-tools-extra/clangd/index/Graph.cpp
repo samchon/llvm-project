@@ -8,6 +8,8 @@
 
 #include "Graph.h"
 #include "support/Path.h"
+#include "clang/Basic/Version.h"
+#include "clang/Driver/Types.h"
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/Support/Path.h"
 #include "llvm/Support/SHA256.h"
@@ -168,6 +170,20 @@ bool includeFromJSON(const llvm::json::Value &Value, GraphInclude &Include,
          O.map("evidence", Include.Evidence);
 }
 
+llvm::json::Value missingIncludeJSON(const GraphMissingInclude &Include) {
+  return llvm::json::Object{{"source", Include.SourceURI},
+                            {"spelling", Include.Spelling},
+                            {"angled", Include.Angled}};
+}
+
+bool missingIncludeFromJSON(const llvm::json::Value &Value,
+                            GraphMissingInclude &Include,
+                            llvm::json::Path Path) {
+  llvm::json::ObjectMapper O(Value, Path);
+  return O && O.map("source", Include.SourceURI) &&
+         O.map("spelling", Include.Spelling) && O.map("angled", Include.Angled);
+}
+
 llvm::json::Value moduleJSON(const GraphModule &Module) {
   return llvm::json::Object{{"name", Module.Name},
                             {"roles", Module.Roles},
@@ -214,7 +230,9 @@ bool diagnosticFromJSON(const llvm::json::Value &Value,
 bool fromJSON(const llvm::json::Value &Value, GraphSnapshotParams &Params,
               llvm::json::Path Path) {
   llvm::json::ObjectMapper O(Value, Path);
-  return O && O.mapOptional("knownGeneration", Params.KnownGeneration);
+  return O && O.mapOptional("knownGeneration", Params.KnownGeneration) &&
+         O.mapOptional("cursor", Params.Cursor) &&
+         O.mapOptional("maxShards", Params.MaxShards);
 }
 
 bool fromJSON(const llvm::json::Value &Value, GraphRange &Range,
@@ -252,6 +270,11 @@ bool fromJSON(const llvm::json::Value &Value, GraphInclude &Include,
   return includeFromJSON(Value, Include, Path);
 }
 
+bool fromJSON(const llvm::json::Value &Value, GraphMissingInclude &Include,
+              llvm::json::Path Path) {
+  return missingIncludeFromJSON(Value, Include, Path);
+}
+
 bool fromJSON(const llvm::json::Value &Value, GraphModule &Module,
               llvm::json::Path Path) {
   return moduleFromJSON(Value, Module, Path);
@@ -269,6 +292,7 @@ bool fromJSON(const llvm::json::Value &Value, GraphDiagnostic &Diagnostic,
 
 llvm::json::Value toJSON(const GraphTU &Graph) {
   return llvm::json::Object{
+      {"producerFingerprint", Graph.ProducerFingerprint},
       {"mainFileUri", Graph.MainFileURI},
       {"mainFile", Graph.MainFile},
       {"directory", Graph.Directory},
@@ -284,6 +308,7 @@ llvm::json::Value toJSON(const GraphTU &Graph) {
       {"relations", arrayJSON(Graph.Relations, relationJSON)},
       {"macros", arrayJSON(Graph.Macros, macroJSON)},
       {"includes", arrayJSON(Graph.Includes, includeJSON)},
+      {"missingIncludes", arrayJSON(Graph.MissingIncludes, missingIncludeJSON)},
       {"modules", arrayJSON(Graph.Modules, moduleJSON)},
       {"diagnostics", arrayJSON(Graph.Diagnostics, diagnosticJSON)}};
 }
@@ -291,7 +316,8 @@ llvm::json::Value toJSON(const GraphTU &Graph) {
 bool fromJSON(const llvm::json::Value &Value, GraphTU &Graph,
               llvm::json::Path Path) {
   llvm::json::ObjectMapper O(Value, Path);
-  return O && O.map("mainFileUri", Graph.MainFileURI) &&
+  return O && O.map("producerFingerprint", Graph.ProducerFingerprint) &&
+         O.map("mainFileUri", Graph.MainFileURI) &&
          O.map("mainFile", Graph.MainFile) &&
          O.map("directory", Graph.Directory) &&
          O.map("commandLine", Graph.CommandLine) &&
@@ -303,7 +329,9 @@ bool fromJSON(const llvm::json::Value &Value, GraphTU &Graph,
          O.map("sources", Graph.Sources) && O.map("symbols", Graph.Symbols) &&
          O.map("occurrences", Graph.Occurrences) &&
          O.map("relations", Graph.Relations) && O.map("macros", Graph.Macros) &&
-         O.map("includes", Graph.Includes) && O.map("modules", Graph.Modules) &&
+         O.map("includes", Graph.Includes) &&
+         O.map("missingIncludes", Graph.MissingIncludes) &&
+         O.map("modules", Graph.Modules) &&
          O.map("diagnostics", Graph.Diagnostics);
 }
 
@@ -336,6 +364,55 @@ std::string graphCommandDigest(const tooling::CompileCommand &Command) {
                                                    : Argument);
   }
   return graphDigest(OS.str());
+}
+
+std::string graphProducerFingerprint() {
+  static const std::string Fingerprint = graphDigest(
+      (llvm::Twine("samchon-graph-schema:1\nversion:") + getClangFullVersion() +
+       "\nrepository:" + getClangFullRepositoryVersion())
+          .str());
+  return Fingerprint;
+}
+
+bool graphCommandIsCOrCXX(const tooling::CompileCommand &Command) {
+  namespace types = clang::driver::types;
+  types::ID Type = types::TY_INVALID;
+  auto SetType = [&](llvm::StringRef Name) {
+    if (Name == "none") {
+      Type = types::TY_INVALID;
+      return;
+    }
+    std::string Owned = Name.str();
+    Type = types::lookupTypeForTypeSpecifier(Owned.c_str());
+  };
+  for (size_t I = 0; I < Command.CommandLine.size(); ++I) {
+    llvm::StringRef Argument = Command.CommandLine[I];
+    if (Argument == "-x" && I + 1 < Command.CommandLine.size()) {
+      SetType(Command.CommandLine[++I]);
+      continue;
+    }
+    if (Argument.starts_with("-x") && Argument.size() > 2) {
+      SetType(Argument.drop_front(2));
+      continue;
+    }
+    if (Argument.equals_insensitive("/TC") ||
+        Argument.starts_with_insensitive("/Tc")) {
+      SetType("c");
+      continue;
+    }
+    if (Argument.equals_insensitive("/TP") ||
+        Argument.starts_with_insensitive("/Tp"))
+      SetType("c++");
+  }
+  if (Type == types::TY_INVALID) {
+    llvm::StringRef Extension = llvm::sys::path::extension(Command.Filename);
+    if (Extension.consume_front("."))
+      Type = types::lookupTypeForExtension(Extension);
+  }
+  return Type != types::TY_INVALID && types::isDerivedFromC(Type) &&
+         !types::isObjC(Type) && !types::isCuda(Type) && !types::isHIP(Type) &&
+         !types::isOpenCL(Type) && !types::isHLSL(Type) &&
+         !types::onlyPrecompileType(Type);
 }
 
 } // namespace clangd

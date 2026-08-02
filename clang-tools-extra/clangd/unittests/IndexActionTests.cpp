@@ -7,10 +7,12 @@
 //===----------------------------------------------------------------------===//
 
 #include "Headers.h"
+#include "SourceCode.h"
 #include "TestFS.h"
 #include "URI.h"
 #include "index/IndexAction.h"
 #include "index/Serialization.h"
+#include "support/Context.h"
 #include "clang/Basic/SourceLocation.h"
 #include "clang/Basic/SourceManager.h"
 #include "clang/Tooling/Tooling.h"
@@ -214,6 +216,43 @@ Derived make() { return Derived{}; }
   }));
 }
 
+TEST_F(IndexActionTest, GraphOffsetsAreFixedUTF16AndDoNotSaturate) {
+  Opts.CollectGraph = true;
+  const std::string Main = testPath("wide.cpp");
+  const std::string Prefix = std::string("/*😀*/") + std::string(5000, ' ');
+  addFile(Main, Prefix + "int veryLongSymbol;\n");
+
+  IndexFileIn UTF8;
+  {
+    WithContextValue Negotiated(kCurrentOffsetEncoding, OffsetEncoding::UTF8);
+    UTF8 = runIndexingAction(Main);
+  }
+  IndexFileIn UTF32;
+  {
+    WithContextValue Negotiated(kCurrentOffsetEncoding, OffsetEncoding::UTF32);
+    UTF32 = runIndexingAction(Main);
+  }
+  auto Find = [](const IndexFileIn &Indexed) -> const GraphSymbol * {
+    if (Indexed.Graphs.size() != 1)
+      return nullptr;
+    auto It = llvm::find_if(Indexed.Graphs.front().Symbols,
+                            [](const GraphSymbol &Symbol) {
+                              return Symbol.Name == "veryLongSymbol";
+                            });
+    return It == Indexed.Graphs.front().Symbols.end() ? nullptr : &*It;
+  };
+  const GraphSymbol *UTF8Symbol = Find(UTF8);
+  const GraphSymbol *UTF32Symbol = Find(UTF32);
+  ASSERT_TRUE(UTF8Symbol);
+  ASSERT_TRUE(UTF32Symbol);
+  EXPECT_EQ(5006u, UTF8Symbol->Declaration.StartColumn);
+  EXPECT_EQ(5024u, UTF8Symbol->Declaration.EndColumn);
+  EXPECT_EQ(UTF8Symbol->Declaration.StartColumn,
+            UTF32Symbol->Declaration.StartColumn);
+  EXPECT_EQ(UTF8Symbol->Declaration.EndColumn,
+            UTF32Symbol->Declaration.EndColumn);
+}
+
 TEST(GraphTest, CommandDigestNormalizesEquivalentInputSpelling) {
   tooling::CompileCommand Native;
   Native.Directory = "C:/project";
@@ -233,6 +272,25 @@ TEST(GraphTest, CommandDigestNormalizesEquivalentInputSpelling) {
 #endif
   Slashes.CommandLine[1] = "-DVALUE=a/b";
   EXPECT_NE(graphCommandDigest(Native), graphCommandDigest(Slashes));
+}
+
+TEST(GraphTest, OnlyPlainCAndCXXCommandsAreAuthoritative) {
+  tooling::CompileCommand Command;
+  Command.Directory = testRoot();
+  Command.Filename = testPath("main.cpp");
+  Command.CommandLine = {"clang++", "-fsyntax-only", Command.Filename};
+  EXPECT_TRUE(graphCommandIsCOrCXX(Command));
+
+  Command.Filename = testPath("main.c");
+  Command.CommandLine = {"clang", "-fsyntax-only", Command.Filename};
+  EXPECT_TRUE(graphCommandIsCOrCXX(Command));
+  for (const auto &Language :
+       {"objective-c", "objective-c++", "cuda", "hip", "cl", "clcpp"}) {
+    Command.Filename = testPath("mixed.cpp");
+    Command.CommandLine = {"clang", "-x", Language, "-fsyntax-only",
+                           Command.Filename};
+    EXPECT_FALSE(graphCommandIsCOrCXX(Command)) << Language;
+  }
 }
 
 TEST_F(IndexActionTest, IncludeGraphSelfInclude) {

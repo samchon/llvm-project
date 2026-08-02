@@ -93,6 +93,10 @@ public:
                           llvm::StringRef RelativePath,
                           const Module *SuggestedModule, bool ModuleImported,
                           SrcMgr::CharacteristicKind FileType) override {
+    if (!File) {
+      Collector->recordGraphMissingInclude(HashLoc, FileName, IsAngled);
+      return;
+    }
     auto IncludeURI = toURI(File);
     if (!IncludeURI)
       return;

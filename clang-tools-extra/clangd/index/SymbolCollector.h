@@ -168,6 +168,8 @@ public:
   void recordGraphInclude(SourceLocation HashLoc, llvm::StringRef FileName,
                           bool IsAngled, OptionalFileEntryRef File,
                           bool ModuleImported);
+  void recordGraphMissingInclude(SourceLocation HashLoc,
+                                 llvm::StringRef FileName, bool IsAngled);
   void recordGraphSource(FileID FID, llvm::StringRef URI,
                          IncludeGraphNode::SourceFlag Flags);
 

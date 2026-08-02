@@ -1123,6 +1123,267 @@ TEST_F(BackgroundIndexTest, CompleteMultiConfigurationGraphSnapshot) {
   expectContentModified(Idx.graphSnapshot({}));
 }
 
+TEST_F(BackgroundIndexTest, GeneratedHeaderCreationRetriesFailedGraph) {
+  MockFS FS;
+  llvm::StringMap<std::string> Storage;
+  size_t CacheHits = 0;
+  MemoryShardStorage MSS(Storage, CacheHits);
+  MultiCommandCDB CDB;
+  const std::string File = testPath("generated.cc");
+  const std::string Header = testPath("generated.h");
+  FS.Files[File] = "#include \"generated.h\"\nint use() { return made(); }";
+  tooling::CompileCommand Command;
+  Command.Filename = File;
+  Command.Directory = testRoot();
+  Command.CommandLine = {"clang++", "-fsyntax-only", File};
+  CDB.Commands[File] = {Command};
+
+  BackgroundIndex Idx(FS, CDB, [&](llvm::StringRef) { return &MSS; }, {});
+  Idx.enqueue({File});
+  ASSERT_TRUE(Idx.blockUntilIdleForTest());
+  auto Failed = Idx.graphSnapshot({});
+  ASSERT_FALSE(Failed);
+  llvm::consumeError(Failed.takeError());
+
+  FS.Files[Header] = "inline int made() { return 1; }";
+  expectContentModified(Idx.graphSnapshot({}));
+  ASSERT_TRUE(Idx.blockUntilIdleForTest());
+  auto Recovered = Idx.graphSnapshot({});
+  ASSERT_TRUE(bool(Recovered)) << llvm::toString(Recovered.takeError());
+  const auto *Upserts = Recovered->getAsObject()->getArray("upserts");
+  ASSERT_TRUE(Upserts);
+  ASSERT_EQ(1u, Upserts->size());
+  const auto *Graph = (*Upserts)[0].getAsObject()->getObject("graph");
+  ASSERT_TRUE(Graph);
+  const auto *Includes = Graph->getArray("includes");
+  ASSERT_TRUE(Includes);
+  ASSERT_EQ(1u, Includes->size());
+  EXPECT_EQ((*Includes)[0].getAsObject()->getString("target"),
+            URI::create(Header).toString());
+}
+
+TEST_F(BackgroundIndexTest, PersistedGraphRequiresCurrentProducerFingerprint) {
+  MockFS FS;
+  llvm::StringMap<std::string> Storage;
+  size_t CacheHits = 0;
+  MemoryShardStorage MSS(Storage, CacheHits);
+  MultiCommandCDB CDB;
+  const std::string File = testPath("persisted.cc");
+  FS.Files[File] = "int persisted();";
+  tooling::CompileCommand Command;
+  Command.Filename = File;
+  Command.Directory = testRoot();
+  Command.CommandLine = {"clang++", "-fsyntax-only", File};
+  CDB.Commands[File] = {Command};
+
+  {
+    BackgroundIndex Idx(FS, CDB, [&](llvm::StringRef) { return &MSS; }, {});
+    Idx.enqueue({File});
+    ASSERT_TRUE(Idx.blockUntilIdleForTest());
+    ASSERT_TRUE(bool(Idx.graphSnapshot({})));
+  }
+  auto Stored = Storage.find(File);
+  ASSERT_NE(Stored, Storage.end());
+  const std::string Fingerprint = graphProducerFingerprint();
+  const size_t FingerprintAt = Stored->getValue().find(Fingerprint);
+  ASSERT_NE(std::string::npos, FingerprintAt);
+  Stored->getValue().replace(FingerprintAt, Fingerprint.size(),
+                             Fingerprint.size(), '0');
+
+  BackgroundIndex Reloaded(FS, CDB, [&](llvm::StringRef) { return &MSS; }, {});
+  Reloaded.enqueue({File});
+  ASSERT_TRUE(Reloaded.blockUntilIdleForTest());
+  auto Snapshot = Reloaded.graphSnapshot({});
+  ASSERT_TRUE(bool(Snapshot)) << llvm::toString(Snapshot.takeError());
+  const auto *Upserts = Snapshot->getAsObject()->getArray("upserts");
+  ASSERT_TRUE(Upserts);
+  ASSERT_EQ(1u, Upserts->size());
+  const auto *Graph = (*Upserts)[0].getAsObject()->getObject("graph");
+  ASSERT_TRUE(Graph);
+  EXPECT_EQ(Graph->getString("producerFingerprint"), Fingerprint);
+}
+
+TEST_F(BackgroundIndexTest, GraphSnapshotPagesShardsAndMeasuresWork) {
+  MockFS FS;
+  llvm::StringMap<std::string> Storage;
+  size_t CacheHits = 0;
+  MemoryShardStorage MSS(Storage, CacheHits);
+  MultiCommandCDB CDB;
+  std::vector<std::string> Files;
+  for (const char *Name : {"one.cc", "two.cc", "three.cc"}) {
+    std::string File = testPath(Name);
+    FS.Files[File] =
+        (llvm::Twine("int ") + llvm::sys::path::stem(Name) + "();").str();
+    tooling::CompileCommand Command;
+    Command.Filename = File;
+    Command.Directory = testRoot();
+    Command.CommandLine = {"clang++", "-fsyntax-only", File};
+    CDB.Commands[File] = {Command};
+    Files.push_back(std::move(File));
+  }
+  BackgroundIndex Idx(FS, CDB, [&](llvm::StringRef) { return &MSS; }, {});
+  Idx.enqueue(Files);
+  ASSERT_TRUE(Idx.blockUntilIdleForTest());
+
+  GraphSnapshotParams Params;
+  Params.MaxShards = 1;
+  auto First = Idx.graphSnapshot(Params);
+  ASSERT_TRUE(bool(First)) << llvm::toString(First.takeError());
+  const auto *FirstObject = First->getAsObject();
+  ASSERT_TRUE(FirstObject);
+  ASSERT_EQ(3u, FirstObject->getArray("manifest")->size());
+  ASSERT_EQ(1u, FirstObject->getArray("upserts")->size());
+  const auto Generation = FirstObject->getString("generation");
+  const auto Sequence = FirstObject->getInteger("sequence");
+  ASSERT_TRUE(Generation);
+  ASSERT_TRUE(Sequence);
+  const auto *FirstPhases = FirstObject->getObject("phases");
+  ASSERT_TRUE(FirstPhases);
+  EXPECT_GT(*FirstPhases->getInteger("semanticMillis"), 0);
+  EXPECT_GT(*FirstPhases->getInteger("shardMillis"), 0);
+  EXPECT_EQ(FirstPhases->getBoolean("cacheHit"), false);
+
+  const auto *FirstPage = FirstObject->getObject("page");
+  ASSERT_TRUE(FirstPage);
+  ASSERT_EQ(3, *FirstPage->getInteger("total"));
+  auto Cursor = FirstPage->getString("nextCursor");
+  ASSERT_TRUE(Cursor);
+  size_t Seen = 1;
+  while (Cursor) {
+    Params.Cursor = Cursor->str();
+    auto Next = Idx.graphSnapshot(Params);
+    ASSERT_TRUE(bool(Next)) << llvm::toString(Next.takeError());
+    const auto *Object = Next->getAsObject();
+    ASSERT_TRUE(Object);
+    EXPECT_EQ(Object->getString("generation"), Generation);
+    EXPECT_EQ(Object->getInteger("sequence"), Sequence);
+    EXPECT_TRUE(Object->getArray("manifest")->empty());
+    ASSERT_EQ(1u, Object->getArray("upserts")->size());
+    const auto *Page = Object->getObject("page");
+    ASSERT_TRUE(Page);
+    EXPECT_EQ(static_cast<int64_t>(Seen), *Page->getInteger("offset"));
+    const auto *Phases = Object->getObject("phases");
+    ASSERT_TRUE(Phases);
+    EXPECT_EQ(0, *Phases->getInteger("semanticMillis"));
+    EXPECT_EQ(0, *Phases->getInteger("shardMillis"));
+    ++Seen;
+    Cursor = Page->getString("nextCursor");
+  }
+  EXPECT_EQ(3u, Seen);
+
+  GraphSnapshotParams NoopParams;
+  NoopParams.KnownGeneration = Generation->str();
+  NoopParams.MaxShards = 1;
+  auto Noop = Idx.graphSnapshot(NoopParams);
+  ASSERT_TRUE(bool(Noop)) << llvm::toString(Noop.takeError());
+  const auto *NoopObject = Noop->getAsObject();
+  ASSERT_TRUE(NoopObject->getArray("manifest")->empty());
+  ASSERT_TRUE(NoopObject->getArray("upserts")->empty());
+  const auto *NoopPhases = NoopObject->getObject("phases");
+  ASSERT_TRUE(NoopPhases);
+  EXPECT_EQ(NoopPhases->getBoolean("cacheHit"), true);
+  EXPECT_EQ(0, *NoopPhases->getInteger("semanticMillis"));
+  EXPECT_EQ(0, *NoopPhases->getInteger("shardMillis"));
+  EXPECT_GT(*NoopPhases->getInteger("encodeMillis"), 0);
+  EXPECT_EQ(*NoopPhases->getInteger("totalMillis"),
+            *NoopPhases->getInteger("encodeMillis"));
+}
+
+TEST_F(BackgroundIndexTest, MixedClangLanguagesPublishOnlyCAndCXX) {
+  MockFS FS;
+  llvm::StringMap<std::string> Storage;
+  size_t CacheHits = 0;
+  MemoryShardStorage MSS(Storage, CacheHits);
+  MultiCommandCDB CDB;
+  struct Fixture {
+    const char *Name;
+    const char *Language;
+    const char *Source;
+  } Fixtures[] = {{"plain.c", "c", "int plain_c(void);"},
+                  {"plain.cpp", "c++", "int plain_cpp();"},
+                  {"objective.m", "objective-c", "@interface Obj @end"},
+                  {"objective.mm", "objective-c++", "@interface ObjCpp @end"},
+                  {"device.cu", "cuda", "int device_value;"}};
+  std::vector<std::string> Files;
+  for (const auto &Fixture : Fixtures) {
+    std::string File = testPath(Fixture.Name);
+    FS.Files[File] = Fixture.Source;
+    tooling::CompileCommand Command;
+    Command.Filename = File;
+    Command.Directory = testRoot();
+    Command.CommandLine = {"clang", "-x", Fixture.Language, "-fsyntax-only",
+                           File};
+    if (llvm::StringRef(Fixture.Language) == "cuda") {
+      Command.CommandLine.insert(
+          Command.CommandLine.end() - 1,
+          {"--cuda-host-only", "-nocudainc", "-nocudalib"});
+    }
+    CDB.Commands[File] = {Command};
+    Files.push_back(std::move(File));
+  }
+  BackgroundIndex Idx(FS, CDB, [&](llvm::StringRef) { return &MSS; }, {});
+  Idx.enqueue(Files);
+  ASSERT_TRUE(Idx.blockUntilIdleForTest());
+  auto Snapshot = Idx.graphSnapshot({});
+  ASSERT_TRUE(bool(Snapshot)) << llvm::toString(Snapshot.takeError());
+  const auto *Upserts = Snapshot->getAsObject()->getArray("upserts");
+  ASSERT_TRUE(Upserts);
+  ASSERT_EQ(2u, Upserts->size());
+  std::set<std::string> Languages;
+  for (const auto &Shard : *Upserts)
+    Languages.insert(
+        Shard.getAsObject()->getObject("graph")->getString("language")->str());
+  EXPECT_EQ((std::set<std::string>{"c", "cpp"}), Languages);
+}
+
+TEST_F(BackgroundIndexTest, HeaderViewsStayOwnedByTheirTranslationUnits) {
+  MockFS FS;
+  llvm::StringMap<std::string> Storage;
+  size_t CacheHits = 0;
+  MemoryShardStorage MSS(Storage, CacheHits);
+  MultiCommandCDB CDB;
+  const std::string Header = testPath("shared.h");
+  const std::string CFile = testPath("owner.c");
+  const std::string CXXFile = testPath("owner.cpp");
+  FS.Files[Header] =
+      "#ifdef __cplusplus\nclass Shared {};\n#else\nstruct Shared;\n#endif";
+  FS.Files[CFile] = "#include \"shared.h\"\nstruct Shared *c_owner;";
+  FS.Files[CXXFile] = "#include \"shared.h\"\nShared cpp_owner;";
+  for (const auto &Entry :
+       {std::pair<std::string, std::string>{CFile, "c"},
+        std::pair<std::string, std::string>{CXXFile, "c++"}}) {
+    tooling::CompileCommand Command;
+    Command.Filename = Entry.first;
+    Command.Directory = testRoot();
+    Command.CommandLine = {"clang", "-x", Entry.second, "-fsyntax-only",
+                           Entry.first};
+    CDB.Commands[Entry.first] = {Command};
+  }
+  BackgroundIndex Idx(FS, CDB, [&](llvm::StringRef) { return &MSS; }, {});
+  Idx.enqueue({CFile, CXXFile});
+  ASSERT_TRUE(Idx.blockUntilIdleForTest());
+  auto Snapshot = Idx.graphSnapshot({});
+  ASSERT_TRUE(bool(Snapshot)) << llvm::toString(Snapshot.takeError());
+  const auto *Upserts = Snapshot->getAsObject()->getArray("upserts");
+  ASSERT_TRUE(Upserts);
+  ASSERT_EQ(2u, Upserts->size());
+  std::set<std::pair<std::string, std::string>> Views;
+  for (const auto &Shard : *Upserts) {
+    const auto *Graph = Shard.getAsObject()->getObject("graph");
+    ASSERT_TRUE(Graph);
+    bool HasSharedHeader = false;
+    for (const auto &Source : *Graph->getArray("sources"))
+      HasSharedHeader |= Source.getAsObject()->getString("uri") ==
+                         URI::create(Header).toString();
+    EXPECT_TRUE(HasSharedHeader);
+    Views.emplace(Graph->getString("mainFile")->str(),
+                  Graph->getString("language")->str());
+  }
+  EXPECT_EQ((std::set<std::pair<std::string, std::string>>{{CFile, "c"},
+                                                           {CXXFile, "cpp"}}),
+            Views);
+}
+
 TEST_F(BackgroundIndexTest, GraphSnapshotDeletesAreCanonical) {
   MockFS FS;
   llvm::StringMap<std::string> Storage;

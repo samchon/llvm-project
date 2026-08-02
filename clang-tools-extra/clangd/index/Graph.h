@@ -23,13 +23,16 @@ namespace clangd {
 
 struct GraphSnapshotParams {
   std::optional<std::string> KnownGeneration;
+  std::optional<std::string> Cursor;
+  std::optional<uint32_t> MaxShards;
 };
 
 bool fromJSON(const llvm::json::Value &Value, GraphSnapshotParams &Params,
               llvm::json::Path Path);
 
-/// Source range retained for graph export. Positions are zero-based UTF-8 byte
-/// offsets within their line, matching clangd's background-index coordinates.
+/// Source range retained for graph export. Positions are zero-based UTF-16
+/// code-unit offsets within their line, independent of the LSP session's
+/// negotiated offset encoding.
 struct GraphRange {
   std::string FileURI;
   uint32_t StartLine = 0;
@@ -111,6 +114,15 @@ struct GraphInclude {
   GraphRange Evidence;
 };
 
+/// An include that the compiler could not resolve. These rows are retained on
+/// failed analyses only so the resident producer can notice generated inputs
+/// appearing and retry their owning translation unit.
+struct GraphMissingInclude {
+  std::string SourceURI;
+  std::string Spelling;
+  bool Angled = false;
+};
+
 struct GraphModule {
   std::string Name;
   uint32_t Roles = 0;
@@ -134,6 +146,9 @@ struct GraphDiagnostic {
 /// This object is persisted only in the main-file shard, so header facts retain
 /// the TU/configuration that gave them meaning.
 struct GraphTU {
+  /// Fingerprint of the exact compiler/fork/schema that produced these facts.
+  /// Persisted shards are accepted only when this matches the running binary.
+  std::string ProducerFingerprint;
   std::string MainFileURI;
   std::string MainFile;
   std::string Directory;
@@ -149,6 +164,7 @@ struct GraphTU {
   std::vector<GraphRelation> Relations;
   std::vector<GraphMacro> Macros;
   std::vector<GraphInclude> Includes;
+  std::vector<GraphMissingInclude> MissingIncludes;
   std::vector<GraphModule> Modules;
   std::vector<GraphDiagnostic> Diagnostics;
 };
@@ -168,6 +184,8 @@ bool fromJSON(const llvm::json::Value &Value, GraphMacro &Macro,
               llvm::json::Path Path);
 bool fromJSON(const llvm::json::Value &Value, GraphInclude &Include,
               llvm::json::Path Path);
+bool fromJSON(const llvm::json::Value &Value, GraphMissingInclude &Include,
+              llvm::json::Path Path);
 bool fromJSON(const llvm::json::Value &Value, GraphModule &Module,
               llvm::json::Path Path);
 bool fromJSON(const llvm::json::Value &Value, GraphSource &Source,
@@ -180,6 +198,8 @@ bool fromJSON(const llvm::json::Value &Value, GraphTU &Graph,
 /// SHA-256 used by graph protocol identities and manifests.
 std::string graphDigest(llvm::StringRef Bytes);
 std::string graphCommandDigest(const tooling::CompileCommand &Command);
+std::string graphProducerFingerprint();
+bool graphCommandIsCOrCXX(const tooling::CompileCommand &Command);
 
 } // namespace clangd
 } // namespace clang

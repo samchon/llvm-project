@@ -138,13 +138,17 @@ public:
         auto Canonical = getCanonicalPath(*File, SM.getFileManager());
         if (Canonical)
           Result.Range.FileURI = URI::create(*Canonical).toString();
-        Result.Range.StartLine = SM.getSpellingLineNumber(Location) - 1;
-        Result.Range.StartColumn = SM.getSpellingColumnNumber(Location) - 1;
-        Result.Range.EndLine = Result.Range.StartLine;
+        WithContextValue FixedEncoding(kCurrentOffsetEncoding,
+                                       OffsetEncoding::UTF16);
+        Position Begin = sourceLocToPosition(SM, Location);
         unsigned Length =
             Lang ? Lexer::MeasureTokenLength(Location, SM, *Lang) : 1;
-        Result.Range.EndColumn =
-            Result.Range.StartColumn + std::max(Length, 1u);
+        Position End = sourceLocToPosition(
+            SM, Location.getLocWithOffset(std::max(Length, 1u)));
+        Result.Range.StartLine = Begin.line;
+        Result.Range.StartColumn = Begin.character;
+        Result.Range.EndLine = End.line;
+        Result.Range.EndColumn = End.character;
       }
     }
     Diagnostics.push_back(std::move(Result));
@@ -166,6 +170,66 @@ llvm::Error contentModified(const char *Format, Args &&...Arguments) {
 
 std::string graphMainKey(llvm::StringRef Path) {
   return maybeCaseFoldPath(llvm::sys::path::convert_to_slash(removeDots(Path)));
+}
+
+uint64_t elapsedMillis(std::chrono::steady_clock::time_point Started) {
+  auto Elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                     std::chrono::steady_clock::now() - Started)
+                     .count();
+  return static_cast<uint64_t>(std::max<int64_t>(Elapsed, 1));
+}
+
+std::vector<std::string> graphMissingIncludeCandidates(const GraphTU &Graph) {
+  std::set<std::string> IncludeRoots;
+  IncludeRoots.insert(Graph.Directory);
+  for (size_t I = 0; I < Graph.CommandLine.size(); ++I) {
+    llvm::StringRef Argument = Graph.CommandLine[I];
+    llvm::StringRef Root;
+    if ((Argument == "-I" || Argument == "-iquote" || Argument == "-isystem" ||
+         Argument.equals_insensitive("/I")) &&
+        I + 1 < Graph.CommandLine.size()) {
+      Root = Graph.CommandLine[++I];
+    } else if (Argument.starts_with("-I") && Argument.size() > 2) {
+      Root = Argument.drop_front(2);
+    } else if (Argument.starts_with_insensitive("/I") && Argument.size() > 2) {
+      Root = Argument.drop_front(2);
+    }
+    if (!Root.empty()) {
+      llvm::SmallString<128> Absolute(Root);
+      if (!llvm::sys::path::is_absolute(Absolute)) {
+        Absolute = Graph.Directory;
+        llvm::sys::path::append(Absolute, Root);
+      }
+      llvm::sys::path::remove_dots(Absolute, true);
+      IncludeRoots.insert(Absolute.str().str());
+    }
+  }
+
+  std::set<std::string> Candidates;
+  for (const auto &Missing : Graph.MissingIncludes) {
+    if (llvm::sys::path::is_absolute(Missing.Spelling)) {
+      Candidates.insert(removeDots(Missing.Spelling));
+      continue;
+    }
+    if (!Missing.Angled) {
+      auto Source = URI::resolve(Missing.SourceURI, Graph.MainFile);
+      if (Source) {
+        llvm::SmallString<128> Candidate(llvm::sys::path::parent_path(*Source));
+        llvm::sys::path::append(Candidate, Missing.Spelling);
+        llvm::sys::path::remove_dots(Candidate, true);
+        Candidates.insert(Candidate.str().str());
+      } else {
+        llvm::consumeError(Source.takeError());
+      }
+    }
+    for (const auto &Root : IncludeRoots) {
+      llvm::SmallString<128> Candidate(Root);
+      llvm::sys::path::append(Candidate, Missing.Spelling);
+      llvm::sys::path::remove_dots(Candidate, true);
+      Candidates.insert(Candidate.str().str());
+    }
+  }
+  return {Candidates.begin(), Candidates.end()};
 }
 
 } // namespace
@@ -256,7 +320,9 @@ static bool isGraphTranslationUnit(llvm::StringRef Path) {
   if (Extension.consume_front(".")) {
     const auto Type = types::lookupTypeForExtension(Extension);
     return Type != types::TY_INVALID && types::isDerivedFromC(Type) &&
-           !types::onlyPrecompileType(Type);
+           !types::isObjC(Type) && !types::isCuda(Type) &&
+           !types::isHIP(Type) && !types::isOpenCL(Type) &&
+           !types::isHLSL(Type) && !types::onlyPrecompileType(Type);
   }
   return false;
 }
@@ -270,39 +336,76 @@ BackgroundQueue::Task BackgroundIndex::indexFileTask(std::string Path) {
       WithProvidedContext.emplace(ContextProvider(Path));
     auto Commands = CDB.getCompileCommands(Path);
     std::optional<std::string> LegacyCommandDigest;
+    std::optional<tooling::CompileCommand> UnsupportedLegacyCommand;
     if (!Commands.empty())
       LegacyCommandDigest = graphCommandDigest(Commands.front());
+    if (!Commands.empty() && !graphCommandIsCOrCXX(Commands.front()))
+      UnsupportedLegacyCommand = Commands.front();
     std::map<std::string, tooling::CompileCommand> Configurations;
     for (auto &Command : Commands)
-      Configurations.try_emplace(graphCommandDigest(Command),
-                                 std::move(Command));
+      if (graphCommandIsCOrCXX(Command))
+        Configurations.try_emplace(graphCommandDigest(Command),
+                                   std::move(Command));
     const std::string GraphKey = graphMainKey(Path);
 
     {
       std::lock_guard<std::mutex> Lock(GraphMu);
       GraphPending.insert(GraphKey);
       GraphFailures.erase(GraphKey);
+      GraphFailureTUs.erase(GraphKey);
+      GraphFailureInputs.erase(GraphKey);
     }
 
-    auto Fail = [&](llvm::StringRef Message) {
+    auto Fail = [&](llvm::StringRef Message,
+                    const std::vector<std::string> &MissingInputs) {
       std::lock_guard<std::mutex> Lock(GraphMu);
       GraphPending.erase(GraphKey);
       GraphFailures[GraphKey] = Message.str();
+      GraphFailureTUs[GraphKey] = Path;
+      if (MissingInputs.empty())
+        GraphFailureInputs.erase(GraphKey);
+      else
+        GraphFailureInputs[GraphKey] = MissingInputs;
       ++GraphRevision;
     };
 
     if (Configurations.empty()) {
+      if (UnsupportedLegacyCommand) {
+        auto Legacy = index(std::move(*UnsupportedLegacyCommand));
+        if (Legacy) {
+          Legacy->Index.Graphs.clear();
+          update(Path, std::move(Legacy->Index), Legacy->ShardVersionsSnapshot,
+                 Legacy->HadErrors);
+          Rebuilder.indexedTU();
+        } else {
+          elog("Indexing unsupported graph language {0} failed: {1}", Path,
+               llvm::toString(Legacy.takeError()));
+        }
+      }
       std::lock_guard<std::mutex> Lock(GraphMu);
       GraphPending.erase(GraphKey);
       GraphFailures.erase(GraphKey);
+      GraphFailureTUs.erase(GraphKey);
+      GraphFailureInputs.erase(GraphKey);
       if (Graphs.erase(GraphKey))
         ++GraphRevision;
+      GraphSemanticMillis.erase(GraphKey);
       return;
     }
 
     std::optional<std::string> Failure;
     std::vector<IndexResult> Results;
-    Results.reserve(Configurations.size());
+    Results.reserve(Configurations.size() + (UnsupportedLegacyCommand ? 1 : 0));
+    if (UnsupportedLegacyCommand) {
+      auto Legacy = index(std::move(*UnsupportedLegacyCommand));
+      if (Legacy) {
+        Legacy->Index.Graphs.clear();
+        Results.push_back(std::move(*Legacy));
+      } else {
+        elog("Indexing unsupported graph language {0} failed: {1}", Path,
+             llvm::toString(Legacy.takeError()));
+      }
+    }
     for (auto &Configuration : Configurations) {
       auto Result = index(std::move(Configuration.second));
       if (!Result) {
@@ -312,8 +415,12 @@ BackgroundQueue::Task BackgroundIndex::indexFileTask(std::string Path) {
           Failure = std::move(Message);
         continue;
       }
-      if (Result->HadErrors) {
-        std::string Message = "compiler diagnostics contain errors";
+      if (!Result->Index.Graphs.empty() &&
+          (Result->HadErrors ||
+           !Result->Index.Graphs.front().MissingIncludes.empty())) {
+        std::string Message = Result->HadErrors
+                                  ? "compiler diagnostics contain errors"
+                                  : "compiler left includes unresolved";
         elog("Indexing {0} did not produce a publishable graph: {1}", Path,
              Message);
         if (!Failure)
@@ -322,12 +429,27 @@ BackgroundQueue::Task BackgroundIndex::indexFileTask(std::string Path) {
       Results.push_back(std::move(*Result));
     }
 
+    std::set<std::string> MissingInputs;
+    if (Failure)
+      for (const auto &Result : Results)
+        for (const auto &Graph : Result.Index.Graphs) {
+          auto FS = TFS.view(Graph.Directory);
+          for (auto &Candidate : graphMissingIncludeCandidates(Graph))
+            if (!FS->exists(Candidate))
+              MissingInputs.insert(std::move(Candidate));
+        }
+
     std::vector<GraphTU> CompleteGraphs;
+    std::map<std::string, uint64_t> CompleteTimings;
     if (!Failure) {
       CompleteGraphs.reserve(Results.size());
       for (const auto &Result : Results) {
-        assert(Result.Index.Graphs.size() == 1);
-        CompleteGraphs.push_back(Result.Index.Graphs.front());
+        assert(Result.Index.Graphs.size() <= 1);
+        if (!Result.Index.Graphs.empty()) {
+          CompleteGraphs.push_back(Result.Index.Graphs.front());
+          CompleteTimings[Result.Index.Graphs.front().CommandDigest] =
+              Result.SemanticMillis;
+        }
       }
     } else {
       // An erroneous or incomplete batch must not replace the last complete
@@ -343,8 +465,8 @@ BackgroundQueue::Task BackgroundIndex::indexFileTask(std::string Path) {
     // the ordinary slabs, and even a diagnostic result updates them. All
     // configurations are analyzed only for the complete graph generation.
     auto Legacy = llvm::find_if(Results, [&](const IndexResult &Result) {
-      return LegacyCommandDigest && Result.Index.Graphs.size() == 1 &&
-             Result.Index.Graphs.front().CommandDigest == *LegacyCommandDigest;
+      return LegacyCommandDigest && Result.Index.Cmd &&
+             graphCommandDigest(*Result.Index.Cmd) == *LegacyCommandDigest;
     });
     if (Legacy != Results.end()) {
       Legacy->Index.Graphs = CompleteGraphs;
@@ -354,18 +476,27 @@ BackgroundQueue::Task BackgroundIndex::indexFileTask(std::string Path) {
     }
 
     if (Failure) {
-      Fail(*Failure);
+      Fail(*Failure, std::vector<std::string>(MissingInputs.begin(),
+                                              MissingInputs.end()));
       return;
     }
 
     {
       std::lock_guard<std::mutex> Lock(GraphMu);
-      auto &Published = Graphs[GraphKey];
-      Published.clear();
-      for (auto &Graph : CompleteGraphs)
-        Published.emplace(Graph.CommandDigest, std::move(Graph));
+      Graphs.erase(GraphKey);
+      GraphSemanticMillis.erase(GraphKey);
+      if (!CompleteGraphs.empty()) {
+        auto &Published = Graphs[GraphKey];
+        auto &Timings = GraphSemanticMillis[GraphKey];
+        for (auto &Graph : CompleteGraphs) {
+          Timings[Graph.CommandDigest] = CompleteTimings[Graph.CommandDigest];
+          Published.emplace(Graph.CommandDigest, std::move(Graph));
+        }
+      }
       GraphPending.erase(GraphKey);
       GraphFailures.erase(GraphKey);
+      GraphFailureTUs.erase(GraphKey);
+      GraphFailureInputs.erase(GraphKey);
       ++GraphRevision;
     }
   });
@@ -527,6 +658,7 @@ BackgroundIndex::index(tooling::CompileCommand Cmd) {
   const FrontendInputFile &Input = Clang->getFrontendOpts().Inputs.front();
   if (!Action->BeginSourceFile(*Clang, Input))
     return error("BeginSourceFile() failed");
+  auto SemanticStarted = std::chrono::steady_clock::now();
   if (llvm::Error Err = Action->Execute())
     return Err;
 
@@ -534,12 +666,17 @@ BackgroundIndex::index(tooling::CompileCommand Cmd) {
 
   Index.Cmd = Inputs.CompileCommand;
   assert(Index.Graphs.size() == 1 && "graph collector did not produce one TU");
-  Index.Graphs.front().MainFile = AbsolutePath.str().str();
-  Index.Graphs.front().Directory = Inputs.CompileCommand.Directory;
-  Index.Graphs.front().CommandLine = Inputs.CompileCommand.CommandLine;
-  Index.Graphs.front().Output = Inputs.CompileCommand.Output;
-  Index.Graphs.front().CommandDigest =
-      graphCommandDigest(Inputs.CompileCommand);
+  if (Index.Graphs.front().Language.empty())
+    Index.Graphs.clear();
+  if (!Index.Graphs.empty()) {
+    Index.Graphs.front().ProducerFingerprint = graphProducerFingerprint();
+    Index.Graphs.front().MainFile = AbsolutePath.str().str();
+    Index.Graphs.front().Directory = Inputs.CompileCommand.Directory;
+    Index.Graphs.front().CommandLine = Inputs.CompileCommand.CommandLine;
+    Index.Graphs.front().Output = Inputs.CompileCommand.Output;
+    Index.Graphs.front().CommandDigest =
+        graphCommandDigest(Inputs.CompileCommand);
+  }
   assert(Index.Symbols && Index.Refs && Index.Sources &&
          "Symbols, Refs and Sources must be set.");
 
@@ -557,15 +694,18 @@ BackgroundIndex::index(tooling::CompileCommand Cmd) {
     for (auto &It : *Index.Sources)
       It.second.Flags |= IncludeGraphNode::SourceFlag::HadErrors;
   }
-  Index.Graphs.front().HadErrors = HadErrors;
-  Index.Graphs.front().Diagnostics = Diagnostics.take();
-  for (auto &Diagnostic : Index.Graphs.front().Diagnostics)
-    if (!Diagnostic.Range.valid())
-      Diagnostic.Range.FileURI = Index.Graphs.front().MainFileURI;
+  if (!Index.Graphs.empty()) {
+    Index.Graphs.front().HadErrors = HadErrors;
+    Index.Graphs.front().Diagnostics = Diagnostics.take();
+    for (auto &Diagnostic : Index.Graphs.front().Diagnostics)
+      if (!Diagnostic.Range.valid())
+        Diagnostic.Range.FileURI = Index.Graphs.front().MainFileURI;
+  }
   IndexResult Result;
   Result.Index = std::move(Index);
   Result.ShardVersionsSnapshot = std::move(ShardVersionsSnapshot);
   Result.HadErrors = HadErrors;
+  Result.SemanticMillis = elapsedMillis(SemanticStarted);
   return Result;
 }
 
@@ -595,7 +735,9 @@ BackgroundIndex::loadProject(std::vector<std::string> MainFiles) {
       if (!LS.Shard)
         continue;
       for (const auto &Graph : LS.Shard->Graphs)
-        LoadedGraphs.push_back(Graph);
+        if (Graph.ProducerFingerprint == graphProducerFingerprint() &&
+            (Graph.Language == "c" || Graph.Language == "cpp"))
+          LoadedGraphs.push_back(Graph);
       auto SS =
           LS.Shard->Symbols
               ? std::make_unique<SymbolSlab>(std::move(*LS.Shard->Symbols))
@@ -622,8 +764,10 @@ BackgroundIndex::loadProject(std::vector<std::string> MainFiles) {
     for (auto &Graph : LoadedGraphs) {
       if (Graph.MainFile.empty() || Graph.CommandDigest.empty())
         continue;
-      Graphs[graphMainKey(Graph.MainFile)][Graph.CommandDigest] =
-          std::move(Graph);
+      const std::string MainKey = graphMainKey(Graph.MainFile);
+      const std::string CommandDigest = Graph.CommandDigest;
+      Graphs[MainKey][CommandDigest] = std::move(Graph);
+      GraphSemanticMillis[MainKey][CommandDigest] = 0;
     }
     ++GraphRevision;
   }
@@ -656,7 +800,8 @@ BackgroundIndex::loadProject(std::vector<std::string> MainFiles) {
       WithProvidedContext.emplace(ContextProvider(MainFile));
     llvm::StringSet<> Expected;
     for (const auto &Command : CDB.getCompileCommands(MainFile))
-      Expected.insert(graphCommandDigest(Command));
+      if (graphCommandIsCOrCXX(Command))
+        Expected.insert(graphCommandDigest(Command));
     llvm::StringSet<> Actual;
     {
       std::lock_guard<std::mutex> Lock(GraphMu);
@@ -703,6 +848,11 @@ void BackgroundIndex::enqueueGraphDependents(
         TUs.try_emplace(Main.getKey().str(),
                         Main.getValue().begin()->second.MainFile);
     }
+    // A failed graph has no reliable dependency set. Any later watched
+    // workspace change may be the generated input that makes it publishable.
+    if (!ChangedFiles.empty())
+      for (const auto &Failure : GraphFailureTUs)
+        TUs.try_emplace(Failure.getKey().str(), Failure.getValue());
   }
   for (const auto &File : ChangedFiles)
     if (isGraphTranslationUnit(File) && !CDB.getCompileCommands(File).empty())
@@ -716,46 +866,370 @@ void BackgroundIndex::enqueueGraphDependents(
 }
 
 llvm::Expected<llvm::json::Value>
-BackgroundIndex::graphSnapshot(const GraphSnapshotParams &Params) const {
-  auto Started = std::chrono::steady_clock::now();
-  std::vector<GraphTU> Frozen;
+BackgroundIndex::graphSnapshot(const GraphSnapshotParams &Params) {
+  std::vector<std::pair<std::string, std::vector<std::string>>> FailedInputs;
+  {
+    std::lock_guard<std::mutex> Lock(GraphMu);
+    if (GraphDiscoveryPending == 0 && GraphPending.empty())
+      for (const auto &Failure : GraphFailureInputs) {
+        auto TU = GraphFailureTUs.find(Failure.getKey());
+        if (TU != GraphFailureTUs.end())
+          FailedInputs.emplace_back(TU->getValue(), Failure.getValue());
+      }
+  }
+  std::vector<std::string> Retry;
+  auto FailureFS = TFS.view(/*CWD=*/std::nullopt);
+  for (const auto &Failure : FailedInputs)
+    if (llvm::any_of(Failure.second, [&](const std::string &Candidate) {
+          return FailureFS->exists(Candidate);
+        }))
+      Retry.push_back(Failure.first);
+  if (!Retry.empty()) {
+    enqueue(Retry);
+    return contentModified(
+        "graph snapshot is retrying translation units whose generated inputs "
+        "appeared");
+  }
+
+  constexpr uint32_t DefaultPageSize = 32;
+  constexpr uint32_t MaximumPageSize = 128;
+  const uint32_t PageSize = Params.MaxShards.value_or(DefaultPageSize);
+  if (PageSize == 0 || PageSize > MaximumPageSize)
+    return error("graph snapshot maxShards must be between 1 and {0}",
+                 MaximumPageSize);
+
+  const std::vector<std::pair<const char *, const char *>> Coverage = {
+      {"contains", "complete"},   {"exports", "partial"},
+      {"imports", "complete"},    {"calls", "partial"},
+      {"accesses", "complete"},   {"instantiates", "partial"},
+      {"type_ref", "complete"},   {"extends", "complete"},
+      {"implements", "partial"},  {"overrides", "complete"},
+      {"dispatches", "partial"},  {"decorates", "unsupported"},
+      {"renders", "unsupported"}, {"tests", "unsupported"},
+      {"references", "complete"}};
+
+  auto JSONText = [](const llvm::json::Value &Value) {
+    std::string Text;
+    llvm::raw_string_ostream OS(Text);
+    OS << Value;
+    return OS.str();
+  };
+  auto CopyPageLocked =
+      [&](const GraphSnapshotCache &Cache, const GraphSnapshotPlan &Plan,
+          size_t Offset) -> llvm::Expected<std::vector<GraphTU>> {
+    if (Offset > Plan.Upserts.size())
+      return error("graph snapshot cursor offset is out of range");
+    const size_t End = std::min(Plan.Upserts.size(), Offset + PageSize);
+    std::vector<GraphTU> Page;
+    Page.reserve(End - Offset);
+    for (size_t I = Offset; I < End; ++I) {
+      const auto &Shard = Cache.Shards[Plan.Upserts[I]];
+      auto Main = Graphs.find(Shard.MainKey);
+      if (Main == Graphs.end())
+        return contentModified("graph snapshot changed between pages");
+      auto Configuration = Main->getValue().find(Shard.CommandDigest);
+      if (Configuration == Main->getValue().end())
+        return contentModified("graph snapshot changed between pages");
+      Page.push_back(Configuration->second);
+    }
+    return Page;
+  };
+  auto EncodePage = [&](const GraphSnapshotCache &Cache,
+                        const GraphSnapshotPlan &Plan, size_t Offset,
+                        std::vector<GraphTU> PageGraphs)
+      -> llvm::Expected<llvm::json::Value> {
+    auto EncodeStarted = std::chrono::steady_clock::now();
+    const size_t End = std::min(Plan.Upserts.size(), Offset + PageSize);
+    if (PageGraphs.size() != End - Offset)
+      return error("graph snapshot page does not match its plan");
+    llvm::json::Array Upserts;
+    for (size_t I = Offset; I < End; ++I) {
+      const auto &Shard = Cache.Shards[Plan.Upserts[I]];
+      const auto &Graph = PageGraphs[I - Offset];
+      llvm::json::Value GraphJSON = toJSON(Graph);
+      std::string ShardDigest =
+          graphDigest(Shard.Key + "\n" + Shard.CheckerDigest + "\n" +
+                      Shard.InterfaceFingerprint + "\n" + JSONText(GraphJSON));
+      if (ShardDigest != Shard.Digest)
+        return contentModified("graph snapshot shard changed while paging: {0}",
+                               Shard.Key);
+      llvm::json::Array CoverageJSON;
+      for (const auto &Row : Coverage)
+        CoverageJSON.push_back(
+            llvm::json::Object{{"family", Row.first}, {"state", Row.second}});
+      Upserts.push_back(llvm::json::Object{
+          {"key", Shard.Key},
+          {"source", Graph.MainFile},
+          {"configuration", Graph.CommandDigest},
+          {"checkerDigest", Shard.CheckerDigest},
+          {"interfaceFingerprint", Shard.InterfaceFingerprint},
+          {"digest", Shard.Digest},
+          {"graph", std::move(GraphJSON)},
+          {"coverage", std::move(CoverageJSON)}});
+    }
+
+    llvm::json::Array Manifest;
+    if (Offset == 0 && !Plan.CacheHit)
+      for (const auto &Shard : Cache.Shards)
+        Manifest.push_back(
+            llvm::json::Object{{"key", Shard.Key}, {"digest", Shard.Digest}});
+    llvm::json::Array Deletes;
+    if (Offset == 0)
+      for (const auto &Key : Plan.Deletes)
+        Deletes.push_back(Key);
+    auto Strings = [](const std::vector<std::string> &Values) {
+      llvm::json::Array Result;
+      for (const auto &Value : Values)
+        Result.push_back(Value);
+      return Result;
+    };
+    llvm::json::Value NextCursor = llvm::json::Value(nullptr);
+    if (End < Plan.Upserts.size())
+      NextCursor = Plan.Token + ":" + std::to_string(End);
+    const uint64_t SemanticMillis = Offset == 0 ? Plan.SemanticMillis : 0;
+    const uint64_t ShardMillis = Offset == 0 ? Plan.ShardMillis : 0;
+    const uint64_t EncodeMillis = elapsedMillis(EncodeStarted);
+    const uint64_t TotalMillis = SemanticMillis + ShardMillis + EncodeMillis;
+    return llvm::json::Object{
+        {"protocolVersion", 1},
+        {"schemaVersion", 1},
+        {"producer",
+         llvm::json::Object{{"name", "samchon-clangd"},
+                            {"version", getClangFullVersion()},
+                            {"commit", getClangFullRepositoryVersion()}}},
+        {"universe",
+         llvm::json::Object{{"digest", Cache.UniverseDigest},
+                            {"targets", Strings(Cache.Targets)},
+                            {"workspaceRoots", Strings(Cache.WorkspaceRoots)},
+                            {"toolchains", Strings(Cache.Toolchains)},
+                            {"configurations", Strings(Cache.Configurations)}}},
+        {"sequence", static_cast<int64_t>(Plan.Sequence)},
+        {"generation", Cache.Generation},
+        {"baseGeneration", Plan.BaseGeneration
+                               ? llvm::json::Value(*Plan.BaseGeneration)
+                               : llvm::json::Value(nullptr)},
+        {"upserts", std::move(Upserts)},
+        {"deletes", std::move(Deletes)},
+        {"manifest", std::move(Manifest)},
+        {"page",
+         llvm::json::Object{
+             {"offset", static_cast<int64_t>(Offset)},
+             {"count", static_cast<int64_t>(End - Offset)},
+             {"total", static_cast<int64_t>(Plan.Upserts.size())},
+             {"nextCursor", std::move(NextCursor)}}},
+        {"phases", llvm::json::Object{
+                       {"semanticMillis", static_cast<int64_t>(SemanticMillis)},
+                       {"shardMillis", static_cast<int64_t>(ShardMillis)},
+                       {"encodeMillis", static_cast<int64_t>(EncodeMillis)},
+                       {"totalMillis", static_cast<int64_t>(TotalMillis)},
+                       {"cacheHit", Plan.CacheHit}}}};
+  };
+  auto CreatePlanLocked = [&](const GraphSnapshotCache &Cache,
+                              bool CacheWasBuilt) {
+    GraphSnapshotPlan Plan;
+    Plan.Sequence = ++GraphSequence;
+    llvm::StringMap<std::string> CurrentManifest;
+    for (const auto &Shard : Cache.Shards)
+      CurrentManifest[Shard.Key] = Shard.Digest;
+    if (Params.KnownGeneration && *Params.KnownGeneration == Cache.Generation) {
+      Plan.BaseGeneration = Cache.Generation;
+      Plan.CacheHit = true;
+    } else if (Params.KnownGeneration &&
+               *Params.KnownGeneration == PublishedGeneration) {
+      Plan.BaseGeneration = PublishedGeneration;
+      for (size_t I = 0; I < Cache.Shards.size(); ++I) {
+        const auto &Shard = Cache.Shards[I];
+        auto Old = PublishedManifest.find(Shard.Key);
+        if (Old == PublishedManifest.end() || Old->getValue() != Shard.Digest)
+          Plan.Upserts.push_back(I);
+      }
+      for (const auto &Old : PublishedManifest)
+        if (!CurrentManifest.contains(Old.getKey()))
+          Plan.Deletes.push_back(Old.getKey().str());
+      llvm::sort(Plan.Deletes);
+    } else {
+      Plan.Upserts.resize(Cache.Shards.size());
+      std::iota(Plan.Upserts.begin(), Plan.Upserts.end(), 0);
+    }
+    for (size_t I : Plan.Upserts)
+      Plan.SemanticMillis += Cache.Shards[I].SemanticMillis;
+    Plan.ShardMillis = CacheWasBuilt ? Cache.ShardMillis : 0;
+    Plan.Token =
+        graphDigest(Cache.Generation + ":" + std::to_string(Plan.Sequence) +
+                    ":" + Params.KnownGeneration.value_or("full"));
+    PublishedGeneration = Cache.Generation;
+    PublishedManifest = std::move(CurrentManifest);
+    ActiveGraphSnapshotPlan = Plan;
+    return Plan;
+  };
+  auto ValidateCachedSnapshot =
+      [&](const GraphSnapshotCache &Cache) -> llvm::Error {
+    std::map<std::string, llvm::StringSet<>> ActualConfigurations;
+    for (const auto &Shard : Cache.Shards)
+      ActualConfigurations[Shard.MainFile].insert(Shard.CommandDigest);
+    for (const auto &Main : ActualConfigurations) {
+      std::optional<WithContext> WithProvidedContext;
+      if (ContextProvider)
+        WithProvidedContext.emplace(ContextProvider(Main.first));
+      llvm::StringSet<> Expected;
+      for (const auto &Command : CDB.getCompileCommands(Main.first))
+        if (graphCommandIsCOrCXX(Command))
+          Expected.insert(graphCommandDigest(Command));
+      if (Expected.size() != Main.second.size() ||
+          llvm::any_of(Expected, [&](const auto &Entry) {
+            return !Main.second.contains(Entry.getKey());
+          }))
+        return contentModified(
+            "graph snapshot compile commands moved during indexing: {0}",
+            Main.first);
+    }
+    llvm::StringMap<std::string> CheckedSources;
+    for (const auto &Shard : Cache.Shards) {
+      auto FS = TFS.view(Shard.Directory);
+      for (const auto &Source : Shard.Sources) {
+        auto Resolved = URI::resolve(Source.URI, Shard.MainFile);
+        if (!Resolved)
+          return Resolved.takeError();
+        auto Known = CheckedSources.find(*Resolved);
+        if (Known != CheckedSources.end()) {
+          if (Known->getValue() != Source.Digest)
+            return error("graph snapshot has contradictory TU views for {0}",
+                         *Resolved);
+          continue;
+        }
+        auto Buffer = FS->getBufferForFile(*Resolved);
+        if (!Buffer)
+          return contentModified(
+              "graph snapshot source cannot be read: {0}: {1}", *Resolved,
+              Buffer.getError().message());
+        std::string Current = graphDigest(Buffer.get()->getBuffer());
+        if (Current != Source.Digest)
+          return contentModified(
+              "graph snapshot source moved during indexing: {0}", *Resolved);
+        CheckedSources[*Resolved] = std::move(Current);
+      }
+    }
+    return llvm::Error::success();
+  };
+
+  size_t Offset = 0;
+  if (Params.Cursor) {
+    llvm::StringRef Cursor = *Params.Cursor;
+    auto Split = Cursor.rsplit(':');
+    uint64_t ParsedOffset = 0;
+    if (Split.first.empty() || Split.second.empty() ||
+        Split.second.getAsInteger(10, ParsedOffset))
+      return error("graph snapshot cursor is malformed");
+    Offset = static_cast<size_t>(ParsedOffset);
+    GraphSnapshotCache Cache;
+    GraphSnapshotPlan Plan;
+    std::vector<GraphTU> PageGraphs;
+    {
+      std::lock_guard<std::mutex> Lock(GraphMu);
+      if (!CachedGraphSnapshot || !ActiveGraphSnapshotPlan ||
+          CachedGraphSnapshot->Revision != GraphRevision ||
+          ActiveGraphSnapshotPlan->Token != Split.first)
+        return contentModified("graph snapshot cursor is stale");
+      if (GraphDiscoveryPending != 0 || !GraphPending.empty() ||
+          !GraphFailures.empty())
+        return contentModified("graph snapshot state moved between pages");
+      Cache = *CachedGraphSnapshot;
+      Plan = *ActiveGraphSnapshotPlan;
+      auto Page = CopyPageLocked(Cache, Plan, Offset);
+      if (!Page)
+        return Page.takeError();
+      PageGraphs = std::move(*Page);
+    }
+    return EncodePage(Cache, Plan, Offset, std::move(PageGraphs));
+  }
+
+  {
+    GraphSnapshotCache Cache;
+    bool Reused = false;
+    {
+      std::lock_guard<std::mutex> Lock(GraphMu);
+      if (GraphDiscoveryPending != 0)
+        return contentModified(
+            "graph snapshot is not ready: project changes are still being "
+            "discovered");
+      if (!GraphPending.empty())
+        return contentModified("graph snapshot is not ready: {0} translation "
+                               "units are still indexing",
+                               GraphPending.size());
+      if (!GraphFailures.empty()) {
+        const auto &Failure = *GraphFailures.begin();
+        return error("graph snapshot is not publishable: {0}: {1}",
+                     Failure.getKey(), Failure.getValue());
+      }
+      if (Graphs.empty() && PublishedGeneration.empty())
+        return contentModified(
+            "graph snapshot is not ready: initial indexing has not completed");
+      if (CachedGraphSnapshot &&
+          CachedGraphSnapshot->Revision == GraphRevision) {
+        Cache = *CachedGraphSnapshot;
+        Reused = true;
+      }
+    }
+    if (Reused) {
+      if (llvm::Error Err = ValidateCachedSnapshot(Cache))
+        return std::move(Err);
+      GraphSnapshotPlan Plan;
+      std::vector<GraphTU> PageGraphs;
+      {
+        std::lock_guard<std::mutex> Lock(GraphMu);
+        if (!CachedGraphSnapshot ||
+            CachedGraphSnapshot->Revision != GraphRevision ||
+            GraphDiscoveryPending != 0 || !GraphPending.empty() ||
+            !GraphFailures.empty())
+          return contentModified(
+              "graph snapshot state moved while its cache was validated");
+        Plan = CreatePlanLocked(Cache, false);
+        auto Page = CopyPageLocked(Cache, Plan, 0);
+        if (!Page)
+          return Page.takeError();
+        PageGraphs = std::move(*Page);
+      }
+      return EncodePage(Cache, Plan, 0, std::move(PageGraphs));
+    }
+  }
+
+  struct FrozenGraph {
+    GraphTU Graph;
+    std::string MainKey;
+    uint64_t SemanticMillis = 0;
+  };
+  std::vector<FrozenGraph> Frozen;
   uint64_t Revision = 0;
   {
     std::lock_guard<std::mutex> Lock(GraphMu);
-    if (GraphDiscoveryPending != 0)
-      return contentModified(
-          "graph snapshot is not ready: project changes are still being "
-          "discovered");
-    if (!GraphPending.empty())
-      return contentModified("graph snapshot is not ready: {0} translation "
-                             "units are still indexing",
-                             GraphPending.size());
-    if (!GraphFailures.empty()) {
-      const auto &Failure = *GraphFailures.begin();
-      return error("graph snapshot is not publishable: {0}: {1}",
-                   Failure.getKey(), Failure.getValue());
-    }
-    if (Graphs.empty() && PublishedGeneration.empty())
-      return contentModified(
-          "graph snapshot is not ready: initial indexing has not completed");
     Revision = GraphRevision;
     for (const auto &Main : Graphs)
-      for (const auto &Configuration : Main.getValue())
-        Frozen.push_back(Configuration.second);
+      for (const auto &Configuration : Main.getValue()) {
+        uint64_t SemanticMillis = 0;
+        auto Timings = GraphSemanticMillis.find(Main.getKey());
+        if (Timings != GraphSemanticMillis.end()) {
+          auto Timing = Timings->getValue().find(Configuration.first);
+          if (Timing != Timings->getValue().end())
+            SemanticMillis = Timing->second;
+        }
+        Frozen.push_back(FrozenGraph{Configuration.second, Main.getKey().str(),
+                                     SemanticMillis});
+      }
   }
-  llvm::sort(Frozen, [](const GraphTU &Left, const GraphTU &Right) {
-    return std::tie(Left.MainFile, Left.CommandDigest) <
-           std::tie(Right.MainFile, Right.CommandDigest);
+  llvm::sort(Frozen, [](const FrozenGraph &Left, const FrozenGraph &Right) {
+    return std::tie(Left.Graph.MainFile, Left.Graph.CommandDigest) <
+           std::tie(Right.Graph.MainFile, Right.Graph.CommandDigest);
   });
 
-  // Validate commands and source checkers outside GraphMu. Rechecking the
-  // revision below makes this optimistic freeze atomic without blocking an
-  // index worker on filesystem or compilation-database I/O.
   std::map<std::string, llvm::StringSet<>> ActualConfigurations;
-  for (const auto &Graph : Frozen) {
+  for (const auto &Entry : Frozen) {
+    const auto &Graph = Entry.Graph;
     if (Graph.HadErrors)
       return error("graph snapshot contains an erroneous configuration: {0}",
                    Graph.MainFile);
+    if (Graph.ProducerFingerprint != graphProducerFingerprint())
+      return contentModified("graph snapshot compiler identity moved: {0}",
+                             Graph.MainFile);
     ActualConfigurations[Graph.MainFile].insert(Graph.CommandDigest);
   }
   for (const auto &Main : ActualConfigurations) {
@@ -764,7 +1238,8 @@ BackgroundIndex::graphSnapshot(const GraphSnapshotParams &Params) const {
       WithProvidedContext.emplace(ContextProvider(Main.first));
     llvm::StringSet<> Expected;
     for (const auto &Command : CDB.getCompileCommands(Main.first))
-      Expected.insert(graphCommandDigest(Command));
+      if (graphCommandIsCOrCXX(Command))
+        Expected.insert(graphCommandDigest(Command));
     if (Expected.size() != Main.second.size() ||
         llvm::any_of(Expected, [&](const auto &Entry) {
           return !Main.second.contains(Entry.getKey());
@@ -775,7 +1250,8 @@ BackgroundIndex::graphSnapshot(const GraphSnapshotParams &Params) const {
   }
 
   llvm::StringMap<std::string> CheckedSources;
-  for (const auto &Graph : Frozen) {
+  for (const auto &Entry : Frozen) {
+    const auto &Graph = Entry.Graph;
     auto FS = TFS.view(Graph.Directory);
     for (const auto &Source : Graph.Sources) {
       auto Resolved = URI::resolve(Source.URI, Graph.MainFile);
@@ -799,40 +1275,15 @@ BackgroundIndex::graphSnapshot(const GraphSnapshotParams &Params) const {
       CheckedSources[*Resolved] = std::move(Current);
     }
   }
-  {
-    std::lock_guard<std::mutex> Lock(GraphMu);
-    if (Revision != GraphRevision || GraphDiscoveryPending != 0 ||
-        !GraphPending.empty() || !GraphFailures.empty())
-      return contentModified(
-          "graph snapshot state moved while it was being frozen");
-  }
 
-  auto JSONText = [](llvm::json::Value Value) {
-    std::string Text;
-    llvm::raw_string_ostream OS(Text);
-    OS << Value;
-    return OS.str();
-  };
-  const std::vector<std::pair<const char *, const char *>> Coverage = {
-      {"contains", "complete"},   {"exports", "partial"},
-      {"imports", "complete"},    {"calls", "partial"},
-      {"accesses", "complete"},   {"instantiates", "partial"},
-      {"type_ref", "complete"},   {"extends", "complete"},
-      {"implements", "partial"},  {"overrides", "complete"},
-      {"dispatches", "partial"},  {"decorates", "unsupported"},
-      {"renders", "unsupported"}, {"tests", "unsupported"},
-      {"references", "complete"}};
-
-  struct EncodedShard {
-    std::string Key;
-    std::string Digest;
-    llvm::json::Object JSON;
-  };
-  std::vector<EncodedShard> Shards;
+  auto ShardStarted = std::chrono::steady_clock::now();
+  GraphSnapshotCache Built;
+  Built.Revision = Revision;
   std::set<std::string> Targets;
   std::set<std::string> Configurations;
   std::set<std::string> WorkspaceRoots;
-  for (const auto &Graph : Frozen) {
+  for (const auto &Entry : Frozen) {
+    const auto &Graph = Entry.Graph;
     std::string Key = Graph.MainFileURI + "#" + Graph.CommandDigest;
     std::string CheckerDigest;
     for (const auto &Source : Graph.Sources)
@@ -843,7 +1294,6 @@ BackgroundIndex::graphSnapshot(const GraphSnapshotParams &Params) const {
     if (CheckerDigest.empty())
       return error("graph snapshot has no main-file checker: {0}",
                    Graph.MainFile);
-
     std::string Interface;
     llvm::raw_string_ostream InterfaceOS(Interface);
     for (const auto &Symbol : Graph.Symbols)
@@ -851,117 +1301,72 @@ BackgroundIndex::graphSnapshot(const GraphSnapshotParams &Params) const {
         InterfaceOS << Symbol.ID.size() << ':' << Symbol.ID
                     << Symbol.Signature.size() << ':' << Symbol.Signature;
     std::string InterfaceFingerprint = graphDigest(InterfaceOS.str());
-    llvm::json::Array CoverageJSON;
-    for (const auto &Row : Coverage)
-      CoverageJSON.push_back(
-          llvm::json::Object{{"family", Row.first}, {"state", Row.second}});
-    std::string GraphText = JSONText(toJSON(Graph));
+    llvm::json::Value GraphJSON = toJSON(Graph);
     std::string ShardDigest =
         graphDigest(Key + "\n" + CheckerDigest + "\n" + InterfaceFingerprint +
-                    "\n" + GraphText);
-    llvm::json::Object Shard{{"key", Key},
-                             {"source", Graph.MainFile},
-                             {"configuration", Graph.CommandDigest},
-                             {"checkerDigest", CheckerDigest},
-                             {"interfaceFingerprint", InterfaceFingerprint},
-                             {"digest", ShardDigest},
-                             {"graph", toJSON(Graph)},
-                             {"coverage", std::move(CoverageJSON)}};
-    Shards.push_back(
-        EncodedShard{std::move(Key), std::move(ShardDigest), std::move(Shard)});
+                    "\n" + JSONText(GraphJSON));
+    GraphSnapshotShardCache Cached;
+    Cached.MainKey = Entry.MainKey;
+    Cached.MainFile = Graph.MainFile;
+    Cached.Directory = Graph.Directory;
+    Cached.CommandDigest = Graph.CommandDigest;
+    Cached.Key = std::move(Key);
+    Cached.Digest = std::move(ShardDigest);
+    Cached.CheckerDigest = std::move(CheckerDigest);
+    Cached.InterfaceFingerprint = std::move(InterfaceFingerprint);
+    Cached.Sources = Graph.Sources;
+    Cached.SemanticMillis = Entry.SemanticMillis;
+    Built.Shards.push_back(std::move(Cached));
     Targets.insert(Graph.TargetTriple);
     Configurations.insert(Graph.CommandDigest);
     if (auto Project = CDB.getProjectInfo(Graph.MainFile))
-      WorkspaceRoots.insert(Project->SourceRoot);
+      WorkspaceRoots.insert(graphMainKey(Project->SourceRoot));
   }
+  Built.Targets.assign(Targets.begin(), Targets.end());
+  Built.Configurations.assign(Configurations.begin(), Configurations.end());
+  Built.WorkspaceRoots.assign(WorkspaceRoots.begin(), WorkspaceRoots.end());
+  Built.Toolchains.push_back(getClangFullVersion());
 
-  llvm::json::Array Manifest;
-  llvm::StringMap<std::string> CurrentManifest;
+  std::string UniverseMaterial;
+  llvm::raw_string_ostream UniverseOS(UniverseMaterial);
+  auto Coordinate = [&](llvm::StringRef Label, llvm::StringRef Value) {
+    UniverseOS << Label << ':' << Value.size() << ':' << Value;
+  };
+  Coordinate("producer", graphProducerFingerprint());
+  for (const auto &Target : Built.Targets)
+    Coordinate("target", Target);
+  for (const auto &Root : Built.WorkspaceRoots)
+    Coordinate("root", Root);
+  for (const auto &Toolchain : Built.Toolchains)
+    Coordinate("toolchain", Toolchain);
+  for (const auto &Configuration : Built.Configurations)
+    Coordinate("configuration", Configuration);
+  Built.UniverseDigest = graphDigest(UniverseOS.str());
   std::string GenerationMaterial;
   llvm::raw_string_ostream GenerationOS(GenerationMaterial);
-  for (const auto &Shard : Shards) {
-    Manifest.push_back(
-        llvm::json::Object{{"key", Shard.Key}, {"digest", Shard.Digest}});
-    CurrentManifest[Shard.Key] = Shard.Digest;
+  for (const auto &Shard : Built.Shards)
     GenerationOS << Shard.Key.size() << ':' << Shard.Key << Shard.Digest;
-  }
-  for (const auto &Target : Targets)
-    GenerationOS << "target:" << Target;
-  std::string UniverseDigest = graphDigest(GenerationOS.str());
-  std::string Generation = graphDigest(UniverseDigest + GenerationMaterial);
+  Built.Generation = graphDigest(Built.UniverseDigest + GenerationOS.str());
+  Built.ShardMillis = elapsedMillis(ShardStarted);
 
-  llvm::json::Array Upserts;
-  llvm::json::Array Deletes;
-  std::optional<std::string> BaseGeneration;
-  uint64_t Sequence;
+  GraphSnapshotCache Cache;
+  GraphSnapshotPlan Plan;
+  std::vector<GraphTU> PageGraphs;
   {
     std::lock_guard<std::mutex> Lock(GraphMu);
-    if (Params.KnownGeneration && *Params.KnownGeneration == Generation) {
-      BaseGeneration = Generation;
-    } else if (Params.KnownGeneration &&
-               *Params.KnownGeneration == PublishedGeneration) {
-      BaseGeneration = PublishedGeneration;
-      for (auto &Shard : Shards) {
-        auto Old = PublishedManifest.find(Shard.Key);
-        if (Old == PublishedManifest.end() || Old->getValue() != Shard.Digest)
-          Upserts.push_back(std::move(Shard.JSON));
-      }
-      std::vector<std::string> DeletedKeys;
-      for (const auto &Old : PublishedManifest)
-        if (!CurrentManifest.contains(Old.getKey()))
-          DeletedKeys.push_back(Old.getKey().str());
-      llvm::sort(DeletedKeys);
-      for (auto &Key : DeletedKeys)
-        Deletes.push_back(std::move(Key));
-    } else {
-      for (auto &Shard : Shards)
-        Upserts.push_back(std::move(Shard.JSON));
-    }
-    PublishedGeneration = Generation;
-    PublishedManifest = CurrentManifest;
-    Sequence = ++GraphSequence;
+    if (Revision != GraphRevision || GraphDiscoveryPending != 0 ||
+        !GraphPending.empty() || !GraphFailures.empty())
+      return contentModified(
+          "graph snapshot state moved while it was being frozen");
+    CachedGraphSnapshot = std::move(Built);
+    Cache = *CachedGraphSnapshot;
+    Plan = CreatePlanLocked(Cache, true);
+    auto Page = CopyPageLocked(Cache, Plan, 0);
+    if (!Page)
+      return Page.takeError();
+    PageGraphs = std::move(*Page);
   }
-
-  llvm::json::Array TargetJSON;
-  for (const auto &Target : Targets)
-    TargetJSON.push_back(Target);
-  llvm::json::Array ConfigurationJSON;
-  for (const auto &Configuration : Configurations)
-    ConfigurationJSON.push_back(Configuration);
-  llvm::json::Array RootJSON;
-  for (const auto &Root : WorkspaceRoots)
-    RootJSON.push_back(Root);
-  llvm::json::Array Toolchains;
-  Toolchains.push_back(getClangFullVersion());
-  auto Elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-                     std::chrono::steady_clock::now() - Started)
-                     .count();
-  return llvm::json::Object{
-      {"protocolVersion", 1},
-      {"schemaVersion", 1},
-      {"producer",
-       llvm::json::Object{{"name", "samchon-clangd"},
-                          {"version", getClangFullVersion()},
-                          {"commit", getClangFullRepositoryVersion()}}},
-      {"universe",
-       llvm::json::Object{{"digest", UniverseDigest},
-                          {"targets", std::move(TargetJSON)},
-                          {"workspaceRoots", std::move(RootJSON)},
-                          {"toolchains", std::move(Toolchains)},
-                          {"configurations", std::move(ConfigurationJSON)}}},
-      {"sequence", static_cast<int64_t>(Sequence)},
-      {"generation", Generation},
-      {"baseGeneration", BaseGeneration ? llvm::json::Value(*BaseGeneration)
-                                        : llvm::json::Value(nullptr)},
-      {"upserts", std::move(Upserts)},
-      {"deletes", std::move(Deletes)},
-      {"manifest", std::move(Manifest)},
-      {"phases",
-       llvm::json::Object{{"semanticMillis", 0},
-                          {"shardMillis", 0},
-                          {"encodeMillis", static_cast<int64_t>(Elapsed)},
-                          {"totalMillis", static_cast<int64_t>(Elapsed)},
-                          {"cacheHit", BaseGeneration.has_value()}}}};
+  return EncodePage(Cache, Plan, 0, std::move(PageGraphs));
 }
 
 void BackgroundIndex::profile(MemoryTree &MT) const {

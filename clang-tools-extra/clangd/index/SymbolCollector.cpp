@@ -433,8 +433,7 @@ private:
       CachePathToFrameworkSpelling.erase(Res.first);
       return std::nullopt;
     }
-    if (auto UmbrellaSpelling =
-            getFrameworkUmbrellaSpelling(HS, *HeaderPath)) {
+    if (auto UmbrellaSpelling = getFrameworkUmbrellaSpelling(HS, *HeaderPath)) {
       *CachedHeaderSpelling = *UmbrellaSpelling;
       return llvm::StringRef(*CachedHeaderSpelling);
     }
@@ -512,7 +511,21 @@ void SymbolCollector::initializeGraphCompilation(const CompilerInstance &CI) {
   if (!Opts.CollectGraph)
     return;
   Graph.TargetTriple = CI.getTarget().getTriple().str();
-  Graph.Language = CI.getLangOpts().CPlusPlus ? "cpp" : "c";
+  if (CI.getFrontendOpts().Inputs.empty())
+    return;
+  switch (CI.getFrontendOpts().Inputs.front().getKind().getLanguage()) {
+  case Language::C:
+    Graph.Language = "c";
+    break;
+  case Language::CXX:
+    Graph.Language = "cpp";
+    break;
+  default:
+    // Objective-C, CUDA, HIP, OpenCL, and other Clang inputs must not be
+    // represented as authoritative C/C++ facts.
+    Graph.Language.clear();
+    break;
+  }
 }
 
 std::optional<GraphRange>
@@ -524,13 +537,17 @@ SymbolCollector::graphTokenRange(SourceLocation Loc) const {
   auto FE = SM.getFileEntryRefForID(SM.getFileID(Loc));
   if (!FE)
     return std::nullopt;
-  auto Positions = getTokenRange(Loc, SM, ASTCtx->getLangOpts());
+  WithContextValue FixedEncoding(kCurrentOffsetEncoding, OffsetEncoding::UTF16);
+  Position Begin = sourceLocToPosition(SM, Loc);
+  unsigned TokenLength =
+      clang::Lexer::MeasureTokenLength(Loc, SM, ASTCtx->getLangOpts());
+  Position End = sourceLocToPosition(SM, Loc.getLocWithOffset(TokenLength));
   GraphRange Result;
   Result.FileURI = HeaderFileURIs->toURI(*FE);
-  Result.StartLine = Positions.first.line();
-  Result.StartColumn = Positions.first.column();
-  Result.EndLine = Positions.second.line();
-  Result.EndColumn = Positions.second.column();
+  Result.StartLine = Begin.line;
+  Result.StartColumn = Begin.character;
+  Result.EndLine = End.line;
+  Result.EndColumn = End.character;
   return Result;
 }
 
@@ -547,6 +564,7 @@ SymbolCollector::graphSourceRange(SourceRange Range) const {
   auto FE = SM.getFileEntryRefForID(SM.getFileID(Begin));
   if (!FE)
     return std::nullopt;
+  WithContextValue FixedEncoding(kCurrentOffsetEncoding, OffsetEncoding::UTF16);
   auto Positions =
       halfOpenToRange(SM, CharSourceRange::getCharRange(FileRange->getBegin(),
                                                         FileRange->getEnd()));
@@ -1187,6 +1205,22 @@ void SymbolCollector::recordGraphInclude(SourceLocation HashLoc,
   Graph.Includes.push_back(std::move(Include));
 }
 
+void SymbolCollector::recordGraphMissingInclude(SourceLocation HashLoc,
+                                                llvm::StringRef FileName,
+                                                bool IsAngled) {
+  if (!Opts.CollectGraph || !ASTCtx || !HeaderFileURIs)
+    return;
+  const auto &SM = ASTCtx->getSourceManager();
+  auto Including = SM.getFileEntryRefForID(SM.getFileID(HashLoc));
+  if (!Including)
+    return;
+  GraphMissingInclude Include;
+  Include.SourceURI = HeaderFileURIs->toURI(*Including);
+  Include.Spelling = FileName.str();
+  Include.Angled = IsAngled;
+  Graph.MissingIncludes.push_back(std::move(Include));
+}
+
 void SymbolCollector::recordGraphSource(FileID FID, llvm::StringRef URI,
                                         IncludeGraphNode::SourceFlag Flags) {
   if (!Opts.CollectGraph || !ASTCtx || FID.isInvalid())
@@ -1257,7 +1291,7 @@ llvm::StringRef getStdHeader(const Symbol *S, const LangOptions &LangOpts) {
   tooling::stdlib::Lang Lang = tooling::stdlib::Lang::CXX;
   if (LangOpts.C11)
     Lang = tooling::stdlib::Lang::C;
-  else if(!LangOpts.CPlusPlus)
+  else if (!LangOpts.CPlusPlus)
     return "";
 
   if (S->Scope == "std::" && S->Name == "move") {
@@ -1377,8 +1411,7 @@ void SymbolCollector::finish() {
         // depending on the translation unit.
         else if (tooling::isSelfContainedHeader(H.physical(), SM,
                                                 PP->getHeaderSearchInfo()))
-          SpellingIt->second =
-              HeaderFileURIs->toURI(H.physical());
+          SpellingIt->second = HeaderFileURIs->toURI(H.physical());
       } else {
         SpellingIt->second = include_cleaner::spellHeader(
             {H, PP->getHeaderSearchInfo(),

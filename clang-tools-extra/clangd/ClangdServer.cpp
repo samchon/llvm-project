@@ -62,8 +62,8 @@ namespace clangd {
 namespace {
 
 // Tracks number of times a tweak has been offered.
-static constexpr trace::Metric TweakAvailable(
-    "tweak_available", trace::Metric::Counter, "tweak_id");
+static constexpr trace::Metric
+    TweakAvailable("tweak_available", trace::Metric::Counter, "tweak_id");
 
 // Update the FileIndex with new ASTs and plumb the diagnostics responses.
 struct UpdateIndexCallbacks : public ParsingCallbacks {
@@ -948,10 +948,15 @@ void ClangdServer::onFileEvent(const DidChangeWatchedFilesParams &Params) {
 }
 
 void ClangdServer::graphSnapshot(const GraphSnapshotParams &Params,
-                                 Callback<llvm::json::Value> CB) const {
+                                 Callback<llvm::json::Value> CB) {
   if (!BackgroundIdx)
     return CB(error("samchon/graphSnapshot requires background indexing"));
-  CB(BackgroundIdx->graphSnapshot(Params));
+  WorkScheduler->run("GraphSnapshot", /*Path=*/"",
+                     [Params, CB = std::move(CB), this]() mutable {
+                       if (auto Reason = isCancelled())
+                         return CB(llvm::make_error<CancelledError>(Reason));
+                       CB(BackgroundIdx->graphSnapshot(Params));
+                     });
 }
 
 void ClangdServer::workspaceSymbols(

@@ -143,6 +143,7 @@ public:
 
   bool shouldIndexUnnamedSymbols() const override { return Opts.CollectGraph; }
   bool shouldIndexImplicitSymbols() const override { return Opts.CollectGraph; }
+  bool collectsGraph() const { return Opts.CollectGraph; }
 
   bool
   handleDeclOccurrence(const Decl *D, index::SymbolRoleSet Roles,

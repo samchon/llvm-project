@@ -9,10 +9,14 @@
 #include "index/Background.h"
 #include "index/BackgroundRebuild.h"
 #include "index/MemIndex.h"
+#include "support/Cancellation.h"
 #include "clang/Tooling/ArgumentsAdjusters.h"
 #include "clang/Tooling/CompilationDatabase.h"
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/Support/FileSystem.h"
+#include "llvm/Support/FileUtilities.h"
 #include "llvm/Support/ScopedPrinter.h"
+#include "llvm/Support/raw_ostream.h"
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
 #include <chrono>
@@ -862,6 +866,23 @@ TEST_F(BackgroundIndexTest, ColdGraphSnapshotIsRetryable) {
   expectContentModified(Idx.graphSnapshot({}));
 }
 
+TEST_F(BackgroundIndexTest, GraphSnapshotHonorsRequestCancellation) {
+  MockFS FS;
+  llvm::StringMap<std::string> Storage;
+  size_t CacheHits = 0;
+  MemoryShardStorage MSS(Storage, CacheHits);
+  OverlayCDB CDB(/*Base=*/nullptr);
+  BackgroundIndex Idx(FS, CDB, [&](llvm::StringRef) { return &MSS; }, {});
+  auto Task = cancelableTask();
+  Task.second();
+  WithContext Cancelled(std::move(Task.first));
+  auto Result = Idx.graphSnapshot({});
+  ASSERT_FALSE(Result);
+  auto Error = Result.takeError();
+  EXPECT_TRUE(Error.isA<CancelledError>());
+  llvm::consumeError(std::move(Error));
+}
+
 TEST_F(BackgroundIndexTest, WatchedMetadataIsNotATranslationUnit) {
   MockFS FS;
   llvm::StringMap<std::string> Storage;
@@ -903,12 +924,15 @@ TEST_F(BackgroundIndexTest, GraphSnapshotUsesTranslationUnitContext) {
   OverlayCDB CDB(/*Base=*/nullptr, /*FallbackFlags=*/{},
                  CommandMangler::forTests());
   CDB.setCompileCommand(Source, Command);
+  std::atomic<bool> ChangedConfig = false;
   BackgroundIndex::Options Opts;
-  Opts.ContextProvider = [](PathRef Path) {
+  Opts.ContextProvider = [&](PathRef Path) {
     Config C;
     if (!Path.empty())
-      C.CompileFlags.Edits.push_back([](std::vector<std::string> &Arguments) {
-        Arguments.insert(Arguments.begin() + 1, "-DGRAPH_CONTEXT");
+      C.CompileFlags.Edits.push_back([Changed = ChangedConfig.load()](
+                                         std::vector<std::string> &Arguments) {
+        Arguments.insert(Arguments.begin() + 1,
+                         Changed ? "-DGRAPH_CONTEXT_V2" : "-DGRAPH_CONTEXT");
       });
     return Context::current().derive(Config::Key, std::move(C));
   };
@@ -921,6 +945,108 @@ TEST_F(BackgroundIndexTest, GraphSnapshotUsesTranslationUnitContext) {
   ASSERT_TRUE(bool(Snapshot)) << llvm::toString(Snapshot.takeError());
   ASSERT_TRUE(Snapshot->getAsObject()->getArray("manifest"));
   EXPECT_EQ(1u, Snapshot->getAsObject()->getArray("manifest")->size());
+  const auto InitialGeneration =
+      Snapshot->getAsObject()->getString("generation")->str();
+
+  // A config-only move is discovered while validating the resident snapshot.
+  // It must schedule the owning TU instead of returning ContentModified
+  // forever with no work capable of advancing the graph.
+  ChangedConfig = true;
+  expectContentModified(Idx.graphSnapshot({}));
+  ASSERT_TRUE(Idx.blockUntilIdleForTest());
+  auto Reconfigured = Idx.graphSnapshot({});
+  ASSERT_TRUE(bool(Reconfigured)) << llvm::toString(Reconfigured.takeError());
+  EXPECT_NE(Reconfigured->getAsObject()->getString("generation"),
+            InitialGeneration);
+  const auto *Graph = (*Reconfigured->getAsObject()->getArray("upserts"))[0]
+                          .getAsObject()
+                          ->getObject("graph");
+  ASSERT_TRUE(Graph);
+  EXPECT_TRUE(llvm::is_contained(*Graph->getArray("commandLine"),
+                                 "-DGRAPH_CONTEXT_V2"));
+  EXPECT_TRUE(llvm::any_of(*Graph->getArray("symbols"), [](const auto &Value) {
+    const auto *Symbol = Value.getAsObject();
+    return Symbol && Symbol->getString("name") == "configured";
+  }));
+
+  // Config-only reindexing must replace the persisted complete view as well as
+  // the resident one, despite unchanged source bytes.
+  auto Persisted = MSS.loadShard(Source);
+  ASSERT_TRUE(Persisted);
+  ASSERT_EQ(1u, Persisted->Graphs.size());
+  EXPECT_TRUE(llvm::is_contained(Persisted->Graphs.front().CommandLine,
+                                 "-DGRAPH_CONTEXT_V2"));
+  EXPECT_TRUE(llvm::any_of(
+      Persisted->Graphs.front().Symbols,
+      [](const GraphSymbol &Symbol) { return Symbol.Name == "configured"; }));
+}
+
+TEST_F(BackgroundIndexTest, ReplacedCompilerDriverStartsANewUniverse) {
+  MockFS FS;
+  llvm::StringMap<std::string> Storage;
+  size_t CacheHits = 0;
+  MemoryShardStorage MSS(Storage, CacheHits);
+  MultiCommandCDB CDB;
+  const std::string Source = testPath("toolchain.cpp");
+  FS.Files[Source] = "int toolchain();";
+
+  int FD = -1;
+  llvm::SmallString<128> Driver;
+  ASSERT_FALSE(
+      llvm::sys::fs::createTemporaryFile("clangd-driver", "", FD, Driver));
+  llvm::FileRemover Cleanup(Driver);
+  {
+    llvm::raw_fd_ostream OS(FD, /*shouldClose=*/true);
+    OS << "first wrapper";
+  }
+  tooling::CompileCommand Command;
+  Command.Directory = testRoot();
+  Command.Filename = Source;
+  Command.CommandLine = {Driver.str().str(), "-fsyntax-only", Source};
+  CDB.Commands[Source] = {Command};
+
+  BackgroundIndex Idx(FS, CDB, [&](llvm::StringRef) { return &MSS; }, {});
+  Idx.enqueue({Source});
+  ASSERT_TRUE(Idx.blockUntilIdleForTest());
+  auto Initial = Idx.graphSnapshot({});
+  ASSERT_TRUE(bool(Initial)) << llvm::toString(Initial.takeError());
+  const auto InitialGeneration =
+      Initial->getAsObject()->getString("generation")->str();
+  const auto InitialUniverse =
+      Initial->getAsObject()->getObject("universe")->getString("digest")->str();
+
+  std::error_code EC;
+  {
+    llvm::raw_fd_ostream OS(Driver, EC, llvm::sys::fs::OF_None);
+    ASSERT_FALSE(EC);
+    OS << "second wrapper";
+  }
+  expectContentModified(Idx.graphSnapshot({}));
+  ASSERT_TRUE(Idx.blockUntilIdleForTest());
+  auto Reindexed = Idx.graphSnapshot({});
+  ASSERT_TRUE(bool(Reindexed)) << llvm::toString(Reindexed.takeError());
+  EXPECT_NE(Reindexed->getAsObject()->getString("generation"),
+            InitialGeneration);
+  EXPECT_NE(
+      Reindexed->getAsObject()->getObject("universe")->getString("digest"),
+      InitialUniverse);
+  const auto *Graph = (*Reindexed->getAsObject()->getArray("upserts"))[0]
+                          .getAsObject()
+                          ->getObject("graph");
+  ASSERT_TRUE(Graph);
+  EXPECT_TRUE(llvm::any_of(*Graph->getArray("symbols"), [](const auto &Value) {
+    const auto *Symbol = Value.getAsObject();
+    return Symbol && Symbol->getString("name") == "toolchain";
+  }));
+
+  auto Persisted = MSS.loadShard(Source);
+  ASSERT_TRUE(Persisted);
+  ASSERT_EQ(1u, Persisted->Graphs.size());
+  EXPECT_EQ(Persisted->Graphs.front().ToolchainFingerprint,
+            compileCommandDriverFingerprint(Command));
+  EXPECT_TRUE(llvm::any_of(
+      Persisted->Graphs.front().Symbols,
+      [](const GraphSymbol &Symbol) { return Symbol.Name == "toolchain"; }));
 }
 
 TEST_F(BackgroundIndexTest, EquivalentMainFileSpellingsShareOneShard) {
@@ -1162,6 +1288,44 @@ TEST_F(BackgroundIndexTest, GeneratedHeaderCreationRetriesFailedGraph) {
             URI::create(Header).toString());
 }
 
+TEST_F(BackgroundIndexTest, GeneratedForcedIncludeRetriesFailedGraph) {
+  MockFS FS;
+  llvm::StringMap<std::string> Storage;
+  size_t CacheHits = 0;
+  MemoryShardStorage MSS(Storage, CacheHits);
+  MultiCommandCDB CDB;
+  const std::string File = testPath("forced.cc");
+  const std::string Header = testPath("generated-force.h");
+  FS.Files[File] = "int use() { return forced(); }";
+  tooling::CompileCommand Command;
+  Command.Filename = File;
+  Command.Directory = testRoot();
+  Command.CommandLine = {"clang++", "-include", "generated-force.h",
+                         "-fsyntax-only", File};
+  CDB.Commands[File] = {Command};
+
+  BackgroundIndex Idx(FS, CDB, [&](llvm::StringRef) { return &MSS; }, {});
+  Idx.enqueue({File});
+  ASSERT_TRUE(Idx.blockUntilIdleForTest());
+  auto Failed = Idx.graphSnapshot({});
+  ASSERT_FALSE(Failed);
+  llvm::consumeError(Failed.takeError());
+
+  FS.Files[Header] = "inline int forced() { return 7; }";
+  expectContentModified(Idx.graphSnapshot({}));
+  ASSERT_TRUE(Idx.blockUntilIdleForTest());
+  auto Recovered = Idx.graphSnapshot({});
+  ASSERT_TRUE(bool(Recovered)) << llvm::toString(Recovered.takeError());
+  const auto *Graph = (*Recovered->getAsObject()->getArray("upserts"))[0]
+                          .getAsObject()
+                          ->getObject("graph");
+  ASSERT_TRUE(Graph);
+  EXPECT_TRUE(llvm::any_of(*Graph->getArray("symbols"), [](const auto &Value) {
+    const auto *Symbol = Value.getAsObject();
+    return Symbol && Symbol->getString("name") == "forced";
+  }));
+}
+
 TEST_F(BackgroundIndexTest, PersistedGraphRequiresCurrentProducerFingerprint) {
   MockFS FS;
   llvm::StringMap<std::string> Storage;
@@ -1239,6 +1403,7 @@ TEST_F(BackgroundIndexTest, GraphSnapshotPagesShardsAndMeasuresWork) {
   ASSERT_TRUE(Sequence);
   const auto *FirstPhases = FirstObject->getObject("phases");
   ASSERT_TRUE(FirstPhases);
+  EXPECT_GT(*FirstPhases->getInteger("validationMillis"), 0);
   EXPECT_GT(*FirstPhases->getInteger("semanticMillis"), 0);
   EXPECT_GT(*FirstPhases->getInteger("shardMillis"), 0);
   EXPECT_EQ(FirstPhases->getBoolean("cacheHit"), false);
@@ -1264,6 +1429,7 @@ TEST_F(BackgroundIndexTest, GraphSnapshotPagesShardsAndMeasuresWork) {
     EXPECT_EQ(static_cast<int64_t>(Seen), *Page->getInteger("offset"));
     const auto *Phases = Object->getObject("phases");
     ASSERT_TRUE(Phases);
+    EXPECT_GT(*Phases->getInteger("validationMillis"), 0);
     EXPECT_EQ(0, *Phases->getInteger("semanticMillis"));
     EXPECT_EQ(0, *Phases->getInteger("shardMillis"));
     ++Seen;
@@ -1284,9 +1450,13 @@ TEST_F(BackgroundIndexTest, GraphSnapshotPagesShardsAndMeasuresWork) {
   EXPECT_EQ(NoopPhases->getBoolean("cacheHit"), true);
   EXPECT_EQ(0, *NoopPhases->getInteger("semanticMillis"));
   EXPECT_EQ(0, *NoopPhases->getInteger("shardMillis"));
+  EXPECT_GT(*NoopPhases->getInteger("validationMillis"), 0);
   EXPECT_GT(*NoopPhases->getInteger("encodeMillis"), 0);
   EXPECT_EQ(*NoopPhases->getInteger("totalMillis"),
-            *NoopPhases->getInteger("encodeMillis"));
+            *NoopPhases->getInteger("validationMillis") +
+                *NoopPhases->getInteger("semanticMillis") +
+                *NoopPhases->getInteger("shardMillis") +
+                *NoopPhases->getInteger("encodeMillis"));
 }
 
 TEST_F(BackgroundIndexTest, MixedClangLanguagesPublishOnlyCAndCXX) {
@@ -1368,20 +1538,67 @@ TEST_F(BackgroundIndexTest, HeaderViewsStayOwnedByTheirTranslationUnits) {
   ASSERT_TRUE(Upserts);
   ASSERT_EQ(2u, Upserts->size());
   std::set<std::pair<std::string, std::string>> Views;
+  std::set<std::string> Configurations;
+  std::set<std::string> ShardKeys;
   for (const auto &Shard : *Upserts) {
-    const auto *Graph = Shard.getAsObject()->getObject("graph");
+    const auto *ShardObject = Shard.getAsObject();
+    ASSERT_TRUE(ShardObject);
+    const auto *Graph = ShardObject->getObject("graph");
     ASSERT_TRUE(Graph);
+    const auto Language = Graph->getString("language");
+    const auto Configuration = ShardObject->getString("configuration");
+    const auto Key = ShardObject->getString("key");
+    ASSERT_TRUE(Language);
+    ASSERT_TRUE(Configuration);
+    ASSERT_TRUE(Key);
+    EXPECT_EQ(Graph->getString("commandDigest"), Configuration);
+    EXPECT_TRUE(Key->ends_with((llvm::Twine("#") + *Configuration).str()));
+    Configurations.insert(Configuration->str());
+    ShardKeys.insert(Key->str());
+
     bool HasSharedHeader = false;
     for (const auto &Source : *Graph->getArray("sources"))
       HasSharedHeader |= Source.getAsObject()->getString("uri") ==
                          URI::create(Header).toString();
     EXPECT_TRUE(HasSharedHeader);
-    Views.emplace(Graph->getString("mainFile")->str(),
-                  Graph->getString("language")->str());
+
+    size_t SharedSymbols = 0;
+    bool SharedIsDefined = false;
+    std::set<std::string> Names;
+    for (const auto &EncodedSymbol : *Graph->getArray("symbols")) {
+      const auto *Symbol = EncodedSymbol.getAsObject();
+      ASSERT_TRUE(Symbol);
+      const auto Name = Symbol->getString("name");
+      const auto Kind = Symbol->getInteger("kind");
+      ASSERT_TRUE(Name);
+      ASSERT_TRUE(Kind);
+      Names.insert(Name->str());
+      if (*Name == "Shared" && *Kind != 23) {
+        ++SharedSymbols;
+        EXPECT_EQ(Symbol->getObject("declaration")->getString("file"),
+                  URI::create(Header).toString());
+        SharedIsDefined =
+            !Symbol->getObject("definition")->getString("file")->empty();
+      }
+    }
+    EXPECT_EQ(1u, SharedSymbols);
+    if (*Language == "c") {
+      EXPECT_FALSE(SharedIsDefined);
+      EXPECT_EQ(1u, Names.count("c_owner"));
+      EXPECT_EQ(0u, Names.count("cpp_owner"));
+    } else {
+      EXPECT_EQ("cpp", *Language);
+      EXPECT_TRUE(SharedIsDefined);
+      EXPECT_EQ(1u, Names.count("cpp_owner"));
+      EXPECT_EQ(0u, Names.count("c_owner"));
+    }
+    Views.emplace(Graph->getString("mainFile")->str(), Language->str());
   }
   EXPECT_EQ((std::set<std::pair<std::string, std::string>>{{CFile, "c"},
                                                            {CXXFile, "cpp"}}),
             Views);
+  EXPECT_EQ(2u, Configurations.size());
+  EXPECT_EQ(2u, ShardKeys.size());
 }
 
 TEST_F(BackgroundIndexTest, GraphSnapshotDeletesAreCanonical) {

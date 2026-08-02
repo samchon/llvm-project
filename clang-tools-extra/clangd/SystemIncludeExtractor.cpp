@@ -81,6 +81,9 @@ struct DriverInfo {
 struct DriverArgs {
   // Name of the driver program to execute or absolute path to it.
   std::string Driver;
+  // Exact resolved driver identity. A replaced wrapper must miss the query
+  // cache even when its path and language are unchanged.
+  std::string DriverFingerprint;
   // Whether certain includes should be part of query.
   bool StandardIncludes = true;
   bool StandardCXXIncludes = true;
@@ -93,11 +96,12 @@ struct DriverArgs {
   llvm::SmallVector<std::string> Specs;
 
   bool operator==(const DriverArgs &RHS) const {
-    return std::tie(Driver, StandardIncludes, StandardCXXIncludes, Lang,
-                    Sysroot, ISysroot, Target, Stdlib, Specs) ==
-           std::tie(RHS.Driver, RHS.StandardIncludes, RHS.StandardCXXIncludes,
-                    RHS.Lang, RHS.Sysroot, RHS.ISysroot, RHS.Target, RHS.Stdlib,
-                    RHS.Specs);
+    return std::tie(Driver, DriverFingerprint, StandardIncludes,
+                    StandardCXXIncludes, Lang, Sysroot, ISysroot, Target,
+                    Stdlib, Specs) ==
+           std::tie(RHS.Driver, RHS.DriverFingerprint, RHS.StandardIncludes,
+                    RHS.StandardCXXIncludes, RHS.Lang, RHS.Sysroot,
+                    RHS.ISysroot, RHS.Target, RHS.Stdlib, RHS.Specs);
   }
 
   DriverArgs(const tooling::CompileCommand &Cmd, llvm::StringRef File) {
@@ -109,6 +113,9 @@ struct DriverArgs {
       llvm::sys::path::make_absolute(Cmd.Directory, Driver);
     }
     this->Driver = Driver.str().str();
+    tooling::CompileCommand DriverCommand = Cmd;
+    DriverCommand.CommandLine = {this->Driver};
+    DriverFingerprint = compileCommandDriverFingerprint(DriverCommand);
     for (size_t I = 0, E = Cmd.CommandLine.size(); I < E; ++I) {
       llvm::StringRef Arg = Cmd.CommandLine[I];
 
@@ -230,6 +237,7 @@ template <> struct DenseMapInfo<DriverArgs> {
   static unsigned getHashValue(const DriverArgs &Val) {
     unsigned FixedFieldsHash = llvm::hash_value(std::tuple{
         Val.Driver,
+        Val.DriverFingerprint,
         Val.StandardIncludes,
         Val.StandardCXXIncludes,
         Val.Lang,

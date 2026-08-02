@@ -155,6 +155,8 @@ struct GraphTU {
   std::vector<std::string> CommandLine;
   std::string Output;
   std::string CommandDigest;
+  /// SHA-256 of the resolved compiler driver path and exact bytes.
+  std::string ToolchainFingerprint;
   std::string TargetTriple;
   std::string Language;
   bool HadErrors = false;

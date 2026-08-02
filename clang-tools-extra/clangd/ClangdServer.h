@@ -419,7 +419,7 @@ public:
 
   /// Returns an atomic, validated generation of complete C/C++ graph facts.
   void graphSnapshot(const GraphSnapshotParams &Params,
-                     Callback<llvm::json::Value> CB) const;
+                     Callback<llvm::json::Value> CB);
 
   /// Get symbol info for given position.
   /// Clangd extension - not part of official LSP.

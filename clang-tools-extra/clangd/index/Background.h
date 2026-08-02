@@ -251,6 +251,7 @@ private:
     std::string MainFile;
     std::string Directory;
     std::string CommandDigest;
+    std::string ToolchainFingerprint;
     std::string Key;
     std::string Digest;
     std::string CheckerDigest;
@@ -289,6 +290,7 @@ private:
   BackgroundQueue::Task
   changedFilesTask(const std::vector<std::string> &ChangedFiles);
   BackgroundQueue::Task indexFileTask(std::string Path);
+  void enqueueGraphReindex(llvm::ArrayRef<std::string> MainFiles);
 
   // from lowest to highest priority
   enum QueuePriority {

@@ -299,6 +299,7 @@ llvm::json::Value toJSON(const GraphTU &Graph) {
       {"commandLine", llvm::json::Array(Graph.CommandLine)},
       {"output", Graph.Output},
       {"commandDigest", Graph.CommandDigest},
+      {"toolchainFingerprint", Graph.ToolchainFingerprint},
       {"targetTriple", Graph.TargetTriple},
       {"language", Graph.Language},
       {"hadErrors", Graph.HadErrors},
@@ -323,6 +324,7 @@ bool fromJSON(const llvm::json::Value &Value, GraphTU &Graph,
          O.map("commandLine", Graph.CommandLine) &&
          O.map("output", Graph.Output) &&
          O.map("commandDigest", Graph.CommandDigest) &&
+         O.map("toolchainFingerprint", Graph.ToolchainFingerprint) &&
          O.map("targetTriple", Graph.TargetTriple) &&
          O.map("language", Graph.Language) &&
          O.map("hadErrors", Graph.HadErrors) &&

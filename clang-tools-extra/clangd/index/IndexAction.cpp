@@ -9,6 +9,7 @@
 #include "IndexAction.h"
 #include "AST.h"
 #include "Headers.h"
+#include "SourceCode.h"
 #include "clang-include-cleaner/Record.h"
 #include "index/Relation.h"
 #include "index/SymbolCollector.h"
@@ -30,13 +31,14 @@ namespace clang {
 namespace clangd {
 namespace {
 
-std::optional<std::string> toURI(OptionalFileEntryRef File) {
+std::optional<std::string> toURI(OptionalFileEntryRef File,
+                                 const SourceManager &SM) {
   if (!File)
     return std::nullopt;
-  auto AbsolutePath = File->getFileEntry().tryGetRealPathName();
-  if (AbsolutePath.empty())
+  auto CanonicalPath = getCanonicalPath(*File, SM.getFileManager());
+  if (!CanonicalPath)
     return std::nullopt;
-  return URI::create(AbsolutePath).toString();
+  return URI::create(*CanonicalPath).toString();
 }
 
 // Collects the nodes and edges of include graph during indexing action.
@@ -62,7 +64,7 @@ public:
 
     const auto FileID = SM.getFileID(Loc);
     auto File = SM.getFileEntryRefForID(FileID);
-    auto URI = toURI(File);
+    auto URI = toURI(File, SM);
     if (!URI)
       return;
     auto I = IG.try_emplace(*URI).first;
@@ -97,11 +99,12 @@ public:
       Collector->recordGraphMissingInclude(HashLoc, FileName, IsAngled);
       return;
     }
-    auto IncludeURI = toURI(File);
+    auto IncludeURI = toURI(File, SM);
     if (!IncludeURI)
       return;
 
-    auto IncludingURI = toURI(SM.getFileEntryRefForID(SM.getFileID(HashLoc)));
+    auto IncludingURI =
+        toURI(SM.getFileEntryRefForID(SM.getFileID(HashLoc)), SM);
     if (!IncludingURI)
       return;
 
@@ -117,7 +120,7 @@ public:
   void FileSkipped(const FileEntryRef &SkippedFile, const Token &FilenameTok,
                    SrcMgr::CharacteristicKind FileType) override {
 #ifndef NDEBUG
-    auto URI = toURI(SkippedFile);
+    auto URI = toURI(SkippedFile, SM);
     if (!URI)
       return;
     auto I = IG.try_emplace(*URI);
@@ -150,6 +153,12 @@ public:
         GraphCallback(GraphCallback), Collector(C), PI(std::move(PI)),
         Opts(Opts) {
     this->Opts.ShouldTraverseDecl = [this](const Decl *D) {
+      // Complete graph export needs every occurrence, including function bodies
+      // in unchanged files and declarations beyond clangd's search-index depth
+      // cutoff. FileFilter and the depth cutoff remain optimizations for the
+      // ordinary symbol/search slabs when graph collection is disabled.
+      if (Collector->collectsGraph())
+        return true;
       // Many operations performed during indexing is linear in terms of depth
       // of the decl (USR generation, name lookups, figuring out role of a
       // reference are some examples). Since we index all the decls nested

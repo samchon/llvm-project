@@ -49,11 +49,15 @@ struct CommandMangler {
   // for parsing `TargetFile`.
   void operator()(tooling::CompileCommand &Cmd,
                   llvm::StringRef TargetFile) const;
-
-private:
-  Memoize<llvm::StringMap<std::string>> ResolvedDrivers;
-  Memoize<llvm::StringMap<std::string>> ResolvedDriversNoFollow;
 };
+
+/// Fingerprints the resolved compiler driver path and its exact bytes.
+///
+/// This is deliberately recomputed when commands are requested: compiler
+/// wrappers and symlink targets can change without changing compile_commands,
+/// and a compiler-owned graph must not reuse the old toolchain universe.
+std::string
+compileCommandDriverFingerprint(const tooling::CompileCommand &Command);
 
 // Removes args from a command-line in a semantically-aware way.
 //

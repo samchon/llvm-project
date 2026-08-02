@@ -20,9 +20,11 @@
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Config/llvm-config.h" // for LLVM_ON_UNIX
 #include "llvm/Support/FileSystem.h"
+#include "llvm/Support/FileUtilities.h"
 #include "llvm/Support/Path.h"
 #include "llvm/Support/Process.h"
 #include "llvm/Support/TargetSelect.h"
+#include "llvm/Support/raw_ostream.h"
 
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
@@ -40,6 +42,32 @@ using ::testing::Not;
 // Sadly, CommandMangler::detect(), which contains much of the logic, is
 // a bunch of untested integration glue. We test the string manipulation here
 // assuming its results are correct.
+
+TEST(CompileCommandDriverFingerprint, ChangesWithExactWrapperBytes) {
+  int FD = -1;
+  llvm::SmallString<128> Driver;
+  ASSERT_FALSE(
+      llvm::sys::fs::createTemporaryFile("clangd-driver", "", FD, Driver));
+  llvm::FileRemover Cleanup(Driver);
+  {
+    llvm::raw_fd_ostream OS(FD, /*shouldClose=*/true);
+    OS << "first wrapper";
+  }
+  tooling::CompileCommand Command;
+  Command.Directory = llvm::sys::path::parent_path(Driver).str();
+  Command.CommandLine = {Driver.str().str()};
+  const std::string First = compileCommandDriverFingerprint(Command);
+
+  std::error_code EC;
+  {
+    llvm::raw_fd_ostream OS(Driver, EC, llvm::sys::fs::OF_None);
+    ASSERT_FALSE(EC);
+    OS << "second wrapper";
+  }
+  const std::string Second = compileCommandDriverFingerprint(Command);
+  EXPECT_NE(First, Second);
+  EXPECT_EQ(Second, compileCommandDriverFingerprint(Command));
+}
 
 // Make use of all features and assert the exact command we get out.
 // Other tests just verify presence/absence of certain args.

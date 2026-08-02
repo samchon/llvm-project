@@ -18,6 +18,7 @@
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/StringExtras.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Option/ArgList.h"
 #include "llvm/Option/Option.h"
@@ -28,6 +29,7 @@
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/Path.h"
 #include "llvm/Support/Program.h"
+#include "llvm/Support/SHA256.h"
 #include <iterator>
 #include <optional>
 #include <string>
@@ -184,6 +186,40 @@ static std::string resolveDriver(llvm::StringRef Driver, bool FollowSymlink,
 }
 
 } // namespace
+
+std::string
+compileCommandDriverFingerprint(const tooling::CompileCommand &Command) {
+  llvm::SmallString<256> Driver(
+      Command.CommandLine.empty() ? llvm::StringRef() : Command.CommandLine[0]);
+  if (!Driver.empty() && !llvm::sys::path::is_absolute(Driver)) {
+    if (llvm::any_of(Driver,
+                     [](char C) { return llvm::sys::path::is_separator(C); })) {
+      llvm::SmallString<256> Absolute(Command.Directory);
+      llvm::sys::path::append(Absolute, Driver);
+      Driver = Absolute;
+    } else if (auto Found = llvm::sys::findProgramByName(Driver)) {
+      Driver = *Found;
+    }
+  }
+  llvm::sys::path::remove_dots(Driver, /*remove_dot_dot=*/true);
+  llvm::SmallString<256> RealDriver;
+  if (!Driver.empty() && !llvm::sys::fs::real_path(Driver, RealDriver))
+    Driver = RealDriver;
+  llvm::sys::path::convert_to_slash(Driver);
+
+  llvm::SHA256 Hash;
+  Hash.update(llvm::arrayRefFromStringRef(Driver));
+  static constexpr char Separator = '\0';
+  Hash.update(llvm::StringRef(&Separator, 1));
+  auto Contents = llvm::MemoryBuffer::getFile(Driver);
+  if (Contents) {
+    Hash.update(llvm::arrayRefFromStringRef((*Contents)->getBuffer()));
+  } else {
+    const std::string ErrorCode = std::to_string(Contents.getError().value());
+    Hash.update(llvm::arrayRefFromStringRef(ErrorCode));
+  }
+  return llvm::toHex(Hash.final(), /*LowerCase=*/true);
+}
 
 CommandMangler CommandMangler::detect() {
   CommandMangler Result;
@@ -346,11 +382,7 @@ void CommandMangler::operator()(tooling::CompileCommand &Command,
 
   if (!Cmd.empty()) {
     bool FollowSymlink = !HasExact("-no-canonical-prefixes");
-    Cmd.front() =
-        (FollowSymlink ? ResolvedDrivers : ResolvedDriversNoFollow)
-            .get(Cmd.front(), [&, this] {
-              return resolveDriver(Cmd.front(), FollowSymlink, ClangPath);
-            });
+    Cmd.front() = resolveDriver(Cmd.front(), FollowSymlink, ClangPath);
   }
 }
 

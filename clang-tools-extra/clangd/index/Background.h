@@ -40,6 +40,8 @@
 namespace clang {
 namespace clangd {
 
+class CompileCommandDriverFingerprintCache;
+
 // Handles storage and retrieval of index shards. Both store and load
 // operations can be called from multiple-threads concurrently.
 class BackgroundIndexStorage {
@@ -220,11 +222,14 @@ private:
   struct IndexResult {
     IndexFileIn Index;
     llvm::StringMap<ShardVersion> ShardVersionsSnapshot;
+    std::vector<std::string> MissingInputs;
     bool HadErrors = false;
     uint64_t SemanticMillis = 0;
   };
 
-  llvm::Expected<IndexResult> index(tooling::CompileCommand);
+  llvm::Expected<IndexResult>
+  index(tooling::CompileCommand,
+        CompileCommandDriverFingerprintCache *DriverFingerprints = nullptr);
 
   FileSymbols IndexedSymbols;
   BackgroundIndexRebuilder Rebuilder;
@@ -272,6 +277,8 @@ private:
   };
   struct GraphSnapshotPlan {
     std::string Token;
+    uint64_t Revision = 0;
+    std::string Generation;
     std::optional<std::string> BaseGeneration;
     uint64_t Sequence = 0;
     std::vector<size_t> Upserts;
@@ -281,7 +288,9 @@ private:
     bool CacheHit = false;
   };
   mutable std::optional<GraphSnapshotCache> CachedGraphSnapshot;
-  mutable std::optional<GraphSnapshotPlan> ActiveGraphSnapshotPlan;
+  // Several clients may page through the same immutable cache concurrently.
+  // Plans are bounded by sequence and invalidated by graph revision changes.
+  mutable llvm::StringMap<GraphSnapshotPlan> ActiveGraphSnapshotPlans;
 
   BackgroundIndexStorage::Factory IndexStorageFactory;
   // Tries to load shards for the MainFiles and their dependencies.

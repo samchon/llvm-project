@@ -63,7 +63,9 @@
 #include <cassert>
 #include <cstddef>
 #include <iterator>
+#include <map>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <tuple>
@@ -72,6 +74,12 @@
 
 namespace clang::clangd {
 namespace {
+
+thread_local uint64_t ActiveRefreshScope = 0;
+thread_local uint64_t NextRefreshScope = 0;
+thread_local bool RefreshQueriesInActiveScope = false;
+thread_local CompileCommandDriverFingerprintCache *ActiveDriverFingerprints =
+    nullptr;
 
 struct DriverInfo {
   std::vector<std::string> SystemIncludes;
@@ -104,7 +112,9 @@ struct DriverArgs {
                     RHS.ISysroot, RHS.Target, RHS.Stdlib, RHS.Specs);
   }
 
-  DriverArgs(const tooling::CompileCommand &Cmd, llvm::StringRef File) {
+  DriverArgs(const tooling::CompileCommand &Cmd, llvm::StringRef File,
+             std::string DriverFingerprint)
+      : DriverFingerprint(std::move(DriverFingerprint)) {
     llvm::SmallString<128> Driver(Cmd.CommandLine.front());
     // Driver is a not a single executable name but instead a path (either
     // relative or absolute).
@@ -113,9 +123,6 @@ struct DriverArgs {
       llvm::sys::path::make_absolute(Cmd.Directory, Driver);
     }
     this->Driver = Driver.str().str();
-    tooling::CompileCommand DriverCommand = Cmd;
-    DriverCommand.CommandLine = {this->Driver};
-    DriverFingerprint = compileCommandDriverFingerprint(DriverCommand);
     for (size_t I = 0, E = Cmd.CommandLine.size(); I < E; ++I) {
       llvm::StringRef Arg = Cmd.CommandLine[I];
 
@@ -524,28 +531,96 @@ llvm::Regex convertGlobsToRegex(llvm::ArrayRef<std::string> Globs) {
 class SystemIncludeExtractor {
 public:
   SystemIncludeExtractor(llvm::ArrayRef<std::string> QueryDriverGlobs)
-      : QueryDriverRegex(convertGlobsToRegex(QueryDriverGlobs)) {}
+      : Shared(std::make_shared<State>()),
+        QueryDriverRegex(convertGlobsToRegex(QueryDriverGlobs)) {}
 
   void operator()(tooling::CompileCommand &Cmd, llvm::StringRef File) const {
     if (Cmd.CommandLine.empty())
       return;
 
-    DriverArgs Args(Cmd, File);
+    struct ThreadCache {
+      uint64_t Scope = 0;
+      llvm::DenseMap<DriverArgs, std::optional<DriverInfo>> Queries;
+    };
+    thread_local std::map<const State *, ThreadCache> ScopedCaches;
+    ThreadCache *Scoped = nullptr;
+    if (ActiveRefreshScope) {
+      Scoped = &ScopedCaches[Shared.get()];
+      if (Scoped->Scope != ActiveRefreshScope) {
+        Scoped->Scope = ActiveRefreshScope;
+        Scoped->Queries.clear();
+      }
+    }
+    std::string DriverFingerprint = ActiveDriverFingerprints
+                                        ? ActiveDriverFingerprints->get(Cmd)
+                                        : compileCommandDriverFingerprint(Cmd);
+    DriverArgs Args(Cmd, File, std::move(DriverFingerprint));
     if (Args.Lang.empty())
       return;
-    if (auto Info = QueriedDrivers.get(Args, [&] {
-          return extractSystemIncludesAndTarget(Args, QueryDriverRegex);
-        })) {
+    std::optional<DriverInfo> Info;
+    if (Scoped && RefreshQueriesInActiveScope) {
+      auto Existing = Scoped->Queries.find(Args);
+      if (Existing != Scoped->Queries.end()) {
+        Info = Existing->second;
+      } else {
+        Info = extractSystemIncludesAndTarget(Args, QueryDriverRegex);
+        Scoped->Queries.try_emplace(Args, Info);
+        std::lock_guard<std::mutex> Lock(Shared->Mu);
+        Shared->QueriedDrivers[Args] = Info;
+      }
+    } else {
+      bool Found = false;
+      {
+        std::lock_guard<std::mutex> Lock(Shared->Mu);
+        auto Existing = Shared->QueriedDrivers.find(Args);
+        if (Existing != Shared->QueriedDrivers.end()) {
+          Info = Existing->second;
+          Found = true;
+        }
+      }
+      if (!Found) {
+        auto Queried = extractSystemIncludesAndTarget(Args, QueryDriverRegex);
+        std::lock_guard<std::mutex> Lock(Shared->Mu);
+        auto Inserted = Shared->QueriedDrivers.try_emplace(Args, Queried);
+        Info = Inserted.first->second;
+      }
+    }
+    if (Info) {
       setTarget(addSystemIncludes(Cmd, Info->SystemIncludes), Info->Target);
     }
   }
 
 private:
-  // Caches includes extracted from a driver. Key is driver:lang.
-  Memoize<llvm::DenseMap<DriverArgs, std::optional<DriverInfo>>> QueriedDrivers;
+  struct State {
+    std::mutex Mu;
+    llvm::DenseMap<DriverArgs, std::optional<DriverInfo>> QueriedDrivers;
+  };
+  std::shared_ptr<State> Shared;
   llvm::Regex QueryDriverRegex;
 };
 } // namespace
+
+SystemIncludeExtractorScope::SystemIncludeExtractorScope(bool RefreshQueries)
+    : Previous(ActiveRefreshScope),
+      PreviousRefresh(RefreshQueriesInActiveScope),
+      PreviousDriverFingerprints(ActiveDriverFingerprints),
+      DriverFingerprints(
+          std::make_unique<CompileCommandDriverFingerprintCache>()) {
+  ActiveRefreshScope = ++NextRefreshScope;
+  RefreshQueriesInActiveScope = RefreshQueries;
+  ActiveDriverFingerprints = DriverFingerprints.get();
+}
+
+SystemIncludeExtractorScope::~SystemIncludeExtractorScope() {
+  ActiveRefreshScope = Previous;
+  RefreshQueriesInActiveScope = PreviousRefresh;
+  ActiveDriverFingerprints = PreviousDriverFingerprints;
+}
+
+CompileCommandDriverFingerprintCache &
+SystemIncludeExtractorScope::driverFingerprints() {
+  return *DriverFingerprints;
+}
 
 SystemIncludeExtractorFn
 getSystemIncludeExtractor(llvm::ArrayRef<std::string> QueryDriverGlobs) {

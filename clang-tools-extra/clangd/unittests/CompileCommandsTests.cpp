@@ -69,6 +69,44 @@ TEST(CompileCommandDriverFingerprint, ChangesWithExactWrapperBytes) {
   EXPECT_EQ(Second, compileCommandDriverFingerprint(Command));
 }
 
+TEST(CompileCommandDriverFingerprint, BoundedCacheReadsEachDriverOnce) {
+  int FD = -1;
+  llvm::SmallString<128> Driver;
+  ASSERT_FALSE(
+      llvm::sys::fs::createTemporaryFile("clangd-driver", "", FD, Driver));
+  llvm::FileRemover Cleanup(Driver);
+  {
+    llvm::raw_fd_ostream OS(FD, /*shouldClose=*/true);
+    OS << "first wrapper";
+  }
+  tooling::CompileCommand Command;
+  Command.Directory = llvm::sys::path::parent_path(Driver).str();
+  Command.CommandLine = {Driver.str().str()};
+  CompileCommandDriverFingerprintCache Cache;
+  const std::string First = Cache.get(Command);
+
+  std::error_code EC;
+  {
+    llvm::raw_fd_ostream OS(Driver, EC, llvm::sys::fs::OF_None);
+    ASSERT_FALSE(EC);
+    OS << "second wrapper";
+  }
+  EXPECT_EQ(First, Cache.get(Command));
+  CompileCommandDriverFingerprintCache NextOperation;
+  EXPECT_NE(First, NextOperation.get(Command));
+}
+
+TEST(CompileCommandDriverFingerprint, ToolchainIncludesEffectiveQueryOutput) {
+  tooling::CompileCommand Command;
+  Command.Directory = testRoot();
+  Command.CommandLine = {"missing-clang++", "-isystem", testPath("v1"),
+                         "--target=x86_64-unknown-linux-gnu", "input.cc"};
+  CompileCommandDriverFingerprintCache Cache;
+  const std::string First = compileCommandToolchainFingerprint(Command, &Cache);
+  Command.CommandLine[2] = testPath("v2");
+  EXPECT_NE(First, compileCommandToolchainFingerprint(Command, &Cache));
+}
+
 // Make use of all features and assert the exact command we get out.
 // Other tests just verify presence/absence of certain args.
 TEST(CommandMangler, Everything) {

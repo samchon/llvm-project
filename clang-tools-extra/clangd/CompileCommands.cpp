@@ -187,8 +187,8 @@ static std::string resolveDriver(llvm::StringRef Driver, bool FollowSymlink,
 
 } // namespace
 
-std::string
-compileCommandDriverFingerprint(const tooling::CompileCommand &Command) {
+static std::string
+resolvedCompileCommandDriver(const tooling::CompileCommand &Command) {
   llvm::SmallString<256> Driver(
       Command.CommandLine.empty() ? llvm::StringRef() : Command.CommandLine[0]);
   if (!Driver.empty() && !llvm::sys::path::is_absolute(Driver)) {
@@ -206,6 +206,10 @@ compileCommandDriverFingerprint(const tooling::CompileCommand &Command) {
   if (!Driver.empty() && !llvm::sys::fs::real_path(Driver, RealDriver))
     Driver = RealDriver;
   llvm::sys::path::convert_to_slash(Driver);
+  return Driver.str().str();
+}
+
+static std::string driverFingerprint(llvm::StringRef Driver) {
 
   llvm::SHA256 Hash;
   Hash.update(llvm::arrayRefFromStringRef(Driver));
@@ -218,6 +222,54 @@ compileCommandDriverFingerprint(const tooling::CompileCommand &Command) {
     const std::string ErrorCode = std::to_string(Contents.getError().value());
     Hash.update(llvm::arrayRefFromStringRef(ErrorCode));
   }
+  return llvm::toHex(Hash.final(), /*LowerCase=*/true);
+}
+
+std::string
+compileCommandDriverFingerprint(const tooling::CompileCommand &Command) {
+  return driverFingerprint(resolvedCompileCommandDriver(Command));
+}
+
+struct CompileCommandDriverFingerprintCache::Impl {
+  llvm::StringMap<std::string> Fingerprints;
+};
+
+CompileCommandDriverFingerprintCache::CompileCommandDriverFingerprintCache()
+    : State(std::make_unique<Impl>()) {}
+CompileCommandDriverFingerprintCache::~CompileCommandDriverFingerprintCache() =
+    default;
+CompileCommandDriverFingerprintCache::CompileCommandDriverFingerprintCache(
+    CompileCommandDriverFingerprintCache &&) = default;
+CompileCommandDriverFingerprintCache &
+CompileCommandDriverFingerprintCache::operator=(
+    CompileCommandDriverFingerprintCache &&) = default;
+
+std::string CompileCommandDriverFingerprintCache::get(
+    const tooling::CompileCommand &Command) {
+  const std::string Driver = resolvedCompileCommandDriver(Command);
+  auto Existing = State->Fingerprints.find(Driver);
+  if (Existing != State->Fingerprints.end())
+    return Existing->getValue();
+  return State->Fingerprints.try_emplace(Driver, driverFingerprint(Driver))
+      .first->getValue();
+}
+
+std::string compileCommandToolchainFingerprint(
+    const tooling::CompileCommand &Command,
+    CompileCommandDriverFingerprintCache *DriverCache) {
+  const std::string Driver = DriverCache
+                                 ? DriverCache->get(Command)
+                                 : compileCommandDriverFingerprint(Command);
+  llvm::SHA256 Hash;
+  auto Add = [&](llvm::StringRef Value) {
+    Hash.update(llvm::arrayRefFromStringRef(Value));
+    static constexpr char Separator = '\0';
+    Hash.update(llvm::StringRef(&Separator, 1));
+  };
+  Add(Driver);
+  Add(Command.Directory);
+  for (const auto &Argument : Command.CommandLine)
+    Add(Argument);
   return llvm::toHex(Hash.final(), /*LowerCase=*/true);
 }
 

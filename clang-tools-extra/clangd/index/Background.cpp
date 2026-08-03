@@ -38,7 +38,9 @@
 #include "clang/Basic/Version.h"
 #include "clang/Driver/Types.h"
 #include "clang/Frontend/FrontendAction.h"
+#include "clang/Lex/HeaderSearchOptions.h"
 #include "clang/Lex/Lexer.h"
+#include "clang/Lex/PreprocessorOptions.h"
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/STLExtras.h"
@@ -181,21 +183,12 @@ uint64_t elapsedMillis(std::chrono::steady_clock::time_point Started) {
   return static_cast<uint64_t>(std::max<int64_t>(Elapsed, 1));
 }
 
-std::vector<std::string> graphMissingIncludeCandidates(const GraphTU &Graph) {
+std::vector<std::string> graphMissingIncludeCandidates(
+    const GraphTU &Graph, llvm::ArrayRef<std::string> ParsedIncludeRoots,
+    llvm::ArrayRef<std::string> ParsedForcedIncludes) {
   std::set<std::string> IncludeRoots;
   IncludeRoots.insert(Graph.Directory);
-  for (size_t I = 0; I < Graph.CommandLine.size(); ++I) {
-    llvm::StringRef Argument = Graph.CommandLine[I];
-    llvm::StringRef Root;
-    if ((Argument == "-I" || Argument == "-iquote" || Argument == "-isystem" ||
-         Argument.equals_insensitive("/I")) &&
-        I + 1 < Graph.CommandLine.size()) {
-      Root = Graph.CommandLine[++I];
-    } else if (Argument.starts_with("-I") && Argument.size() > 2) {
-      Root = Argument.drop_front(2);
-    } else if (Argument.starts_with_insensitive("/I") && Argument.size() > 2) {
-      Root = Argument.drop_front(2);
-    }
+  for (llvm::StringRef Root : ParsedIncludeRoots) {
     if (!Root.empty()) {
       llvm::SmallString<128> Absolute(Root);
       if (!llvm::sys::path::is_absolute(Absolute)) {
@@ -244,27 +237,12 @@ std::vector<std::string> graphMissingIncludeCandidates(const GraphTU &Graph) {
                                        : std::nullopt);
   }
 
-  // Forced includes originate from the compiler's synthetic <built-in> file,
-  // whose missing-include callback has no FileEntry to identify. Recover their
-  // concrete candidates directly from the exact command instead.
-  for (size_t I = 0; I < Graph.CommandLine.size(); ++I) {
-    llvm::StringRef Argument = Graph.CommandLine[I];
-    llvm::StringRef Spelling;
-    if ((Argument == "-include" || Argument == "-imacros" ||
-         Argument == "-include-pch" || Argument.equals_insensitive("/FI")) &&
-        I + 1 < Graph.CommandLine.size()) {
-      Spelling = Graph.CommandLine[++I];
-    } else if (Argument.starts_with("-include-pch=")) {
-      Spelling = Argument.drop_front(13);
-    } else if (Argument.starts_with("-include=") ||
-               Argument.starts_with("-imacros=")) {
-      Spelling = Argument.drop_front(Argument.find('=') + 1);
-    } else if (Argument.starts_with_insensitive("/FI") && Argument.size() > 3) {
-      Spelling = Argument.drop_front(3);
-    }
-    if (!Spelling.empty())
-      AddCandidate(Spelling, Graph.MainFile);
-  }
+  // These spellings and roots come from CompilerInvocation, after Clang's
+  // option table has decoded joined/separate GNU and clang-cl forms. Forced
+  // includes originate from synthetic <built-in>, so PPCallbacks alone cannot
+  // identify the concrete file that should unblock this failed graph.
+  for (llvm::StringRef Spelling : ParsedForcedIncludes)
+    AddCandidate(Spelling, Graph.MainFile);
   return {Candidates.begin(), Candidates.end()};
 }
 
@@ -322,6 +300,7 @@ BackgroundQueue::Task BackgroundIndex::changedFilesTask(
     log("Enqueueing {0} commands for indexing", ChangedFiles.size());
     SPAN_ATTACH(Tracer, "files", int64_t(ChangedFiles.size()));
 
+    SystemIncludeExtractorScope SystemIncludes(/*RefreshQueries=*/false);
     auto NeedsReIndexing = loadProject(std::move(ChangedFiles));
     {
       std::lock_guard<std::mutex> Lock(GraphMu);
@@ -384,6 +363,7 @@ BackgroundQueue::Task BackgroundIndex::indexFileTask(std::string Path) {
     std::optional<WithContext> WithProvidedContext;
     if (ContextProvider)
       WithProvidedContext.emplace(ContextProvider(Path));
+    SystemIncludeExtractorScope SystemIncludes(/*RefreshQueries=*/false);
     auto Commands = CDB.getCompileCommands(Path);
     std::optional<std::string> LegacyCommandDigest;
     std::optional<tooling::CompileCommand> UnsupportedLegacyCommand;
@@ -421,7 +401,8 @@ BackgroundQueue::Task BackgroundIndex::indexFileTask(std::string Path) {
 
     if (Configurations.empty()) {
       if (UnsupportedLegacyCommand) {
-        auto Legacy = index(std::move(*UnsupportedLegacyCommand));
+        auto Legacy = index(std::move(*UnsupportedLegacyCommand),
+                            &SystemIncludes.driverFingerprints());
         if (Legacy) {
           Legacy->Index.Graphs.clear();
           update(Path, std::move(Legacy->Index), Legacy->ShardVersionsSnapshot,
@@ -447,7 +428,8 @@ BackgroundQueue::Task BackgroundIndex::indexFileTask(std::string Path) {
     std::vector<IndexResult> Results;
     Results.reserve(Configurations.size() + (UnsupportedLegacyCommand ? 1 : 0));
     if (UnsupportedLegacyCommand) {
-      auto Legacy = index(std::move(*UnsupportedLegacyCommand));
+      auto Legacy = index(std::move(*UnsupportedLegacyCommand),
+                          &SystemIncludes.driverFingerprints());
       if (Legacy) {
         Legacy->Index.Graphs.clear();
         Results.push_back(std::move(*Legacy));
@@ -457,7 +439,8 @@ BackgroundQueue::Task BackgroundIndex::indexFileTask(std::string Path) {
       }
     }
     for (auto &Configuration : Configurations) {
-      auto Result = index(std::move(Configuration.second));
+      auto Result = index(std::move(Configuration.second),
+                          &SystemIncludes.driverFingerprints());
       if (!Result) {
         std::string Message = llvm::toString(Result.takeError());
         elog("Indexing {0} failed: {1}", Path, Message);
@@ -484,7 +467,7 @@ BackgroundQueue::Task BackgroundIndex::indexFileTask(std::string Path) {
       for (const auto &Result : Results)
         for (const auto &Graph : Result.Index.Graphs) {
           auto FS = TFS.view(Graph.Directory);
-          for (auto &Candidate : graphMissingIncludeCandidates(Graph))
+          for (auto &Candidate : Result.MissingInputs)
             if (!FS->exists(Candidate))
               MissingInputs.insert(std::move(Candidate));
         }
@@ -642,8 +625,9 @@ void BackgroundIndex::update(
   }
 }
 
-llvm::Expected<BackgroundIndex::IndexResult>
-BackgroundIndex::index(tooling::CompileCommand Cmd) {
+llvm::Expected<BackgroundIndex::IndexResult> BackgroundIndex::index(
+    tooling::CompileCommand Cmd,
+    CompileCommandDriverFingerprintCache *DriverFingerprints) {
   trace::Span Tracer("BackgroundIndex");
   SPAN_ATTACH(Tracer, "file", Cmd.Filename);
   auto AbsolutePath = getAbsolutePath(Cmd);
@@ -734,7 +718,8 @@ BackgroundIndex::index(tooling::CompileCommand Cmd) {
     Index.Graphs.front().CommandDigest =
         graphCommandDigest(Inputs.CompileCommand);
     Index.Graphs.front().ToolchainFingerprint =
-        compileCommandDriverFingerprint(Inputs.CompileCommand);
+        compileCommandToolchainFingerprint(Inputs.CompileCommand,
+                                           DriverFingerprints);
   }
   assert(Index.Symbols && Index.Refs && Index.Sources &&
          "Symbols, Refs and Sources must be set.");
@@ -761,6 +746,19 @@ BackgroundIndex::index(tooling::CompileCommand Cmd) {
         Diagnostic.Range.FileURI = Index.Graphs.front().MainFileURI;
   }
   IndexResult Result;
+  if (!Index.Graphs.empty()) {
+    std::vector<std::string> IncludeRoots;
+    for (const auto &Entry : Clang->getHeaderSearchOpts().UserEntries)
+      IncludeRoots.push_back(Entry.Path);
+    std::vector<std::string> ForcedIncludes =
+        Clang->getPreprocessorOpts().Includes;
+    llvm::append_range(ForcedIncludes,
+                       Clang->getPreprocessorOpts().MacroIncludes);
+    if (!Clang->getPreprocessorOpts().ImplicitPCHInclude.empty())
+      ForcedIncludes.push_back(Clang->getPreprocessorOpts().ImplicitPCHInclude);
+    Result.MissingInputs = graphMissingIncludeCandidates(
+        Index.Graphs.front(), IncludeRoots, ForcedIncludes);
+  }
   Result.Index = std::move(Index);
   Result.ShardVersionsSnapshot = std::move(ShardVersionsSnapshot);
   Result.HadErrors = HadErrors;
@@ -935,6 +933,10 @@ void BackgroundIndex::enqueueGraphDependents(
 llvm::Expected<llvm::json::Value>
 BackgroundIndex::graphSnapshot(const GraphSnapshotParams &Params) {
   const auto RequestStarted = std::chrono::steady_clock::now();
+  // Query-driver output is part of the graph's semantic universe. Refresh it
+  // once per distinct query in this request so arbitrary wrappers and specs
+  // files cannot remain hidden behind the ordinary process cache.
+  SystemIncludeExtractorScope RefreshSystemIncludes(/*RefreshQueries=*/true);
   auto CheckCancellation = []() -> llvm::Error {
     if (auto Reason = isCancelled())
       return llvm::make_error<CancelledError>(Reason);
@@ -1109,6 +1111,8 @@ BackgroundIndex::graphSnapshot(const GraphSnapshotParams &Params) {
   auto CreatePlanLocked = [&](const GraphSnapshotCache &Cache,
                               bool CacheWasBuilt) {
     GraphSnapshotPlan Plan;
+    Plan.Revision = Cache.Revision;
+    Plan.Generation = Cache.Generation;
     Plan.Sequence = ++GraphSequence;
     llvm::StringMap<std::string> CurrentManifest;
     for (const auto &Shard : Cache.Shards)
@@ -1148,7 +1152,22 @@ BackgroundIndex::graphSnapshot(const GraphSnapshotParams &Params) {
       CurrentManifest[Shard.Key] = Shard.Digest;
     PublishedGeneration = Cache.Generation;
     PublishedManifest = std::move(CurrentManifest);
-    ActiveGraphSnapshotPlan = Plan;
+    for (auto I = ActiveGraphSnapshotPlans.begin();
+         I != ActiveGraphSnapshotPlans.end();) {
+      auto Current = I++;
+      if (Current->getValue().Revision != Cache.Revision ||
+          Current->getValue().Generation != Cache.Generation)
+        ActiveGraphSnapshotPlans.erase(Current);
+    }
+    constexpr size_t MaximumActivePlans = 64;
+    while (ActiveGraphSnapshotPlans.size() >= MaximumActivePlans) {
+      auto Oldest = llvm::min_element(
+          ActiveGraphSnapshotPlans, [](const auto &Left, const auto &Right) {
+            return Left.getValue().Sequence < Right.getValue().Sequence;
+          });
+      ActiveGraphSnapshotPlans.erase(Oldest);
+    }
+    ActiveGraphSnapshotPlans[Plan.Token] = Plan;
   };
   auto ValidateCachedSnapshot =
       [&](const GraphSnapshotCache &Cache) -> llvm::Error {
@@ -1156,6 +1175,7 @@ BackgroundIndex::graphSnapshot(const GraphSnapshotParams &Params) {
     for (const auto &Shard : Cache.Shards)
       ActualConfigurations[Shard.MainFile][Shard.CommandDigest] =
           Shard.ToolchainFingerprint;
+    std::vector<std::string> Mismatched;
     for (const auto &Main : ActualConfigurations) {
       if (llvm::Error Err = CheckCancellation())
         return Err;
@@ -1166,19 +1186,23 @@ BackgroundIndex::graphSnapshot(const GraphSnapshotParams &Params) {
       for (const auto &Command : CDB.getCompileCommands(Main.first))
         if (graphCommandIsCOrCXX(Command))
           Expected[graphCommandDigest(Command)] =
-              compileCommandDriverFingerprint(Command);
+              compileCommandToolchainFingerprint(
+                  Command, &RefreshSystemIncludes.driverFingerprints());
       if (Expected.size() != Main.second.size() ||
           llvm::any_of(Expected, [&](const auto &Entry) {
             auto Actual = Main.second.find(Entry.getKey());
             return Actual == Main.second.end() ||
                    Actual->getValue() != Entry.getValue();
           })) {
-        enqueueGraphReindex({Main.first});
-        return contentModified(
-            "graph snapshot is reindexing moved compile commands/toolchain: "
-            "{0}",
-            Main.first);
+        Mismatched.push_back(Main.first);
       }
+    }
+    if (!Mismatched.empty()) {
+      enqueueGraphReindex(Mismatched);
+      return contentModified(
+          "graph snapshot is reindexing {0} translation units with moved "
+          "compile commands/toolchains",
+          Mismatched.size());
     }
     llvm::StringMap<std::string> CheckedSources;
     for (const auto &Shard : Cache.Shards) {
@@ -1225,15 +1249,17 @@ BackgroundIndex::graphSnapshot(const GraphSnapshotParams &Params) {
     std::vector<GraphTU> PageGraphs;
     {
       std::lock_guard<std::mutex> Lock(GraphMu);
-      if (!CachedGraphSnapshot || !ActiveGraphSnapshotPlan ||
+      auto Active = ActiveGraphSnapshotPlans.find(Split.first);
+      if (!CachedGraphSnapshot || Active == ActiveGraphSnapshotPlans.end() ||
           CachedGraphSnapshot->Revision != GraphRevision ||
-          ActiveGraphSnapshotPlan->Token != Split.first)
+          Active->getValue().Revision != CachedGraphSnapshot->Revision ||
+          Active->getValue().Generation != CachedGraphSnapshot->Generation)
         return contentModified("graph snapshot cursor is stale");
       if (GraphDiscoveryPending != 0 || !GraphPending.empty() ||
           !GraphFailures.empty())
         return contentModified("graph snapshot state moved between pages");
       Cache = *CachedGraphSnapshot;
-      Plan = *ActiveGraphSnapshotPlan;
+      Plan = Active->getValue();
       auto Page = CopyPageLocked(Cache, Plan, Offset);
       if (!Page)
         return Page.takeError();
@@ -1354,6 +1380,7 @@ BackgroundIndex::graphSnapshot(const GraphSnapshotParams &Params) {
     ActualConfigurations[Graph.MainFile][Graph.CommandDigest] =
         Graph.ToolchainFingerprint;
   }
+  std::vector<std::string> Mismatched;
   for (const auto &Main : ActualConfigurations) {
     if (llvm::Error Err = CheckCancellation())
       return std::move(Err);
@@ -1364,18 +1391,23 @@ BackgroundIndex::graphSnapshot(const GraphSnapshotParams &Params) {
     for (const auto &Command : CDB.getCompileCommands(Main.first))
       if (graphCommandIsCOrCXX(Command))
         Expected[graphCommandDigest(Command)] =
-            compileCommandDriverFingerprint(Command);
+            compileCommandToolchainFingerprint(
+                Command, &RefreshSystemIncludes.driverFingerprints());
     if (Expected.size() != Main.second.size() ||
         llvm::any_of(Expected, [&](const auto &Entry) {
           auto Actual = Main.second.find(Entry.getKey());
           return Actual == Main.second.end() ||
                  Actual->getValue() != Entry.getValue();
         })) {
-      enqueueGraphReindex({Main.first});
-      return contentModified(
-          "graph snapshot is reindexing moved compile commands/toolchain: {0}",
-          Main.first);
+      Mismatched.push_back(Main.first);
     }
+  }
+  if (!Mismatched.empty()) {
+    enqueueGraphReindex(Mismatched);
+    return contentModified(
+        "graph snapshot is reindexing {0} translation units with moved "
+        "compile commands/toolchains",
+        Mismatched.size());
   }
 
   llvm::StringMap<std::string> CheckedSources;

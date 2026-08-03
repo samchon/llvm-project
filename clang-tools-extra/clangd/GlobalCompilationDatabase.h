@@ -18,6 +18,7 @@
 #include "clang/Tooling/CompilationDatabase.h"
 #include "llvm/ADT/FunctionExtras.h"
 #include "llvm/ADT/StringMap.h"
+#include <cstdint>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -25,6 +26,8 @@
 
 namespace clang {
 namespace clangd {
+
+class CompileCommandDriverFingerprintCache;
 
 struct ProjectInfo {
   // The directory in which the compilation database was discovered.
@@ -208,6 +211,27 @@ using SystemIncludeExtractorFn = llvm::unique_function<void(
     tooling::CompileCommand &, llvm::StringRef) const>;
 SystemIncludeExtractorFn
 getSystemIncludeExtractor(llvm::ArrayRef<std::string> QueryDriverGlobs);
+
+/// Bounds driver hashing and optional query-driver refresh to one CDB
+/// operation. Identical work is deduplicated within the scope. A refresh scope
+/// is used by graph publication to validate arbitrary wrapper-owned toolchain
+/// state rather than trusting a process-lifetime memoized result.
+class SystemIncludeExtractorScope {
+public:
+  explicit SystemIncludeExtractorScope(bool RefreshQueries);
+  ~SystemIncludeExtractorScope();
+  SystemIncludeExtractorScope(const SystemIncludeExtractorScope &) = delete;
+  SystemIncludeExtractorScope &
+  operator=(const SystemIncludeExtractorScope &) = delete;
+
+  CompileCommandDriverFingerprintCache &driverFingerprints();
+
+private:
+  uint64_t Previous = 0;
+  bool PreviousRefresh = false;
+  CompileCommandDriverFingerprintCache *PreviousDriverFingerprints = nullptr;
+  std::unique_ptr<CompileCommandDriverFingerprintCache> DriverFingerprints;
+};
 
 /// Wraps another compilation database, and supports overriding the commands
 /// using an in-memory mapping.

@@ -14,6 +14,7 @@
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/CommandLine.h"
 #include <deque>
+#include <memory>
 #include <optional>
 #include <string>
 #include <vector>
@@ -58,6 +59,36 @@ struct CommandMangler {
 /// and a compiler-owned graph must not reuse the old toolchain universe.
 std::string
 compileCommandDriverFingerprint(const tooling::CompileCommand &Command);
+
+/// Deduplicates exact driver hashing within one bounded operation.
+///
+/// A cache instance is intentionally scoped by its caller (for example, one
+/// graph validation or one TU/configuration batch). The first command for a
+/// resolved driver reads its exact bytes; later commands reuse that result.
+class CompileCommandDriverFingerprintCache {
+public:
+  CompileCommandDriverFingerprintCache();
+  ~CompileCommandDriverFingerprintCache();
+  CompileCommandDriverFingerprintCache(CompileCommandDriverFingerprintCache &&);
+  CompileCommandDriverFingerprintCache &
+  operator=(CompileCommandDriverFingerprintCache &&);
+  CompileCommandDriverFingerprintCache(
+      const CompileCommandDriverFingerprintCache &) = delete;
+  CompileCommandDriverFingerprintCache &
+  operator=(const CompileCommandDriverFingerprintCache &) = delete;
+
+  std::string get(const tooling::CompileCommand &Command);
+
+private:
+  struct Impl;
+  std::unique_ptr<Impl> State;
+};
+
+/// Fingerprints the exact driver together with the effective command that
+/// determines its target and include universe.
+std::string compileCommandToolchainFingerprint(
+    const tooling::CompileCommand &Command,
+    CompileCommandDriverFingerprintCache *DriverCache = nullptr);
 
 // Removes args from a command-line in a semantically-aware way.
 //

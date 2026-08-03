@@ -1043,10 +1043,54 @@ TEST_F(BackgroundIndexTest, ReplacedCompilerDriverStartsANewUniverse) {
   ASSERT_TRUE(Persisted);
   ASSERT_EQ(1u, Persisted->Graphs.size());
   EXPECT_EQ(Persisted->Graphs.front().ToolchainFingerprint,
-            compileCommandDriverFingerprint(Command));
+            compileCommandToolchainFingerprint(Command));
   EXPECT_TRUE(llvm::any_of(
       Persisted->Graphs.front().Symbols,
       [](const GraphSymbol &Symbol) { return Symbol.Name == "toolchain"; }));
+}
+
+TEST_F(BackgroundIndexTest, ValidationReindexesAllMovedTranslationUnits) {
+  MockFS FS;
+  llvm::StringMap<std::string> Storage;
+  size_t CacheHits = 0;
+  MemoryShardStorage MSS(Storage, CacheHits);
+  MultiCommandCDB CDB;
+  std::vector<std::string> Files;
+  for (const char *Name : {"first.cc", "second.cc"}) {
+    std::string File = testPath(Name);
+    FS.Files[File] =
+        (llvm::Twine("int ") + llvm::sys::path::stem(Name) + "();").str();
+    tooling::CompileCommand Command;
+    Command.Directory = testRoot();
+    Command.Filename = File;
+    Command.CommandLine = {"clang++", "-fsyntax-only", File};
+    CDB.Commands[File] = {Command};
+    Files.push_back(std::move(File));
+  }
+  BackgroundIndex Idx(FS, CDB, [&](llvm::StringRef) { return &MSS; }, {});
+  Idx.enqueue(Files);
+  ASSERT_TRUE(Idx.blockUntilIdleForTest());
+  ASSERT_TRUE(bool(Idx.graphSnapshot({})));
+
+  CDB.Commands[Files[0]][0].CommandLine.insert(
+      CDB.Commands[Files[0]][0].CommandLine.begin() + 1, "-DFIRST_MOVED");
+  CDB.Commands[Files[1]][0].CommandLine.insert(
+      CDB.Commands[Files[1]][0].CommandLine.begin() + 1, "-DSECOND_MOVED");
+  expectContentModified(Idx.graphSnapshot({}));
+  ASSERT_TRUE(Idx.blockUntilIdleForTest());
+
+  auto Reindexed = Idx.graphSnapshot({});
+  ASSERT_TRUE(bool(Reindexed)) << llvm::toString(Reindexed.takeError());
+  const auto *Upserts = Reindexed->getAsObject()->getArray("upserts");
+  ASSERT_TRUE(Upserts);
+  ASSERT_EQ(2u, Upserts->size());
+  std::set<std::string> Flags;
+  for (const auto &Upsert : *Upserts)
+    for (const auto &Argument :
+         *Upsert.getAsObject()->getObject("graph")->getArray("commandLine"))
+      if (auto Text = Argument.getAsString(); Text && Text->starts_with("-D"))
+        Flags.insert(Text->str());
+  EXPECT_EQ((std::set<std::string>{"-DFIRST_MOVED", "-DSECOND_MOVED"}), Flags);
 }
 
 TEST_F(BackgroundIndexTest, EquivalentMainFileSpellingsShareOneShard) {
@@ -1289,41 +1333,53 @@ TEST_F(BackgroundIndexTest, GeneratedHeaderCreationRetriesFailedGraph) {
 }
 
 TEST_F(BackgroundIndexTest, GeneratedForcedIncludeRetriesFailedGraph) {
-  MockFS FS;
-  llvm::StringMap<std::string> Storage;
-  size_t CacheHits = 0;
-  MemoryShardStorage MSS(Storage, CacheHits);
-  MultiCommandCDB CDB;
-  const std::string File = testPath("forced.cc");
-  const std::string Header = testPath("generated-force.h");
-  FS.Files[File] = "int use() { return forced(); }";
-  tooling::CompileCommand Command;
-  Command.Filename = File;
-  Command.Directory = testRoot();
-  Command.CommandLine = {"clang++", "-include", "generated-force.h",
-                         "-fsyntax-only", File};
-  CDB.Commands[File] = {Command};
+  struct Case {
+    const char *Name;
+    std::vector<std::string> Prefix;
+  } Cases[] = {
+      {"gnu-include",
+       {"clang++", "-includegenerated-force.h", "-isystemgenerated"}},
+      {"gnu-imacros",
+       {"clang++", "-imacrosgenerated-force.h", "-iquotegenerated"}},
+      {"cl-external",
+       {"clang-cl", "--driver-mode=cl", "/FIgenerated-force.h",
+        "/external:Igenerated"}},
+      {"cl-imsvc",
+       {"clang-cl", "--driver-mode=cl", "/FIgenerated-force.h",
+        "/imsvcgenerated"}},
+  };
+  for (const auto &Test : Cases) {
+    SCOPED_TRACE(Test.Name);
+    MockFS FS;
+    llvm::StringMap<std::string> Storage;
+    size_t CacheHits = 0;
+    MemoryShardStorage MSS(Storage, CacheHits);
+    MultiCommandCDB CDB;
+    const std::string File = testPath((llvm::Twine(Test.Name) + ".cc").str());
+    const std::string Header = testPath("generated/generated-force.h");
+    FS.Files[File] = "int use() { return FORCED_VALUE; }";
+    tooling::CompileCommand Command;
+    Command.Filename = File;
+    Command.Directory = testRoot();
+    Command.CommandLine = Test.Prefix;
+    Command.CommandLine.push_back("-fsyntax-only");
+    Command.CommandLine.push_back(File);
+    CDB.Commands[File] = {Command};
 
-  BackgroundIndex Idx(FS, CDB, [&](llvm::StringRef) { return &MSS; }, {});
-  Idx.enqueue({File});
-  ASSERT_TRUE(Idx.blockUntilIdleForTest());
-  auto Failed = Idx.graphSnapshot({});
-  ASSERT_FALSE(Failed);
-  llvm::consumeError(Failed.takeError());
+    BackgroundIndex Idx(FS, CDB, [&](llvm::StringRef) { return &MSS; }, {});
+    Idx.enqueue({File});
+    ASSERT_TRUE(Idx.blockUntilIdleForTest());
+    auto Failed = Idx.graphSnapshot({});
+    ASSERT_FALSE(Failed);
+    llvm::consumeError(Failed.takeError());
 
-  FS.Files[Header] = "inline int forced() { return 7; }";
-  expectContentModified(Idx.graphSnapshot({}));
-  ASSERT_TRUE(Idx.blockUntilIdleForTest());
-  auto Recovered = Idx.graphSnapshot({});
-  ASSERT_TRUE(bool(Recovered)) << llvm::toString(Recovered.takeError());
-  const auto *Graph = (*Recovered->getAsObject()->getArray("upserts"))[0]
-                          .getAsObject()
-                          ->getObject("graph");
-  ASSERT_TRUE(Graph);
-  EXPECT_TRUE(llvm::any_of(*Graph->getArray("symbols"), [](const auto &Value) {
-    const auto *Symbol = Value.getAsObject();
-    return Symbol && Symbol->getString("name") == "forced";
-  }));
+    FS.Files[Header] = "#define FORCED_VALUE 7";
+    expectContentModified(Idx.graphSnapshot({}));
+    ASSERT_TRUE(Idx.blockUntilIdleForTest());
+    auto Recovered = Idx.graphSnapshot({});
+    ASSERT_TRUE(bool(Recovered)) << llvm::toString(Recovered.takeError());
+    EXPECT_EQ(1u, Recovered->getAsObject()->getArray("upserts")->size());
+  }
 }
 
 TEST_F(BackgroundIndexTest, PersistedGraphRequiresCurrentProducerFingerprint) {
@@ -1413,7 +1469,22 @@ TEST_F(BackgroundIndexTest, GraphSnapshotPagesShardsAndMeasuresWork) {
   ASSERT_EQ(3, *FirstPage->getInteger("total"));
   auto Cursor = FirstPage->getString("nextCursor");
   ASSERT_TRUE(Cursor);
-  size_t Seen = 1;
+  const std::string FirstCursor = Cursor->str();
+  auto Overlapping = Idx.graphSnapshot(Params);
+  ASSERT_TRUE(bool(Overlapping)) << llvm::toString(Overlapping.takeError());
+  const auto OverlappingCursor =
+      Overlapping->getAsObject()->getObject("page")->getString("nextCursor");
+  ASSERT_TRUE(OverlappingCursor);
+  EXPECT_NE(*OverlappingCursor, FirstCursor);
+  // Starting another paginated request must not invalidate the first plan.
+  Params.Cursor = FirstCursor;
+  auto FirstContinuation = Idx.graphSnapshot(Params);
+  ASSERT_TRUE(bool(FirstContinuation))
+      << llvm::toString(FirstContinuation.takeError());
+  EXPECT_EQ(FirstContinuation->getAsObject()->getInteger("sequence"), Sequence);
+  Cursor = FirstContinuation->getAsObject()->getObject("page")->getString(
+      "nextCursor");
+  size_t Seen = 2;
   while (Cursor) {
     Params.Cursor = Cursor->str();
     auto Next = Idx.graphSnapshot(Params);

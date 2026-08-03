@@ -148,6 +148,10 @@ TEST(CompileCommandDriverFingerprint, ToolchainUsesDriverOptionSemantics) {
   CompileCommandDriverFingerprintCache Cache;
   EXPECT_EQ(compileCommandToolchainFingerprint(First, &Cache),
             compileCommandToolchainFingerprint(Second, &Cache));
+  Second.Directory = testPath("other-root");
+  EXPECT_NE(compileCommandToolchainFingerprint(First, &Cache),
+            compileCommandToolchainFingerprint(Second, &Cache));
+  Second.Directory = First.Directory;
   Second.CommandLine[2] = testPath("other-after");
   EXPECT_NE(compileCommandToolchainFingerprint(First, &Cache),
             compileCommandToolchainFingerprint(Second, &Cache));

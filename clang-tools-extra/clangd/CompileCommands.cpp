@@ -326,7 +326,7 @@ std::string compileCommandToolchainFingerprint(
       continue;
     Add(Option.getUnaliasedOption().getName());
     for (llvm::StringRef Value : Arg->getValues()) {
-      if (IsPath && !Value.starts_with("="))
+      if (IsPath)
         AddPath(Value);
       else
         Add(Value);

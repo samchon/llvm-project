@@ -282,18 +282,39 @@ static bool Execute(ProcessInfo &PI, StringRef Program,
   }
 #endif // HAVE_POSIX_SPAWN
 
+  int OwnershipPipe[2] = {-1, -1};
+  if (OwnProcessTree && ::pipe(OwnershipPipe) == -1) {
+    MakeErrMsg(ErrMsg, "Couldn't create process ownership pipe");
+    return false;
+  }
+
   // Create a child process.
   int child = fork();
   switch (child) {
   // An error occurred:  Return to the caller.
   case -1:
+    if (OwnProcessTree) {
+      close(OwnershipPipe[0]);
+      close(OwnershipPipe[1]);
+    }
     MakeErrMsg(ErrMsg, "Couldn't fork");
     return false;
 
   // Child process: Execute the program.
   case 0: {
-    if (OwnProcessTree && !DetachProcess && ::setpgid(0, 0) == -1)
-      _exit(126);
+    if (OwnProcessTree) {
+      close(OwnershipPipe[0]);
+      const bool Owned =
+          DetachProcess ? ::setsid() != -1 : ::setpgid(0, 0) != -1;
+      const char Ready = 1;
+      ssize_t Written;
+      do {
+        Written = Owned ? ::write(OwnershipPipe[1], &Ready, sizeof(Ready)) : -1;
+      } while (Written == -1 && Owned && errno == EINTR);
+      close(OwnershipPipe[1]);
+      if (Written != 1)
+        _exit(126);
+    }
     // Redirect file descriptors...
     if (!Redirects.empty()) {
       // Redirect stdin
@@ -319,7 +340,7 @@ static bool Execute(ProcessInfo &PI, StringRef Program,
       }
     }
 
-    if (DetachProcess) {
+    if (DetachProcess && !OwnProcessTree) {
       // Detach from controlling terminal
       if (::setsid() == -1) {
         MakeErrMsg(ErrMsg, "Could not detach process, ::setsid failed");
@@ -351,6 +372,26 @@ static bool Execute(ProcessInfo &PI, StringRef Program,
   // Parent process: Break out of the switch to do our processing.
   default:
     break;
+  }
+
+  if (OwnProcessTree) {
+    close(OwnershipPipe[1]);
+    char Ready = 0;
+    ssize_t Read;
+    do {
+      Read = ::read(OwnershipPipe[0], &Ready, sizeof(Ready));
+    } while (Read == -1 && errno == EINTR);
+    const int ReadError = errno;
+    close(OwnershipPipe[0]);
+    if (Read != 1 || Ready != 1) {
+      kill(child, SIGKILL);
+      int Status;
+      while (::waitpid(child, &Status, 0) == -1 && errno == EINTR) {
+      }
+      MakeErrMsg(ErrMsg, "Child failed to establish process ownership",
+                 Read == -1 ? ReadError : EINVAL);
+      return false;
+    }
   }
 
   PI.Pid = child;
@@ -453,6 +494,13 @@ ProcessInfo llvm::sys::Wait(const ProcessInfo &PI,
       // Non-blocking wait.
       return WaitResult;
     } else {
+      if (errno == EINTR && Polling) {
+        if (SecondsToWait && *SecondsToWait > 0) {
+          alarm(0);
+          sigaction(SIGALRM, &Old, nullptr);
+        }
+        return WaitResult;
+      }
       if (SecondsToWait && errno == EINTR && !Polling) {
         // Kill the child.
         kill(PI.ProcessGroup ? -PI.ProcessGroup : PI.Pid, SIGKILL);

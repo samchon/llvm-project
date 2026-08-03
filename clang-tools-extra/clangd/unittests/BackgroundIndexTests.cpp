@@ -1022,6 +1022,13 @@ TEST_F(BackgroundIndexTest, QueryDriverCachesOnlyCompleteSuccess) {
   EXPECT_EQ(4u, runSystemIncludeExtractorCacheForTest({1, 2, 3, 0, 1}));
 }
 
+TEST_F(BackgroundIndexTest, QueryDriverScopeDeduplicatesEveryStatus) {
+  for (unsigned Status : {1u, 2u, 3u})
+    EXPECT_EQ(1u,
+              runSystemIncludeExtractorCacheForTest({Status, 0},
+                                                    /*OperationLocal=*/true));
+}
+
 TEST_F(BackgroundIndexTest, QueryDriverTerminationOwnsDescendants) {
   ScopedEnvironmentUnset TotalShards("GTEST_TOTAL_SHARDS");
   ScopedEnvironmentUnset ShardIndex("GTEST_SHARD_INDEX");

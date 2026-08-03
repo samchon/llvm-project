@@ -303,6 +303,23 @@ private:
   llvm::DenseMap<DriverArgs, DriverInfo> Queries;
 };
 
+class ScopedDriverQueryCache {
+public:
+  const DriverQueryResult<DriverInfo> *get(const DriverArgs &Args) const {
+    auto Existing = Queries.find(Args);
+    return Existing == Queries.end() ? nullptr : &Existing->second;
+  }
+
+  void publish(const DriverArgs &Args, DriverQueryResult<DriverInfo> Result) {
+    Queries.try_emplace(Args, std::move(Result));
+  }
+
+  void clear() { Queries.clear(); }
+
+private:
+  llvm::DenseMap<DriverArgs, DriverQueryResult<DriverInfo>> Queries;
+};
+
 bool isValidTarget(llvm::StringRef Triple) {
   std::shared_ptr<TargetOptions> TargetOpts(new TargetOptions);
   TargetOpts->Triple = Triple.str();
@@ -619,7 +636,7 @@ public:
 
     struct ThreadCache {
       uint64_t Scope = 0;
-      llvm::DenseMap<DriverArgs, DriverInfo> Queries;
+      ScopedDriverQueryCache Queries;
     };
     thread_local std::map<const State *, ThreadCache> ScopedCaches;
     ThreadCache *Scoped = nullptr;
@@ -645,17 +662,13 @@ public:
       Shared->DriverFingerprints.update(Cmd, Args.DriverFingerprint);
     std::optional<DriverInfo> Info;
     if (Scoped && RefreshQueriesInActiveScope) {
-      auto Existing = Scoped->Queries.find(Args);
-      if (Existing != Scoped->Queries.end()) {
-        Info = Existing->second;
+      if (const auto *Existing = Scoped->Queries.get(Args)) {
+        Info = Existing->Value;
       } else {
         auto Queried = extractSystemIncludesAndTarget(Args);
-        if (Queried.Status == DriverQueryStatus::Success) {
-          Info = Queried.Value;
-          Scoped->Queries.try_emplace(Args, *Info);
-          Info = Shared->Queries.publish(Args, std::move(Queried),
-                                         /*Replace=*/true);
-        }
+        if (Queried.Status == DriverQueryStatus::Success)
+          Info = Shared->Queries.publish(Args, Queried, /*Replace=*/true);
+        Scoped->Queries.publish(Args, std::move(Queried));
       }
     } else {
       Info = Shared->Queries.get(Args);
@@ -687,23 +700,29 @@ runSystemIncludeExtractorForTest(llvm::ArrayRef<llvm::StringRef> Argv,
 }
 
 unsigned
-runSystemIncludeExtractorCacheForTest(llvm::ArrayRef<unsigned> QueryStatuses) {
+runSystemIncludeExtractorCacheForTest(llvm::ArrayRef<unsigned> QueryStatuses,
+                                      bool OperationLocal) {
   SuccessfulDriverQueryCache Cache;
+  ScopedDriverQueryCache ScopedCache;
   DriverArgs Args = DriverArgs::getEmpty();
   Args.Driver = "test-driver";
   Args.Lang = "c++";
   unsigned Queries = 0;
   for (unsigned RawStatus : QueryStatuses) {
-    if (Cache.get(Args))
+    if (OperationLocal ? ScopedCache.get(Args) != nullptr
+                       : Cache.get(Args).has_value())
       continue;
     ++Queries;
     assert(RawStatus <= unsigned(DriverQueryStatus::TimedOut));
     const auto Status = static_cast<DriverQueryStatus>(RawStatus);
-    Cache.publish(Args,
-                  {Status, Status == DriverQueryStatus::Success
-                               ? std::optional(DriverInfo{})
-                               : std::nullopt},
-                  /*Replace=*/false);
+    DriverQueryResult<DriverInfo> Result{Status,
+                                         Status == DriverQueryStatus::Success
+                                             ? std::optional(DriverInfo{})
+                                             : std::nullopt};
+    if (OperationLocal)
+      ScopedCache.publish(Args, std::move(Result));
+    else
+      Cache.publish(Args, std::move(Result), /*Replace=*/false);
   }
   return Queries;
 }

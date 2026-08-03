@@ -343,10 +343,13 @@ static bool Execute(ProcessInfo &PI, StringRef Program,
       }
     }
     if (!success) {
-      SetLastError(GetLastError());
-      MakeErrMsg(ErrMsg, std::string("Unable to set memory limit"));
+      const DWORD JobError = GetLastError();
       TerminateProcess(pi.hProcess, 1);
       WaitForSingleObject(pi.hProcess, INFINITE);
+      CloseHandle(pi.hProcess);
+      PI = ProcessInfo();
+      SetLastError(JobError);
+      MakeErrMsg(ErrMsg, std::string("Unable to configure process job"));
       return false;
     }
     if (OwnProcessTree)

@@ -32,7 +32,8 @@
 
 namespace llvm {
 
-ProcessInfo::ProcessInfo() : Pid(0), Process(0), ReturnCode(0) {}
+ProcessInfo::ProcessInfo()
+    : Pid(0), Process(0), ProcessGroup(0), ReturnCode(0) {}
 
 ErrorOr<std::string> sys::findProgramByName(StringRef Name,
                                             ArrayRef<StringRef> Paths) {
@@ -175,7 +176,8 @@ static bool Execute(ProcessInfo &PI, StringRef Program,
                     std::optional<ArrayRef<StringRef>> Env,
                     ArrayRef<std::optional<StringRef>> Redirects,
                     unsigned MemoryLimit, std::string *ErrMsg,
-                    BitVector *AffinityMask, bool DetachProcess) {
+                    BitVector *AffinityMask, bool DetachProcess,
+                    bool OwnProcessTree) {
   if (!sys::fs::can_execute(Program)) {
     if (ErrMsg)
       *ErrMsg = "program not executable";
@@ -285,7 +287,7 @@ static bool Execute(ProcessInfo &PI, StringRef Program,
   }
 
   unsigned CreateFlags = CREATE_UNICODE_ENVIRONMENT;
-  if (AffinityMask)
+  if (AffinityMask || OwnProcessTree)
     CreateFlags |= CREATE_SUSPENDED;
   if (DetachProcess)
     CreateFlags |= DETACHED_PROCESS;
@@ -317,16 +319,23 @@ static bool Execute(ProcessInfo &PI, StringRef Program,
   // Make sure these get closed no matter what.
   ScopedCommonHandle hThread(pi.hThread);
 
-  // Assign the process to a job if a memory limit is defined.
+  // Assign the process to a job before it can spawn descendants when either a
+  // memory limit or an owned process tree is requested.
   ScopedJobHandle hJob;
-  if (MemoryLimit != 0) {
+  if (MemoryLimit != 0 || OwnProcessTree) {
     hJob = CreateJobObjectW(0, 0);
     bool success = false;
     if (hJob) {
       JOBOBJECT_EXTENDED_LIMIT_INFORMATION jeli;
       memset(&jeli, 0, sizeof(jeli));
-      jeli.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_PROCESS_MEMORY;
-      jeli.ProcessMemoryLimit = uintptr_t(MemoryLimit) * 1048576;
+      if (MemoryLimit != 0) {
+        jeli.BasicLimitInformation.LimitFlags |=
+            JOB_OBJECT_LIMIT_PROCESS_MEMORY;
+        jeli.ProcessMemoryLimit = uintptr_t(MemoryLimit) * 1048576;
+      }
+      if (OwnProcessTree)
+        jeli.BasicLimitInformation.LimitFlags |=
+            JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
       if (SetInformationJobObject(hJob, JobObjectExtendedLimitInformation,
                                   &jeli, sizeof(jeli))) {
         if (AssignProcessToJobObject(hJob, pi.hProcess))
@@ -334,20 +343,26 @@ static bool Execute(ProcessInfo &PI, StringRef Program,
       }
     }
     if (!success) {
-      SetLastError(GetLastError());
-      MakeErrMsg(ErrMsg, std::string("Unable to set memory limit"));
+      const DWORD JobError = GetLastError();
       TerminateProcess(pi.hProcess, 1);
       WaitForSingleObject(pi.hProcess, INFINITE);
+      CloseHandle(pi.hProcess);
+      PI = ProcessInfo();
+      SetLastError(JobError);
+      MakeErrMsg(ErrMsg, std::string("Unable to configure process job"));
       return false;
     }
+    if (OwnProcessTree)
+      PI.ProcessGroup = hJob.take();
   }
 
   // Set the affinity mask
   if (AffinityMask) {
     ::SetProcessAffinityMask(pi.hProcess,
                              (DWORD_PTR)AffinityMask->getData().front());
-    ::ResumeThread(pi.hThread);
   }
+  if (AffinityMask || OwnProcessTree)
+    ::ResumeThread(pi.hThread);
 
   return true;
 }
@@ -426,20 +441,26 @@ ProcessInfo sys::Wait(const ProcessInfo &PI,
   ProcessInfo WaitResult = PI;
   if (ProcStat)
     ProcStat->reset();
+  bool TimedOut = false;
   DWORD WaitStatus = WaitForSingleObject(PI.Process, milliSecondsToWait);
   if (WaitStatus == WAIT_TIMEOUT) {
     if (!Polling && *SecondsToWait > 0) {
-      if (!TerminateProcess(PI.Process, 1)) {
+      const bool Terminated = PI.ProcessGroup
+                                  ? TerminateJobObject(PI.ProcessGroup, 1)
+                                  : TerminateProcess(PI.Process, 1);
+      if (!Terminated) {
         if (ErrMsg)
           MakeErrMsg(ErrMsg, "Failed to terminate timed-out program");
 
         // -2 indicates a crash or timeout as opposed to failure to execute.
         WaitResult.ReturnCode = -2;
         CloseHandle(PI.Process);
+        if (PI.ProcessGroup)
+          CloseHandle(PI.ProcessGroup);
         return WaitResult;
       }
       WaitForSingleObject(PI.Process, INFINITE);
-      CloseHandle(PI.Process);
+      TimedOut = true;
     } else {
       // Non-blocking wait.
       return ProcessInfo();
@@ -465,9 +486,10 @@ ProcessInfo sys::Wait(const ProcessInfo &PI,
   // Get its exit status.
   DWORD status;
   BOOL rc = GetExitCodeProcess(PI.Process, &status);
-  DWORD err = GetLastError();
-  if (err != ERROR_INVALID_HANDLE)
-    CloseHandle(PI.Process);
+  DWORD err = rc ? ERROR_SUCCESS : GetLastError();
+  CloseHandle(PI.Process);
+  if (PI.ProcessGroup)
+    CloseHandle(PI.ProcessGroup);
 
   if (!rc) {
     SetLastError(err);
@@ -475,6 +497,11 @@ ProcessInfo sys::Wait(const ProcessInfo &PI,
       MakeErrMsg(ErrMsg, "Failed getting status for program");
 
     // -2 indicates a crash or timeout as opposed to failure to execute.
+    WaitResult.ReturnCode = -2;
+    return WaitResult;
+  }
+
+  if (TimedOut) {
     WaitResult.ReturnCode = -2;
     return WaitResult;
   }
@@ -491,6 +518,17 @@ ProcessInfo sys::Wait(const ProcessInfo &PI,
     WaitResult.ReturnCode = 1;
 
   return WaitResult;
+}
+
+ProcessInfo sys::TerminateProcessTree(const ProcessInfo &PI,
+                                      std::string *ErrMsg) {
+  assert(PI.Pid && "invalid pid to terminate, process not started?");
+  const bool Terminated = PI.ProcessGroup
+                              ? TerminateJobObject(PI.ProcessGroup, 1)
+                              : TerminateProcess(PI.Process, 1);
+  if (!Terminated && GetLastError() != ERROR_ACCESS_DENIED && ErrMsg)
+    MakeErrMsg(ErrMsg, "Failed to terminate process tree");
+  return Wait(PI, std::nullopt, ErrMsg);
 }
 
 std::error_code llvm::sys::ChangeStdinMode(sys::fs::OpenFlags Flags) {

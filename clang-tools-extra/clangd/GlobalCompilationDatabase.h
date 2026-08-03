@@ -16,8 +16,11 @@
 #include "support/ThreadsafeFS.h"
 #include "clang/Tooling/ArgumentsAdjusters.h"
 #include "clang/Tooling/CompilationDatabase.h"
+#include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/FunctionExtras.h"
 #include "llvm/ADT/StringMap.h"
+#include <chrono>
+#include <cstdint>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -25,6 +28,8 @@
 
 namespace clang {
 namespace clangd {
+
+class CompileCommandDriverFingerprintCache;
 
 struct ProjectInfo {
   // The directory in which the compilation database was discovered.
@@ -43,6 +48,13 @@ public:
   /// If there are any known-good commands for building this file, returns one.
   virtual std::optional<tooling::CompileCommand>
   getCompileCommand(PathRef File) const = 0;
+
+  /// Returns every known-good command for this file. Most clangd clients need
+  /// one representative command and continue to call getCompileCommand().
+  /// Bulk graph indexing uses all commands so a TU/header can retain distinct
+  /// language, target, and preprocessor views.
+  virtual std::vector<tooling::CompileCommand>
+  getCompileCommands(PathRef File) const;
 
   /// Finds the closest project to \p File.
   virtual std::optional<ProjectInfo> getProjectInfo(PathRef File) const {
@@ -88,6 +100,9 @@ public:
 
   std::optional<tooling::CompileCommand>
   getCompileCommand(PathRef File) const override;
+
+  std::vector<tooling::CompileCommand>
+  getCompileCommands(PathRef File) const override;
 
   std::optional<ProjectInfo> getProjectInfo(PathRef File) const override;
 
@@ -141,6 +156,9 @@ public:
   /// Might trigger OnCommandChanged, if CDB wasn't broadcasted yet.
   std::optional<tooling::CompileCommand>
   getCompileCommand(PathRef File) const override;
+
+  std::vector<tooling::CompileCommand>
+  getCompileCommands(PathRef File) const override;
 
   /// Returns the path to first directory containing a compilation database in
   /// \p File's parents.
@@ -196,6 +214,43 @@ using SystemIncludeExtractorFn = llvm::unique_function<void(
 SystemIncludeExtractorFn
 getSystemIncludeExtractor(llvm::ArrayRef<std::string> QueryDriverGlobs);
 
+/// Exercises the bounded, cancellable query-driver process runner.
+std::optional<std::string>
+runSystemIncludeExtractorForTest(llvm::ArrayRef<llvm::StringRef> Argv,
+                                 bool OutputIsStderr,
+                                 std::chrono::milliseconds Timeout);
+
+/// Exercises shared-cache publication for success (0), execution failure (1),
+/// cancellation (2), and timeout (3) query outcomes.
+unsigned
+runSystemIncludeExtractorCacheForTest(llvm::ArrayRef<unsigned> QueryStatuses,
+                                      bool OperationLocal = false,
+                                      bool RefreshQueries = false);
+
+/// Bounds driver hashing and optional query-driver refresh to one CDB
+/// operation. Identical work is deduplicated within the scope. A refresh scope
+/// is used by graph publication to validate arbitrary wrapper-owned toolchain
+/// state rather than trusting a process-lifetime memoized result.
+class SystemIncludeExtractorScope {
+public:
+  explicit SystemIncludeExtractorScope(
+      bool RefreshQueries,
+      std::shared_ptr<CompileCommandDriverFingerprintCache> DriverFingerprints =
+          nullptr);
+  ~SystemIncludeExtractorScope();
+  SystemIncludeExtractorScope(const SystemIncludeExtractorScope &) = delete;
+  SystemIncludeExtractorScope &
+  operator=(const SystemIncludeExtractorScope &) = delete;
+
+  CompileCommandDriverFingerprintCache &driverFingerprints();
+
+private:
+  uint64_t Previous = 0;
+  bool PreviousRefresh = false;
+  CompileCommandDriverFingerprintCache *PreviousDriverFingerprints = nullptr;
+  std::shared_ptr<CompileCommandDriverFingerprintCache> DriverFingerprints;
+};
+
 /// Wraps another compilation database, and supports overriding the commands
 /// using an in-memory mapping.
 class OverlayCDB : public DelegatingCDB {
@@ -216,6 +271,8 @@ public:
 
   std::optional<tooling::CompileCommand>
   getCompileCommand(PathRef File) const override;
+  std::vector<tooling::CompileCommand>
+  getCompileCommands(PathRef File) const override;
   tooling::CompileCommand getFallbackCommand(PathRef File) const override;
 
   /// Sets or clears the compilation command for a particular file.

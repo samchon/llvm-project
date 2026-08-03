@@ -62,8 +62,8 @@ namespace clangd {
 namespace {
 
 // Tracks number of times a tweak has been offered.
-static constexpr trace::Metric TweakAvailable(
-    "tweak_available", trace::Metric::Counter, "tweak_id");
+static constexpr trace::Metric
+    TweakAvailable("tweak_available", trace::Metric::Counter, "tweak_id");
 
 // Update the FileIndex with new ASTs and plumb the diagnostics responses.
 struct UpdateIndexCallbacks : public ParsingCallbacks {
@@ -938,8 +938,25 @@ void ClangdServer::outgoingCalls(
 }
 
 void ClangdServer::onFileEvent(const DidChangeWatchedFilesParams &Params) {
-  // FIXME: Do nothing for now. This will be used for indexing and potentially
-  // invalidating other caches.
+  if (!BackgroundIdx)
+    return;
+  std::vector<std::string> ChangedFiles;
+  ChangedFiles.reserve(Params.changes.size());
+  for (const auto &Change : Params.changes)
+    ChangedFiles.push_back(Change.uri.file().str());
+  BackgroundIdx->enqueueGraphDependents(ChangedFiles);
+}
+
+void ClangdServer::graphSnapshot(const GraphSnapshotParams &Params,
+                                 Callback<llvm::json::Value> CB) {
+  if (!BackgroundIdx)
+    return CB(error("samchon/graphSnapshot requires background indexing"));
+  WorkScheduler->run("GraphSnapshot", /*Path=*/"",
+                     [Params, CB = std::move(CB), this]() mutable {
+                       if (auto Reason = isCancelled())
+                         return CB(llvm::make_error<CancelledError>(Reason));
+                       CB(BackgroundIdx->graphSnapshot(Params));
+                     });
 }
 
 void ClangdServer::workspaceSymbols(

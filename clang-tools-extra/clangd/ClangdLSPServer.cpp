@@ -783,6 +783,11 @@ void ClangdLSPServer::onFileEvent(const DidChangeWatchedFilesParams &Params) {
   //  - .clangd and clangd/config.yaml
 }
 
+void ClangdLSPServer::onGraphSnapshot(const GraphSnapshotParams &Params,
+                                      Callback<llvm::json::Value> Reply) {
+  Server->graphSnapshot(Params, std::move(Reply));
+}
+
 void ClangdLSPServer::onCommand(const ExecuteCommandParams &Params,
                                 Callback<llvm::json::Value> Reply) {
   auto It = Handlers.CommandHandlers.find(Params.command);
@@ -1681,6 +1686,8 @@ void ClangdLSPServer::bindMethods(LSPBinder &Bind,
   Bind.notification("initialized", this, &ClangdLSPServer::onInitialized);
   Bind.method("shutdown", this, &ClangdLSPServer::onShutdown);
   Bind.method("sync", this, &ClangdLSPServer::onSync);
+  Bind.method("samchon/graphSnapshot", this,
+              &ClangdLSPServer::onGraphSnapshot);
   Bind.method("textDocument/rangeFormatting", this, &ClangdLSPServer::onDocumentRangeFormatting);
   Bind.method("textDocument/rangesFormatting", this, &ClangdLSPServer::onDocumentRangesFormatting);
   Bind.method("textDocument/onTypeFormatting", this, &ClangdLSPServer::onDocumentOnTypeFormatting);

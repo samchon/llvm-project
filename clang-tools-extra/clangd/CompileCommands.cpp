@@ -18,6 +18,7 @@
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/StringExtras.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Option/ArgList.h"
 #include "llvm/Option/Option.h"
@@ -28,7 +29,9 @@
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/Path.h"
 #include "llvm/Support/Program.h"
+#include "llvm/Support/SHA256.h"
 #include <iterator>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <vector>
@@ -184,6 +187,161 @@ static std::string resolveDriver(llvm::StringRef Driver, bool FollowSymlink,
 }
 
 } // namespace
+
+static std::string
+resolvedCompileCommandDriver(const tooling::CompileCommand &Command) {
+  llvm::SmallString<256> Driver(
+      Command.CommandLine.empty() ? llvm::StringRef() : Command.CommandLine[0]);
+  if (!Driver.empty() && !llvm::sys::path::is_absolute(Driver)) {
+    if (llvm::any_of(Driver,
+                     [](char C) { return llvm::sys::path::is_separator(C); })) {
+      llvm::SmallString<256> Absolute(Command.Directory);
+      llvm::sys::path::append(Absolute, Driver);
+      Driver = Absolute;
+    } else if (auto Found = llvm::sys::findProgramByName(Driver)) {
+      Driver = *Found;
+    }
+  }
+  llvm::sys::path::remove_dots(Driver, /*remove_dot_dot=*/true);
+  llvm::SmallString<256> RealDriver;
+  if (!Driver.empty() && !llvm::sys::fs::real_path(Driver, RealDriver))
+    Driver = RealDriver;
+  llvm::sys::path::convert_to_slash(Driver);
+  return Driver.str().str();
+}
+
+static std::string driverFingerprint(llvm::StringRef Driver) {
+
+  llvm::SHA256 Hash;
+  Hash.update(llvm::arrayRefFromStringRef(Driver));
+  static constexpr char Separator = '\0';
+  Hash.update(llvm::StringRef(&Separator, 1));
+  auto Contents = llvm::MemoryBuffer::getFile(Driver);
+  if (Contents) {
+    Hash.update(llvm::arrayRefFromStringRef((*Contents)->getBuffer()));
+  } else {
+    const std::string ErrorCode = std::to_string(Contents.getError().value());
+    Hash.update(llvm::arrayRefFromStringRef(ErrorCode));
+  }
+  return llvm::toHex(Hash.final(), /*LowerCase=*/true);
+}
+
+std::string
+compileCommandDriverFingerprint(const tooling::CompileCommand &Command) {
+  return driverFingerprint(resolvedCompileCommandDriver(Command));
+}
+
+struct CompileCommandDriverFingerprintCache::Impl {
+  std::mutex Mu;
+  llvm::StringMap<std::string> Fingerprints;
+};
+
+CompileCommandDriverFingerprintCache::CompileCommandDriverFingerprintCache()
+    : State(std::make_unique<Impl>()) {}
+CompileCommandDriverFingerprintCache::~CompileCommandDriverFingerprintCache() =
+    default;
+CompileCommandDriverFingerprintCache::CompileCommandDriverFingerprintCache(
+    CompileCommandDriverFingerprintCache &&) = default;
+CompileCommandDriverFingerprintCache &
+CompileCommandDriverFingerprintCache::operator=(
+    CompileCommandDriverFingerprintCache &&) = default;
+
+std::string CompileCommandDriverFingerprintCache::get(
+    const tooling::CompileCommand &Command) {
+  const std::string Driver = resolvedCompileCommandDriver(Command);
+  std::lock_guard<std::mutex> Lock(State->Mu);
+  auto Existing = State->Fingerprints.find(Driver);
+  if (Existing != State->Fingerprints.end())
+    return Existing->getValue();
+  return State->Fingerprints.try_emplace(Driver, driverFingerprint(Driver))
+      .first->getValue();
+}
+
+void CompileCommandDriverFingerprintCache::update(
+    const tooling::CompileCommand &Command, llvm::StringRef Fingerprint) {
+  const std::string Driver = resolvedCompileCommandDriver(Command);
+  std::lock_guard<std::mutex> Lock(State->Mu);
+  State->Fingerprints[Driver] = Fingerprint.str();
+}
+
+std::string compileCommandToolchainFingerprint(
+    const tooling::CompileCommand &Command,
+    CompileCommandDriverFingerprintCache *DriverCache) {
+  const std::string Driver = DriverCache
+                                 ? DriverCache->get(Command)
+                                 : compileCommandDriverFingerprint(Command);
+  llvm::SHA256 Hash;
+  auto Add = [&](llvm::StringRef Value) {
+    Hash.update(llvm::arrayRefFromStringRef(Value));
+    static constexpr char Separator = '\0';
+    Hash.update(llvm::StringRef(&Separator, 1));
+  };
+  Add(Driver);
+  auto AddPath = [&](llvm::StringRef Value) {
+    llvm::SmallString<256> Absolute(Value);
+    if (!llvm::sys::path::is_absolute(Absolute))
+      llvm::sys::path::make_absolute(Command.Directory, Absolute);
+    llvm::sys::path::remove_dots(Absolute, /*remove_dot_dot=*/true);
+    llvm::sys::path::convert_to_slash(Absolute);
+    Add(Absolute);
+  };
+  llvm::SmallVector<const char *, 16> OriginalArgs;
+  OriginalArgs.reserve(Command.CommandLine.size());
+  for (const std::string &Argument : Command.CommandLine)
+    OriginalArgs.push_back(Argument.c_str());
+  if (OriginalArgs.empty())
+    return llvm::toHex(Hash.final(), /*LowerCase=*/true);
+  const bool IsCLMode = driver::IsClangCL(driver::getDriverMode(
+      OriginalArgs.front(), llvm::ArrayRef(OriginalArgs).drop_front()));
+  unsigned MissingArgIndex = 0;
+  unsigned MissingArgCount = 0;
+  auto Args = getDriverOptTable().ParseArgs(
+      llvm::ArrayRef(OriginalArgs).drop_front(), MissingArgIndex,
+      MissingArgCount,
+      llvm::opt::Visibility(IsCLMode ? options::CLOption
+                                     : options::ClangOption));
+  const llvm::opt::Arg *Sysroot =
+      Args.getLastArg(options::OPT__sysroot_EQ, options::OPT_isysroot);
+  for (const llvm::opt::Arg *Arg : Args) {
+    const llvm::opt::Option Option = Arg->getOption();
+    const bool IsPath = Option.matches(options::OPT_isystem) ||
+                        Option.matches(options::OPT_isystem_after) ||
+                        Option.matches(options::OPT_internal_isystem) ||
+                        Option.matches(options::OPT_internal_externc_isystem) ||
+                        Option.matches(options::OPT_isysroot) ||
+                        Option.matches(options::OPT__sysroot_EQ) ||
+                        Option.matches(options::OPT_resource_dir) ||
+                        Option.matches(options::OPT_resource_dir_EQ) ||
+                        Option.matches(options::OPT_gcc_toolchain) ||
+                        Option.matches(options::OPT_iframework) ||
+                        Option.matches(options::OPT_iframeworkwithsysroot) ||
+                        Option.matches(options::OPT_iwithsysroot) ||
+                        Option.matches(options::OPT_stdlibxx_isystem) ||
+                        Option.matches(options::OPT__SLASH_imsvc) ||
+                        Option.matches(options::OPT__SLASH_winsysroot);
+    const bool IsCoordinate =
+        IsPath || Option.matches(options::OPT_target) ||
+        Option.matches(options::OPT_target_legacy_spelling) ||
+        Option.matches(options::OPT_arch) ||
+        Option.matches(options::OPT_stdlib_EQ);
+    if (!IsCoordinate)
+      continue;
+    Add(Option.getUnaliasedOption().getName());
+    for (llvm::StringRef Value : Arg->getValues()) {
+      if (Option.matches(options::OPT_isystem) && Sysroot &&
+          Value.starts_with("=")) {
+        llvm::SmallString<256> SysrootPath(Sysroot->getValue());
+        llvm::sys::path::append(SysrootPath, Value.drop_front());
+        AddPath(SysrootPath);
+      } else if (IsPath) {
+        AddPath(Value);
+      } else {
+        Add(Value);
+      }
+    }
+  }
+  return llvm::toHex(Hash.final(), /*LowerCase=*/true);
+}
 
 CommandMangler CommandMangler::detect() {
   CommandMangler Result;
@@ -346,11 +504,7 @@ void CommandMangler::operator()(tooling::CompileCommand &Command,
 
   if (!Cmd.empty()) {
     bool FollowSymlink = !HasExact("-no-canonical-prefixes");
-    Cmd.front() =
-        (FollowSymlink ? ResolvedDrivers : ResolvedDriversNoFollow)
-            .get(Cmd.front(), [&, this] {
-              return resolveDriver(Cmd.front(), FollowSymlink, ClangPath);
-            });
+    Cmd.front() = resolveDriver(Cmd.front(), FollowSymlink, ClangPath);
   }
 }
 

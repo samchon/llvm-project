@@ -9,6 +9,7 @@
 #include "CompileCommands.h"
 #include "Config.h"
 #include "TestFS.h"
+#include "index/Graph.h"
 #include "support/Context.h"
 
 #include "clang/Testing/CommandLineArgs.h"
@@ -20,9 +21,11 @@
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Config/llvm-config.h" // for LLVM_ON_UNIX
 #include "llvm/Support/FileSystem.h"
+#include "llvm/Support/FileUtilities.h"
 #include "llvm/Support/Path.h"
 #include "llvm/Support/Process.h"
 #include "llvm/Support/TargetSelect.h"
+#include "llvm/Support/raw_ostream.h"
 
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
@@ -40,6 +43,135 @@ using ::testing::Not;
 // Sadly, CommandMangler::detect(), which contains much of the logic, is
 // a bunch of untested integration glue. We test the string manipulation here
 // assuming its results are correct.
+
+TEST(CompileCommandDriverFingerprint, ChangesWithExactWrapperBytes) {
+  int FD = -1;
+  llvm::SmallString<128> Driver;
+  ASSERT_FALSE(
+      llvm::sys::fs::createTemporaryFile("clangd-driver", "", FD, Driver));
+  llvm::FileRemover Cleanup(Driver);
+  {
+    llvm::raw_fd_ostream OS(FD, /*shouldClose=*/true);
+    OS << "first wrapper";
+  }
+  tooling::CompileCommand Command;
+  Command.Directory = llvm::sys::path::parent_path(Driver).str();
+  Command.CommandLine = {Driver.str().str()};
+  const std::string First = compileCommandDriverFingerprint(Command);
+
+  std::error_code EC;
+  {
+    llvm::raw_fd_ostream OS(Driver, EC, llvm::sys::fs::OF_None);
+    ASSERT_FALSE(EC);
+    OS << "second wrapper";
+  }
+  const std::string Second = compileCommandDriverFingerprint(Command);
+  EXPECT_NE(First, Second);
+  EXPECT_EQ(Second, compileCommandDriverFingerprint(Command));
+}
+
+TEST(CompileCommandDriverFingerprint, BoundedCacheReadsEachDriverOnce) {
+  int FD = -1;
+  llvm::SmallString<128> Driver;
+  ASSERT_FALSE(
+      llvm::sys::fs::createTemporaryFile("clangd-driver", "", FD, Driver));
+  llvm::FileRemover Cleanup(Driver);
+  {
+    llvm::raw_fd_ostream OS(FD, /*shouldClose=*/true);
+    OS << "first wrapper";
+  }
+  tooling::CompileCommand Command;
+  Command.Directory = llvm::sys::path::parent_path(Driver).str();
+  Command.CommandLine = {Driver.str().str()};
+  CompileCommandDriverFingerprintCache Cache;
+  const std::string First = Cache.get(Command);
+
+  std::error_code EC;
+  {
+    llvm::raw_fd_ostream OS(Driver, EC, llvm::sys::fs::OF_None);
+    ASSERT_FALSE(EC);
+    OS << "second wrapper";
+  }
+  EXPECT_EQ(First, Cache.get(Command));
+  CompileCommandDriverFingerprintCache NextOperation;
+  EXPECT_NE(First, NextOperation.get(Command));
+}
+
+TEST(CompileCommandDriverFingerprint, ToolchainIncludesEffectiveQueryOutput) {
+  tooling::CompileCommand Command;
+  Command.Directory = testRoot();
+  Command.CommandLine = {"missing-clang++", "-isystem", testPath("v1"),
+                         "--target=x86_64-unknown-linux-gnu", "input.cc"};
+  CompileCommandDriverFingerprintCache Cache;
+  const std::string First = compileCommandToolchainFingerprint(Command, &Cache);
+  Command.CommandLine[2] = testPath("v2");
+  EXPECT_NE(First, compileCommandToolchainFingerprint(Command, &Cache));
+}
+
+TEST(CompileCommandDriverFingerprint, ToolchainExcludesTUConfiguration) {
+  tooling::CompileCommand First;
+  First.Directory = testPath("first");
+  First.Filename = testPath("first/input.cc");
+  First.CommandLine = {"missing-clang++",
+                       "-isystem",
+                       testPath("toolchain/include"),
+                       "--target=x86_64-unknown-linux-gnu",
+                       "-DFIRST",
+                       "-o",
+                       "first.o",
+                       First.Filename};
+  tooling::CompileCommand Second = First;
+  Second.Directory = testPath("second");
+  Second.Filename = testPath("second/input.cc");
+  Second.CommandLine[4] = "-DSECOND";
+  Second.CommandLine[6] = "second.o";
+  Second.CommandLine[7] = Second.Filename;
+
+  CompileCommandDriverFingerprintCache Cache;
+  EXPECT_EQ(compileCommandToolchainFingerprint(First, &Cache),
+            compileCommandToolchainFingerprint(Second, &Cache));
+  EXPECT_NE(graphCommandDigest(First), graphCommandDigest(Second));
+}
+
+TEST(CompileCommandDriverFingerprint, ToolchainUsesDriverOptionSemantics) {
+  tooling::CompileCommand First;
+  First.Directory = testRoot();
+  First.Filename = "/imsvc-first.cc";
+  First.CommandLine = {"missing-clang++", "-isystem-after",
+                       testPath("after"), "-iframeworkwithsysroot",
+                       "=Frameworks",     "--",
+                       First.Filename};
+  tooling::CompileCommand Second = First;
+  Second.Filename = "/imsvc-second.cc";
+  Second.CommandLine.back() = Second.Filename;
+
+  CompileCommandDriverFingerprintCache Cache;
+  EXPECT_EQ(compileCommandToolchainFingerprint(First, &Cache),
+            compileCommandToolchainFingerprint(Second, &Cache));
+  Second.Directory = testPath("other-root");
+  EXPECT_NE(compileCommandToolchainFingerprint(First, &Cache),
+            compileCommandToolchainFingerprint(Second, &Cache));
+  Second.Directory = First.Directory;
+  Second.CommandLine[2] = testPath("other-after");
+  EXPECT_NE(compileCommandToolchainFingerprint(First, &Cache),
+            compileCommandToolchainFingerprint(Second, &Cache));
+
+  First.Directory = testPath("first-root");
+  First.CommandLine = {"missing-clang++", "-isysroot", testPath("sdk"),
+                       "-isystem", "=Headers"};
+  Second = First;
+  Second.Directory = testPath("second-root");
+  EXPECT_EQ(compileCommandToolchainFingerprint(First, &Cache),
+            compileCommandToolchainFingerprint(Second, &Cache));
+  Second.CommandLine[2] = testPath("other-sdk");
+  EXPECT_NE(compileCommandToolchainFingerprint(First, &Cache),
+            compileCommandToolchainFingerprint(Second, &Cache));
+
+  First.CommandLine = {"missing-clang-cl", "/imsvc", testPath("msvc")};
+  Second.CommandLine = {"missing-clang-cl", "/imsvc", testPath("other-msvc")};
+  EXPECT_NE(compileCommandToolchainFingerprint(First, &Cache),
+            compileCommandToolchainFingerprint(Second, &Cache));
+}
 
 // Make use of all features and assert the exact command we get out.
 // Other tests just verify presence/absence of certain args.

@@ -13,6 +13,7 @@
 #include "SourceCode.h"
 #include "index/BackgroundRebuild.h"
 #include "index/FileIndex.h"
+#include "index/Graph.h"
 #include "index/Index.h"
 #include "index/Serialization.h"
 #include "support/Context.h"
@@ -22,10 +23,14 @@
 #include "support/ThreadsafeFS.h"
 #include "clang/Tooling/CompilationDatabase.h"
 #include "llvm/ADT/StringMap.h"
+#include "llvm/ADT/StringSet.h"
+#include "llvm/Support/Error.h"
 #include "llvm/Support/Threading.h"
 #include <atomic>
 #include <condition_variable>
 #include <deque>
+#include <map>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <queue>
@@ -35,6 +40,8 @@
 
 namespace clang {
 namespace clangd {
+
+class CompileCommandDriverFingerprintCache;
 
 // Handles storage and retrieval of index shards. Both store and load
 // operations can be called from multiple-threads concurrently.
@@ -74,10 +81,11 @@ public:
 
     std::function<void()> Run;
     llvm::ThreadPriority ThreadPri = llvm::ThreadPriority::Low;
-    unsigned QueuePri = 0; // Higher-priority tasks will run first.
-    std::string Tag;       // Allows priority to be boosted later.
-    uint64_t Key = 0;      // If the key matches a previous task, drop this one.
-                           // (in practice this means we never reindex a file).
+    unsigned QueuePri = 0;   // Higher-priority tasks will run first.
+    std::string Tag;         // Allows priority to be boosted later.
+    uint64_t Key = 0;        // Coalesces equivalent queued work.
+    bool Repeatable = false; // Release Key after running; coalesce a rerun if
+                             // the same key changes while this task is active.
 
     bool operator<(const Task &O) const { return QueuePri < O.QueuePri; }
   };
@@ -126,6 +134,8 @@ private:
   llvm::StringMap<unsigned> Boosts;
   std::function<void(Stats)> OnProgress;
   llvm::DenseSet<uint64_t> SeenKeys;
+  llvm::DenseSet<uint64_t> ActiveKeys;
+  std::map<uint64_t, Task> DeferredRepeats;
 };
 
 // Builds an in-memory index by by running the static indexer action over
@@ -160,9 +170,7 @@ public:
   // Enqueue translation units for indexing.
   // The indexing happens in a background thread, so the symbols will be
   // available sometime later.
-  void enqueue(const std::vector<std::string> &ChangedFiles) {
-    Queue.push(changedFilesTask(ChangedFiles));
-  }
+  void enqueue(const std::vector<std::string> &ChangedFiles);
 
   /// Boosts priority of indexing related to Path.
   /// Typically used to index TUs when headers are opened.
@@ -182,6 +190,15 @@ public:
   }
 
   void profile(MemoryTree &MT) const;
+
+  /// Freezes the complete graph-index generation currently resident in the
+  /// background index. The request fails while indexing is incomplete, after
+  /// an analysis error, or if source/CDB state moves during validation.
+  llvm::Expected<llvm::json::Value>
+  graphSnapshot(const GraphSnapshotParams &Params);
+
+  /// Reindexes every known translation unit that contains one of ChangedFiles.
+  void enqueueGraphDependents(llvm::ArrayRef<std::string> ChangedFiles);
 
 private:
   /// Represents the state of a single file when indexing was performed.
@@ -203,12 +220,78 @@ private:
   llvm::ThreadPriority IndexingPriority;
   std::function<Context(PathRef)> ContextProvider;
 
-  llvm::Error index(tooling::CompileCommand);
+  struct IndexResult {
+    IndexFileIn Index;
+    llvm::StringMap<ShardVersion> ShardVersionsSnapshot;
+    std::vector<std::string> MissingInputs;
+    bool HadErrors = false;
+    uint64_t SemanticMillis = 0;
+  };
+
+  llvm::Expected<IndexResult>
+  index(tooling::CompileCommand,
+        CompileCommandDriverFingerprintCache *DriverFingerprints = nullptr);
 
   FileSymbols IndexedSymbols;
   BackgroundIndexRebuilder Rebuilder;
   llvm::StringMap<ShardVersion> ShardVersions; // Key is absolute file path.
   std::mutex ShardVersionsMu;
+
+  // Complete TU/configuration views. The outer key is the absolute main file,
+  // the inner key is graphCommandDigest(). A batch replaces all views for one
+  // main file atomically, so snapshots cannot mix old and new configurations.
+  mutable std::mutex GraphMu;
+  llvm::StringMap<std::map<std::string, GraphTU>> Graphs;
+  size_t GraphDiscoveryPending = 0;
+  llvm::StringSet<> GraphPending;
+  llvm::StringMap<std::string> GraphFailures;
+  llvm::StringMap<std::string> GraphFailureTUs;
+  llvm::StringMap<std::vector<std::string>> GraphFailureInputs;
+  llvm::StringMap<std::map<std::string, uint64_t>> GraphSemanticMillis;
+  uint64_t GraphRevision = 0;
+  mutable uint64_t GraphSequence = 0;
+  mutable std::string PublishedGeneration;
+  mutable llvm::StringMap<std::string> PublishedManifest;
+  struct GraphSnapshotShardCache {
+    std::string MainKey;
+    std::string MainFile;
+    std::string Directory;
+    std::string CommandDigest;
+    std::string ToolchainFingerprint;
+    std::string Key;
+    std::string Digest;
+    std::string CheckerDigest;
+    std::string InterfaceFingerprint;
+    std::vector<GraphSource> Sources;
+    uint64_t SemanticMillis = 0;
+  };
+  struct GraphSnapshotCache {
+    uint64_t Revision = 0;
+    std::string UniverseDigest;
+    std::string Generation;
+    std::vector<GraphSnapshotShardCache> Shards;
+    std::vector<std::string> Targets;
+    std::vector<std::string> Configurations;
+    std::vector<std::string> WorkspaceRoots;
+    std::vector<std::string> Toolchains;
+    uint64_t ShardMillis = 0;
+  };
+  struct GraphSnapshotPlan {
+    std::string Token;
+    uint64_t Revision = 0;
+    std::string Generation;
+    std::optional<std::string> BaseGeneration;
+    uint64_t Sequence = 0;
+    std::vector<size_t> Upserts;
+    std::vector<std::string> Deletes;
+    uint64_t SemanticMillis = 0;
+    uint64_t ShardMillis = 0;
+    bool CacheHit = false;
+  };
+  mutable std::optional<GraphSnapshotCache> CachedGraphSnapshot;
+  // Several clients may page through the same immutable cache concurrently.
+  // Plans are bounded by sequence and invalidated by graph revision changes.
+  mutable llvm::StringMap<GraphSnapshotPlan> ActiveGraphSnapshotPlans;
 
   BackgroundIndexStorage::Factory IndexStorageFactory;
   // Tries to load shards for the MainFiles and their dependencies.
@@ -216,7 +299,10 @@ private:
 
   BackgroundQueue::Task
   changedFilesTask(const std::vector<std::string> &ChangedFiles);
-  BackgroundQueue::Task indexFileTask(std::string Path);
+  BackgroundQueue::Task indexFileTask(
+      std::string Path,
+      std::shared_ptr<CompileCommandDriverFingerprintCache> DriverFingerprints);
+  void enqueueGraphReindex(llvm::ArrayRef<std::string> MainFiles);
 
   // from lowest to highest priority
   enum QueuePriority {

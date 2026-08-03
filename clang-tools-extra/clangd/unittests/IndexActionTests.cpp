@@ -7,13 +7,18 @@
 //===----------------------------------------------------------------------===//
 
 #include "Headers.h"
+#include "SourceCode.h"
 #include "TestFS.h"
 #include "URI.h"
 #include "index/IndexAction.h"
 #include "index/Serialization.h"
+#include "support/Context.h"
 #include "clang/Basic/SourceLocation.h"
 #include "clang/Basic/SourceManager.h"
 #include "clang/Tooling/Tooling.h"
+#include "llvm/Support/FileSystem.h"
+#include "llvm/Support/FileUtilities.h"
+#include "llvm/Support/raw_ostream.h"
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
 #include <string>
@@ -89,7 +94,8 @@ public:
         Opts, [&](SymbolSlab S) { IndexFile.Symbols = std::move(S); },
         [&](RefSlab R) { IndexFile.Refs = std::move(R); },
         [&](RelationSlab R) { IndexFile.Relations = std::move(R); },
-        [&](IncludeGraph IG) { IndexFile.Sources = std::move(IG); });
+        [&](IncludeGraph IG) { IndexFile.Sources = std::move(IG); },
+        [&](GraphTU Graph) { IndexFile.Graphs.push_back(std::move(Graph)); });
 
     std::vector<std::string> Args = {"index_action", "-fsyntax-only",
                                      "-xc++",        "-std=c++11",
@@ -145,6 +151,173 @@ TEST_F(IndexActionTest, CollectIncludeGraph) {
                   Pair(toUri(Level2HeaderPath),
                        AllOf(Not(isTU()), includesAre({}),
                              hasDigest(digest(Level2HeaderCode))))));
+}
+
+TEST_F(IndexActionTest, CollectCompleteGraphFacts) {
+  Opts.CollectGraph = true;
+  const std::string Header = testPath("graph.h");
+  const std::string Main = testPath("graph.cpp");
+  addFile(Header, R"cpp(
+#define GRAPH_WRAP(x) x
+struct Base { virtual void run(); };
+struct Derived : Base { void run() override; };
+)cpp");
+  addFile(Main, R"cpp(
+#include "graph.h"
+static int hidden;
+void Derived::run() { int local = GRAPH_WRAP(hidden); }
+Derived make() { return Derived{}; }
+)cpp");
+
+  IndexFileIn Indexed = runIndexingAction(Main);
+  ASSERT_EQ(1u, Indexed.Graphs.size());
+  const GraphTU &Graph = Indexed.Graphs.front();
+  EXPECT_EQ("cpp", Graph.Language);
+  EXPECT_EQ(toUri(Main), Graph.MainFileURI);
+  EXPECT_EQ(2u, Graph.Sources.size());
+  EXPECT_THAT(
+      Graph.Includes,
+      Contains(AllOf(testing::Field(&GraphInclude::SourceURI, toUri(Main)),
+                     testing::Field(&GraphInclude::TargetURI, toUri(Header)))));
+  size_t MacroOccurrences = 0;
+  std::string MacroID;
+  for (const auto &Macro : Graph.Macros) {
+    if (Macro.Name != "GRAPH_WRAP")
+      continue;
+    ++MacroOccurrences;
+    if (MacroID.empty())
+      MacroID = Macro.ID;
+    else
+      EXPECT_EQ(MacroID, Macro.ID);
+  }
+  EXPECT_GE(MacroOccurrences, 2u);
+  EXPECT_TRUE(llvm::all_of(Graph.Macros, [](const GraphMacro &Macro) {
+    return Macro.Definition.valid();
+  }));
+  EXPECT_TRUE(llvm::any_of(Graph.Symbols, [](const GraphSymbol &Symbol) {
+    return Symbol.Name == "hidden" && Symbol.Internal;
+  }));
+  EXPECT_TRUE(llvm::any_of(Graph.Symbols, [](const GraphSymbol &Symbol) {
+    return Symbol.Name == "local" && Symbol.Local;
+  }));
+  EXPECT_TRUE(llvm::any_of(Graph.Relations, [](const GraphRelation &Relation) {
+    return Relation.Roles &
+           static_cast<uint32_t>(index::SymbolRole::RelationBaseOf);
+  }));
+  EXPECT_TRUE(llvm::any_of(Graph.Relations, [](const GraphRelation &Relation) {
+    return Relation.Roles &
+           static_cast<uint32_t>(index::SymbolRole::RelationOverrideOf);
+  }));
+  EXPECT_TRUE(
+      llvm::any_of(Graph.Occurrences, [](const GraphOccurrence &Occurrence) {
+        return Occurrence.Roles &
+               static_cast<uint32_t>(index::SymbolRole::Read);
+      }));
+  EXPECT_TRUE(llvm::all_of(Graph.Symbols, [](const GraphSymbol &Symbol) {
+    return !Symbol.Declaration.valid() ||
+           Symbol.Declaration.EndColumn >= Symbol.Declaration.StartColumn;
+  }));
+}
+
+TEST_F(IndexActionTest, GraphDistinguishesCheckerAndDiskDigests) {
+  Opts.CollectGraph = true;
+  int FD = -1;
+  llvm::SmallString<128> Main;
+  ASSERT_FALSE(llvm::sys::fs::createTemporaryFile("clangd-graph-source", "cpp",
+                                                  FD, Main));
+  llvm::FileRemover Cleanup(Main);
+  constexpr llvm::StringLiteral DiskContents = "int fromDisk;\n";
+  {
+    llvm::raw_fd_ostream OS(FD, /*shouldClose=*/true);
+    OS << DiskContents;
+  }
+  constexpr llvm::StringLiteral CheckerContents = "int fromOverlay;\n";
+  addFile(Main, CheckerContents);
+
+  IndexFileIn Indexed = runIndexingAction(Main);
+  ASSERT_EQ(1u, Indexed.Graphs.size());
+  ASSERT_EQ(1u, Indexed.Graphs.front().Sources.size());
+  const GraphSource &Source = Indexed.Graphs.front().Sources.front();
+  EXPECT_EQ(graphDigest(CheckerContents), Source.Digest);
+  EXPECT_EQ(graphDigest(DiskContents), Source.DiskDigest);
+  EXPECT_NE(Source.Digest, Source.DiskDigest);
+}
+
+TEST_F(IndexActionTest, GraphOffsetsAreFixedUTF16AndDoNotSaturate) {
+  Opts.CollectGraph = true;
+  const std::string Main = testPath("wide.cpp");
+  const std::string Prefix = std::string("/*😀*/") + std::string(5000, ' ');
+  addFile(Main, Prefix + "int veryLongSymbol;\n");
+
+  IndexFileIn UTF8;
+  {
+    WithContextValue Negotiated(kCurrentOffsetEncoding, OffsetEncoding::UTF8);
+    UTF8 = runIndexingAction(Main);
+  }
+  IndexFileIn UTF32;
+  {
+    WithContextValue Negotiated(kCurrentOffsetEncoding, OffsetEncoding::UTF32);
+    UTF32 = runIndexingAction(Main);
+  }
+  auto Find = [](const IndexFileIn &Indexed) -> const GraphSymbol * {
+    if (Indexed.Graphs.size() != 1)
+      return nullptr;
+    auto It = llvm::find_if(Indexed.Graphs.front().Symbols,
+                            [](const GraphSymbol &Symbol) {
+                              return Symbol.Name == "veryLongSymbol";
+                            });
+    return It == Indexed.Graphs.front().Symbols.end() ? nullptr : &*It;
+  };
+  const GraphSymbol *UTF8Symbol = Find(UTF8);
+  const GraphSymbol *UTF32Symbol = Find(UTF32);
+  ASSERT_TRUE(UTF8Symbol);
+  ASSERT_TRUE(UTF32Symbol);
+  EXPECT_EQ(5006u, UTF8Symbol->Declaration.StartColumn);
+  EXPECT_EQ(5024u, UTF8Symbol->Declaration.EndColumn);
+  EXPECT_EQ(UTF8Symbol->Declaration.StartColumn,
+            UTF32Symbol->Declaration.StartColumn);
+  EXPECT_EQ(UTF8Symbol->Declaration.EndColumn,
+            UTF32Symbol->Declaration.EndColumn);
+}
+
+TEST(GraphTest, CommandDigestNormalizesEquivalentInputSpelling) {
+  tooling::CompileCommand Native;
+  Native.Directory = "C:/project";
+  Native.Filename = "C:/project/main.cpp";
+  Native.CommandLine = {"clang++", "-DVALUE=a\\b", "--",
+                        "C:\\project\\main.cpp"};
+  tooling::CompileCommand Slashes = Native;
+  Slashes.CommandLine.back() = "C:/project/main.cpp";
+#ifdef _WIN32
+  EXPECT_EQ(graphCommandDigest(Native), graphCommandDigest(Slashes));
+  Slashes.Directory = "c:\\PROJECT";
+  Slashes.Filename = "c:\\PROJECT\\main.cpp";
+  Slashes.CommandLine.back() = "c:\\PROJECT\\main.cpp";
+  EXPECT_EQ(graphCommandDigest(Native), graphCommandDigest(Slashes));
+#else
+  EXPECT_NE(graphCommandDigest(Native), graphCommandDigest(Slashes));
+#endif
+  Slashes.CommandLine[1] = "-DVALUE=a/b";
+  EXPECT_NE(graphCommandDigest(Native), graphCommandDigest(Slashes));
+}
+
+TEST(GraphTest, OnlyPlainCAndCXXCommandsAreAuthoritative) {
+  tooling::CompileCommand Command;
+  Command.Directory = testRoot();
+  Command.Filename = testPath("main.cpp");
+  Command.CommandLine = {"clang++", "-fsyntax-only", Command.Filename};
+  EXPECT_TRUE(graphCommandIsCOrCXX(Command));
+
+  Command.Filename = testPath("main.c");
+  Command.CommandLine = {"clang", "-fsyntax-only", Command.Filename};
+  EXPECT_TRUE(graphCommandIsCOrCXX(Command));
+  for (const auto &Language :
+       {"objective-c", "objective-c++", "cuda", "hip", "cl", "clcpp"}) {
+    Command.Filename = testPath("mixed.cpp");
+    Command.CommandLine = {"clang", "-x", Language, "-fsyntax-only",
+                           Command.Filename};
+    EXPECT_FALSE(graphCommandIsCOrCXX(Command)) << Language;
+  }
 }
 
 TEST_F(IndexActionTest, IncludeGraphSelfInclude) {

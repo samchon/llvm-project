@@ -7,6 +7,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "llvm/Support/Program.h"
+#include "llvm/ADT/ScopeExit.h"
 #include "llvm/Config/llvm-config.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/ConvertUTF.h"
@@ -25,6 +26,8 @@ extern char **environ;
 #endif
 
 #if defined(LLVM_ON_UNIX)
+#include <pthread.h>
+#include <signal.h>
 #include <unistd.h>
 void sleep_for(unsigned int seconds) {
   sleep(seconds);
@@ -60,6 +63,10 @@ static cl::opt<std::string>
 ProgramTestStringArg1("program-test-string-arg1");
 static cl::opt<std::string>
 ProgramTestStringArg2("program-test-string-arg2");
+
+#if defined(LLVM_ON_UNIX)
+void pollingWaitSignalHandler(int) {}
+#endif
 
 class ProgramEnvTest : public testing::Test {
   std::vector<StringRef> EnvTable;
@@ -413,6 +420,115 @@ TEST_F(ProgramEnvTest, TestExecuteNoWaitTimeoutPolling) {
 
   ASSERT_GT(LoopCount, 1u) << "LoopCount should be >1";
 }
+
+TEST_F(ProgramEnvTest, TestOwnedDetachedProcessTerminatesImmediately) {
+  if (getenv("LLVM_PROGRAM_TEST_OWNED_DETACHED")) {
+    sleep_for(/*seconds=*/10);
+    exit(0);
+  }
+
+  std::string Executable =
+      sys::fs::getMainExecutable(TestMainArgv0, &ProgramTestStringArg1);
+  StringRef argv[] = {Executable,
+                      "--gtest_filter=ProgramEnvTest."
+                      "TestOwnedDetachedProcessTerminatesImmediately"};
+  addEnvVar("LLVM_PROGRAM_TEST_OWNED_DETACHED=1");
+
+  std::string Error;
+  bool ExecutionFailed;
+  ProcessInfo PI = ExecuteNoWait(
+      Executable, argv, getEnviron(), /*Redirects=*/{}, /*MemoryLimit=*/0,
+      &Error, &ExecutionFailed, /*AffinityMask=*/nullptr,
+      /*DetachProcess=*/true, /*OwnProcessTree=*/true);
+  ASSERT_FALSE(ExecutionFailed) << Error;
+  ASSERT_NE(PI.Pid, ProcessInfo::InvalidPid) << "Invalid process id";
+
+  const auto Started = std::chrono::steady_clock::now();
+  ProcessInfo Terminated = TerminateProcessTree(PI, &Error);
+  EXPECT_EQ(Terminated.Pid, PI.Pid) << Error;
+  EXPECT_LT(std::chrono::steady_clock::now() - Started,
+            std::chrono::seconds(5));
+}
+
+#if defined(LLVM_ON_UNIX)
+TEST_F(ProgramEnvTest, TestOwnedDetachedSetupFailureIsSynchronous) {
+  std::string Executable =
+      sys::fs::getMainExecutable(TestMainArgv0, &ProgramTestStringArg1);
+  StringRef argv[] = {Executable, "--gtest_filter=ProgramEnvTest."
+                                  "TestOwnedDetachedSetupFailureIsSynchronous"};
+
+  int FD = -1;
+  SmallString<128> MissingInput;
+  ASSERT_NO_ERROR(sys::fs::createTemporaryFile("program-owned-missing-input",
+                                               "txt", FD, MissingInput));
+  ASSERT_EQ(0, close(FD));
+  ASSERT_NO_ERROR(sys::fs::remove(MissingInput));
+  std::optional<StringRef> Redirects[] = {MissingInput.str(), std::nullopt,
+                                          std::nullopt};
+
+  std::string Error;
+  bool ExecutionFailed = false;
+  ProcessInfo PI = ExecuteNoWait(
+      Executable, argv, getEnviron(), Redirects, /*MemoryLimit=*/0, &Error,
+      &ExecutionFailed, /*AffinityMask=*/nullptr,
+      /*DetachProcess=*/true, /*OwnProcessTree=*/true);
+  EXPECT_TRUE(ExecutionFailed);
+  EXPECT_EQ(PI.Pid, ProcessInfo::InvalidPid);
+  EXPECT_FALSE(Error.empty());
+}
+
+TEST_F(ProgramEnvTest, TestPollingWaitSurvivesUnrelatedSignal) {
+  if (getenv("LLVM_PROGRAM_TEST_POLLING_SIGNAL")) {
+    sleep_for(/*seconds=*/10);
+    exit(0);
+  }
+
+  std::string Executable =
+      sys::fs::getMainExecutable(TestMainArgv0, &ProgramTestStringArg1);
+  StringRef argv[] = {
+      Executable,
+      "--gtest_filter=ProgramEnvTest.TestPollingWaitSurvivesUnrelatedSignal"};
+  addEnvVar("LLVM_PROGRAM_TEST_POLLING_SIGNAL=1");
+
+  std::string Error;
+  bool ExecutionFailed;
+  ProcessInfo PI = ExecuteNoWait(
+      Executable, argv, getEnviron(), /*Redirects=*/{}, /*MemoryLimit=*/0,
+      &Error, &ExecutionFailed, /*AffinityMask=*/nullptr,
+      /*DetachProcess=*/false, /*OwnProcessTree=*/true);
+  ASSERT_FALSE(ExecutionFailed) << Error;
+  ASSERT_NE(PI.Pid, ProcessInfo::InvalidPid) << "Invalid process id";
+
+  struct sigaction Action = {};
+  struct sigaction Previous = {};
+  Action.sa_handler = pollingWaitSignalHandler;
+  sigemptyset(&Action.sa_mask);
+  ASSERT_EQ(0, sigaction(SIGUSR1, &Action, &Previous));
+  auto RestoreHandler =
+      llvm::make_scope_exit([&] { sigaction(SIGUSR1, &Previous, nullptr); });
+
+  int SignalResult = -1;
+  const pthread_t WaitingThread = pthread_self();
+  std::thread Interrupter([&] {
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    SignalResult = pthread_kill(WaitingThread, SIGUSR1);
+  });
+  ProcessInfo Interrupted = Wait(PI, /*SecondsToWait=*/5, &Error,
+                                 /*ProcStat=*/nullptr, /*Polling=*/true);
+  Interrupter.join();
+  EXPECT_EQ(0, SignalResult);
+  EXPECT_EQ(Interrupted.Pid, ProcessInfo::InvalidPid);
+  EXPECT_TRUE(Error.empty()) << Error;
+
+  ProcessInfo StillRunning = Wait(PI, /*SecondsToWait=*/0, &Error,
+                                  /*ProcStat=*/nullptr, /*Polling=*/true);
+  EXPECT_EQ(StillRunning.Pid, 0);
+  if (StillRunning.Pid == 0) {
+    ProcessInfo Terminated = TerminateProcessTree(PI, &Error);
+    EXPECT_EQ(Terminated.Pid, PI.Pid) << Error;
+  }
+}
+#endif
 
 TEST(ProgramTest, TestExecuteNegative) {
   std::string Executable = "i_dont_exist";

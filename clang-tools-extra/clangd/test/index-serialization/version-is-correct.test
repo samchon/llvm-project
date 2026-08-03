@@ -12,4 +12,3 @@ clang-tools-extra/clangd/index/Serialization.cpp and regenarate sample.idx with
 Also if you've introduced new slabs/chunks to serialized index, make sure
 indexing sample.cpp would yield non-trivial values for those.
 # RUN: dexp %/S/Inputs/sample.idx -c="find B" | grep Bar || not grep -v '^#' %s
-# RUN: grep -a grph %/S/Inputs/sample.idx

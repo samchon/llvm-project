@@ -1517,6 +1517,79 @@ TEST_F(BackgroundIndexTest, SharedDriverProducesOneToolchainCoordinate) {
   EXPECT_EQ(2u, Universe->getArray("configurations")->size());
 }
 
+TEST_F(BackgroundIndexTest, GraphSnapshotRecapturesNativeDiskDigest) {
+  MockFS FS;
+  llvm::StringMap<std::string> Storage;
+  size_t CacheHits = 0;
+  MemoryShardStorage MSS(Storage, CacheHits);
+  MultiCommandCDB CDB;
+
+  int FD = -1;
+  llvm::SmallString<128> Source;
+  ASSERT_FALSE(llvm::sys::fs::createTemporaryFile("clangd-graph-disk", "cc", FD,
+                                                  Source));
+  llvm::FileRemover Cleanup(Source);
+  const std::string InitialDisk = "int native_version_one();";
+  {
+    llvm::raw_fd_ostream OS(FD, /*shouldClose=*/true);
+    OS << InitialDisk;
+  }
+  const std::string Checker = "int checker_overlay();";
+  FS.Files[Source] = Checker;
+  tooling::CompileCommand Command;
+  Command.Filename = Source.str().str();
+  Command.Directory = llvm::sys::path::parent_path(Source).str();
+  Command.CommandLine = {"clang++", "-fsyntax-only", Source.str().str()};
+  CDB.Commands[Source] = {Command};
+
+  BackgroundIndex Idx(FS, CDB, [&](llvm::StringRef) { return &MSS; }, {});
+  Idx.enqueue({Source.str().str()});
+  ASSERT_TRUE(Idx.blockUntilIdleForTest());
+  auto Initial = Idx.graphSnapshot({});
+  ASSERT_TRUE(bool(Initial)) << llvm::toString(Initial.takeError());
+  const auto *InitialObject = Initial->getAsObject();
+  ASSERT_TRUE(InitialObject);
+  const std::string InitialGeneration =
+      InitialObject->getString("generation")->str();
+  const auto *InitialGraph =
+      (*InitialObject->getArray("upserts"))[0].getAsObject()->getObject(
+          "graph");
+  ASSERT_TRUE(InitialGraph);
+  const auto *InitialSource =
+      (*InitialGraph->getArray("sources"))[0].getAsObject();
+  ASSERT_TRUE(InitialSource);
+  EXPECT_EQ(InitialSource->getString("digest"), graphDigest(Checker));
+  EXPECT_EQ(InitialSource->getString("diskDigest"), graphDigest(InitialDisk));
+
+  const std::string MovedDisk = "int native_version_two();";
+  std::error_code EC;
+  {
+    llvm::raw_fd_ostream OS(Source, EC, llvm::sys::fs::OF_None);
+    ASSERT_FALSE(EC);
+    OS << MovedDisk;
+  }
+  GraphSnapshotParams Params;
+  Params.KnownGeneration = InitialGeneration;
+  auto Moved = Idx.graphSnapshot(Params);
+  ASSERT_TRUE(bool(Moved)) << llvm::toString(Moved.takeError());
+  const auto *MovedObject = Moved->getAsObject();
+  ASSERT_TRUE(MovedObject);
+  ASSERT_NE(MovedObject->getString("generation"), InitialGeneration);
+  EXPECT_EQ(MovedObject->getString("baseGeneration"), InitialGeneration);
+  const auto *MovedGraph =
+      (*MovedObject->getArray("upserts"))[0].getAsObject()->getObject("graph");
+  ASSERT_TRUE(MovedGraph);
+  const auto *MovedSource = (*MovedGraph->getArray("sources"))[0].getAsObject();
+  ASSERT_TRUE(MovedSource);
+  EXPECT_EQ(MovedSource->getString("digest"), graphDigest(Checker));
+  EXPECT_EQ(MovedSource->getString("diskDigest"), graphDigest(MovedDisk));
+
+  Params.KnownGeneration = MovedObject->getString("generation")->str();
+  auto Unchanged = Idx.graphSnapshot(Params);
+  ASSERT_TRUE(bool(Unchanged)) << llvm::toString(Unchanged.takeError());
+  EXPECT_TRUE(Unchanged->getAsObject()->getArray("upserts")->empty());
+}
+
 TEST_F(BackgroundIndexTest, GeneratedHeaderCreationRetriesFailedGraph) {
   MockFS FS;
   llvm::StringMap<std::string> Storage;

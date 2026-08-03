@@ -296,7 +296,8 @@ TEST(SerializationTest, CompleteGraphRoundTrip) {
 
   IndexFileOut Output(Input);
   Output.Format = IndexFileFormat::RIFF;
-  auto Parsed = readIndexFile(llvm::to_string(Output));
+  std::string Serialized = llvm::to_string(Output);
+  auto Parsed = readIndexFile(Serialized);
   ASSERT_TRUE(bool(Parsed)) << Parsed.takeError();
   ASSERT_EQ(1u, Parsed->Graphs.size());
   const auto &RoundTrip = Parsed->Graphs.front();
@@ -310,6 +311,35 @@ TEST(SerializationTest, CompleteGraphRoundTrip) {
             RoundTrip.Occurrences.front().Roles);
   EXPECT_EQ(Graph.Diagnostics.front().Message,
             RoundTrip.Diagnostics.front().Message);
+
+  auto LegacyRIFF = riff::readFile(Serialized);
+  ASSERT_TRUE(bool(LegacyRIFF)) << LegacyRIFF.takeError();
+  auto GraphChunk = llvm::find_if(LegacyRIFF->Chunks, [](riff::Chunk Chunk) {
+    return Chunk.ID == riff::fourCC("grph");
+  });
+  ASSERT_NE(GraphChunk, LegacyRIFF->Chunks.end());
+  auto LegacyGraphJSON = llvm::json::parse(GraphChunk->Data);
+  ASSERT_TRUE(bool(LegacyGraphJSON)) << LegacyGraphJSON.takeError();
+  auto *LegacyGraphs = LegacyGraphJSON->getAsArray();
+  ASSERT_TRUE(LegacyGraphs);
+  ASSERT_EQ(1u, LegacyGraphs->size());
+  auto *LegacySources = (*LegacyGraphs)[0].getAsObject()->getArray("sources");
+  ASSERT_TRUE(LegacySources);
+  ASSERT_EQ(1u, LegacySources->size());
+  EXPECT_TRUE((*LegacySources)[0].getAsObject()->erase("diskDigest"));
+  std::string LegacyGraphSection;
+  {
+    llvm::raw_string_ostream OS(LegacyGraphSection);
+    OS << *LegacyGraphJSON;
+  }
+  GraphChunk->Data = LegacyGraphSection;
+  auto Legacy = readIndexFile(llvm::to_string(*LegacyRIFF));
+  ASSERT_TRUE(bool(Legacy)) << Legacy.takeError();
+  EXPECT_TRUE(Legacy->Symbols.has_value());
+  EXPECT_TRUE(Legacy->Refs.has_value());
+  ASSERT_EQ(1u, Legacy->Graphs.size());
+  ASSERT_EQ(1u, Legacy->Graphs.front().Sources.size());
+  EXPECT_TRUE(Legacy->Graphs.front().Sources.front().DiskDigest.empty());
 }
 
 TEST(SerializationTest, SrcsTest) {

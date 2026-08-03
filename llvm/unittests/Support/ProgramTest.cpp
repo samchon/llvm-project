@@ -451,6 +451,32 @@ TEST_F(ProgramEnvTest, TestOwnedDetachedProcessTerminatesImmediately) {
 }
 
 #if defined(LLVM_ON_UNIX)
+TEST_F(ProgramEnvTest, TestOwnedDetachedSetupFailureIsSynchronous) {
+  std::string Executable =
+      sys::fs::getMainExecutable(TestMainArgv0, &ProgramTestStringArg1);
+  StringRef argv[] = {Executable, "--gtest_filter=ProgramEnvTest."
+                                  "TestOwnedDetachedSetupFailureIsSynchronous"};
+
+  int FD = -1;
+  SmallString<128> MissingInput;
+  ASSERT_NO_ERROR(sys::fs::createTemporaryFile("program-owned-missing-input",
+                                               "txt", FD, MissingInput));
+  ASSERT_EQ(0, close(FD));
+  ASSERT_NO_ERROR(sys::fs::remove(MissingInput));
+  std::optional<StringRef> Redirects[] = {MissingInput.str(), std::nullopt,
+                                          std::nullopt};
+
+  std::string Error;
+  bool ExecutionFailed = false;
+  ProcessInfo PI = ExecuteNoWait(
+      Executable, argv, getEnviron(), Redirects, /*MemoryLimit=*/0, &Error,
+      &ExecutionFailed, /*AffinityMask=*/nullptr,
+      /*DetachProcess=*/true, /*OwnProcessTree=*/true);
+  EXPECT_TRUE(ExecutionFailed);
+  EXPECT_EQ(PI.Pid, ProcessInfo::InvalidPid);
+  EXPECT_FALSE(Error.empty());
+}
+
 TEST_F(ProgramEnvTest, TestPollingWaitSurvivesUnrelatedSignal) {
   if (getenv("LLVM_PROGRAM_TEST_POLLING_SIGNAL")) {
     sleep_for(/*seconds=*/10);

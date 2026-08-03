@@ -208,7 +208,8 @@ bool sourceFromJSON(const llvm::json::Value &Value, GraphSource &Source,
                     llvm::json::Path Path) {
   llvm::json::ObjectMapper O(Value, Path);
   return O && O.map("uri", Source.URI) && O.map("digest", Source.Digest) &&
-         O.map("diskDigest", Source.DiskDigest) && O.map("flags", Source.Flags);
+         O.mapOptional("diskDigest", Source.DiskDigest) &&
+         O.map("flags", Source.Flags);
 }
 
 llvm::json::Value diagnosticJSON(const GraphDiagnostic &Diagnostic) {

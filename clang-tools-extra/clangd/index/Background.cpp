@@ -48,6 +48,7 @@
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/Error.h"
 #include "llvm/Support/FormatVariadic.h"
+#include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/Path.h"
 #include "llvm/Support/Threading.h"
 #include "llvm/Support/raw_ostream.h"
@@ -1000,6 +1001,10 @@ BackgroundIndex::graphSnapshot(const GraphSnapshotParams &Params) {
     OS << Value;
     return OS.str();
   };
+  auto NativeDiskDigest = [](llvm::StringRef File) {
+    auto Buffer = llvm::MemoryBuffer::getFile(File);
+    return Buffer ? graphDigest((*Buffer)->getBuffer()) : std::string();
+  };
   auto CopyPageLocked =
       [&](const GraphSnapshotCache &Cache, const GraphSnapshotPlan &Plan,
           size_t Offset) -> llvm::Expected<std::vector<GraphTU>> {
@@ -1017,6 +1022,7 @@ BackgroundIndex::graphSnapshot(const GraphSnapshotParams &Params) {
       if (Configuration == Main->getValue().end())
         return contentModified("graph snapshot changed between pages");
       Page.push_back(Configuration->second);
+      Page.back().Sources = Shard.Sources;
     }
     return Page;
   };
@@ -1178,8 +1184,8 @@ BackgroundIndex::graphSnapshot(const GraphSnapshotParams &Params) {
     }
     ActiveGraphSnapshotPlans[Plan.Token] = Plan;
   };
-  auto ValidateCachedSnapshot =
-      [&](const GraphSnapshotCache &Cache) -> llvm::Error {
+  auto ValidateCachedSnapshot = [&](const GraphSnapshotCache &Cache,
+                                    bool &DiskDigestsMoved) -> llvm::Error {
     std::map<std::string, llvm::StringMap<std::string>> ActualConfigurations;
     for (const auto &Shard : Cache.Shards)
       ActualConfigurations[Shard.MainFile][Shard.CommandDigest] =
@@ -1217,7 +1223,11 @@ BackgroundIndex::graphSnapshot(const GraphSnapshotParams &Params) {
           "compile commands/toolchains",
           Mismatched.size());
     }
-    llvm::StringMap<std::string> CheckedSources;
+    struct CheckedSource {
+      std::string CheckerDigest;
+      std::string DiskDigest;
+    };
+    llvm::StringMap<CheckedSource> CheckedSources;
     for (const auto &Shard : Cache.Shards) {
       if (llvm::Error Err = CheckCancellation())
         return Err;
@@ -1228,9 +1238,10 @@ BackgroundIndex::graphSnapshot(const GraphSnapshotParams &Params) {
           return Resolved.takeError();
         auto Known = CheckedSources.find(*Resolved);
         if (Known != CheckedSources.end()) {
-          if (Known->getValue() != Source.Digest)
+          if (Known->getValue().CheckerDigest != Source.Digest)
             return error("graph snapshot has contradictory TU views for {0}",
                          *Resolved);
+          DiskDigestsMoved |= Known->getValue().DiskDigest != Source.DiskDigest;
           continue;
         }
         auto Buffer = FS->getBufferForFile(*Resolved);
@@ -1242,7 +1253,10 @@ BackgroundIndex::graphSnapshot(const GraphSnapshotParams &Params) {
         if (Current != Source.Digest)
           return contentModified(
               "graph snapshot source moved during indexing: {0}", *Resolved);
-        CheckedSources[*Resolved] = std::move(Current);
+        std::string CurrentDisk = NativeDiskDigest(*Resolved);
+        DiskDigestsMoved |= CurrentDisk != Source.DiskDigest;
+        CheckedSources[*Resolved] =
+            CheckedSource{std::move(Current), std::move(CurrentDisk)};
       }
     }
     return llvm::Error::success();
@@ -1310,42 +1324,45 @@ BackgroundIndex::graphSnapshot(const GraphSnapshotParams &Params) {
       }
     }
     if (Reused) {
-      if (llvm::Error Err = ValidateCachedSnapshot(Cache))
+      bool DiskDigestsMoved = false;
+      if (llvm::Error Err = ValidateCachedSnapshot(Cache, DiskDigestsMoved))
         return std::move(Err);
-      GraphSnapshotPlan Plan;
-      std::vector<GraphTU> PageGraphs;
-      {
-        std::lock_guard<std::mutex> Lock(GraphMu);
-        if (!CachedGraphSnapshot ||
-            CachedGraphSnapshot->Revision != GraphRevision ||
-            GraphDiscoveryPending != 0 || !GraphPending.empty() ||
-            !GraphFailures.empty())
-          return contentModified(
-              "graph snapshot state moved while its cache was validated");
-        Plan = CreatePlanLocked(Cache, false);
-        auto Page = CopyPageLocked(Cache, Plan, 0);
-        if (!Page)
-          return Page.takeError();
-        PageGraphs = std::move(*Page);
+      if (!DiskDigestsMoved) {
+        GraphSnapshotPlan Plan;
+        std::vector<GraphTU> PageGraphs;
+        {
+          std::lock_guard<std::mutex> Lock(GraphMu);
+          if (!CachedGraphSnapshot ||
+              CachedGraphSnapshot->Revision != GraphRevision ||
+              GraphDiscoveryPending != 0 || !GraphPending.empty() ||
+              !GraphFailures.empty())
+            return contentModified(
+                "graph snapshot state moved while its cache was validated");
+          Plan = CreatePlanLocked(Cache, false);
+          auto Page = CopyPageLocked(Cache, Plan, 0);
+          if (!Page)
+            return Page.takeError();
+          PageGraphs = std::move(*Page);
+        }
+        auto Encoded = EncodePage(Cache, Plan, 0, std::move(PageGraphs),
+                                  elapsedMillis(RequestStarted));
+        if (!Encoded)
+          return Encoded.takeError();
+        if (llvm::Error Err = CheckCancellation())
+          return std::move(Err);
+        {
+          std::lock_guard<std::mutex> Lock(GraphMu);
+          if (!CachedGraphSnapshot ||
+              CachedGraphSnapshot->Revision != Cache.Revision ||
+              CachedGraphSnapshot->Generation != Cache.Generation ||
+              GraphDiscoveryPending != 0 || !GraphPending.empty() ||
+              !GraphFailures.empty())
+            return contentModified(
+                "graph snapshot state moved before publication");
+          PublishPlanLocked(Cache, Plan);
+        }
+        return Encoded;
       }
-      auto Encoded = EncodePage(Cache, Plan, 0, std::move(PageGraphs),
-                                elapsedMillis(RequestStarted));
-      if (!Encoded)
-        return Encoded.takeError();
-      if (llvm::Error Err = CheckCancellation())
-        return std::move(Err);
-      {
-        std::lock_guard<std::mutex> Lock(GraphMu);
-        if (!CachedGraphSnapshot ||
-            CachedGraphSnapshot->Revision != Cache.Revision ||
-            CachedGraphSnapshot->Generation != Cache.Generation ||
-            GraphDiscoveryPending != 0 || !GraphPending.empty() ||
-            !GraphFailures.empty())
-          return contentModified(
-              "graph snapshot state moved before publication");
-        PublishPlanLocked(Cache, Plan);
-      }
-      return Encoded;
     }
   }
 
@@ -1427,21 +1444,26 @@ BackgroundIndex::graphSnapshot(const GraphSnapshotParams &Params) {
         Mismatched.size());
   }
 
-  llvm::StringMap<std::string> CheckedSources;
-  for (const auto &Entry : Frozen) {
+  struct CheckedSource {
+    std::string CheckerDigest;
+    std::string DiskDigest;
+  };
+  llvm::StringMap<CheckedSource> CheckedSources;
+  for (auto &Entry : Frozen) {
     if (llvm::Error Err = CheckCancellation())
       return std::move(Err);
-    const auto &Graph = Entry.Graph;
+    auto &Graph = Entry.Graph;
     auto FS = TFS.view(Graph.Directory);
-    for (const auto &Source : Graph.Sources) {
+    for (auto &Source : Graph.Sources) {
       auto Resolved = URI::resolve(Source.URI, Graph.MainFile);
       if (!Resolved)
         return Resolved.takeError();
       auto Known = CheckedSources.find(*Resolved);
       if (Known != CheckedSources.end()) {
-        if (Known->getValue() != Source.Digest)
+        if (Known->getValue().CheckerDigest != Source.Digest)
           return error("graph snapshot has contradictory TU views for {0}",
                        *Resolved);
+        Source.DiskDigest = Known->getValue().DiskDigest;
         continue;
       }
       auto Buffer = FS->getBufferForFile(*Resolved);
@@ -1452,7 +1474,9 @@ BackgroundIndex::graphSnapshot(const GraphSnapshotParams &Params) {
       if (Current != Source.Digest)
         return contentModified(
             "graph snapshot source moved during indexing: {0}", *Resolved);
-      CheckedSources[*Resolved] = std::move(Current);
+      Source.DiskDigest = NativeDiskDigest(*Resolved);
+      CheckedSources[*Resolved] =
+          CheckedSource{std::move(Current), Source.DiskDigest};
     }
   }
 

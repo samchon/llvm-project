@@ -300,6 +300,8 @@ std::string compileCommandToolchainFingerprint(
       MissingArgCount,
       llvm::opt::Visibility(IsCLMode ? options::CLOption
                                      : options::ClangOption));
+  const llvm::opt::Arg *Sysroot =
+      Args.getLastArg(options::OPT__sysroot_EQ, options::OPT_isysroot);
   for (const llvm::opt::Arg *Arg : Args) {
     const llvm::opt::Option Option = Arg->getOption();
     const bool IsPath = Option.matches(options::OPT_isystem) ||
@@ -326,10 +328,16 @@ std::string compileCommandToolchainFingerprint(
       continue;
     Add(Option.getUnaliasedOption().getName());
     for (llvm::StringRef Value : Arg->getValues()) {
-      if (IsPath)
+      if (Option.matches(options::OPT_isystem) && Sysroot &&
+          Value.starts_with("=")) {
+        llvm::SmallString<256> SysrootPath(Sysroot->getValue());
+        llvm::sys::path::append(SysrootPath, Value.drop_front());
+        AddPath(SysrootPath);
+      } else if (IsPath) {
         AddPath(Value);
-      else
+      } else {
         Add(Value);
+      }
     }
   }
   return llvm::toHex(Hash.final(), /*LowerCase=*/true);

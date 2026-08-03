@@ -156,6 +156,17 @@ TEST(CompileCommandDriverFingerprint, ToolchainUsesDriverOptionSemantics) {
   EXPECT_NE(compileCommandToolchainFingerprint(First, &Cache),
             compileCommandToolchainFingerprint(Second, &Cache));
 
+  First.Directory = testPath("first-root");
+  First.CommandLine = {"missing-clang++", "-isysroot", testPath("sdk"),
+                       "-isystem", "=Headers"};
+  Second = First;
+  Second.Directory = testPath("second-root");
+  EXPECT_EQ(compileCommandToolchainFingerprint(First, &Cache),
+            compileCommandToolchainFingerprint(Second, &Cache));
+  Second.CommandLine[2] = testPath("other-sdk");
+  EXPECT_NE(compileCommandToolchainFingerprint(First, &Cache),
+            compileCommandToolchainFingerprint(Second, &Cache));
+
   First.CommandLine = {"missing-clang-cl", "/imsvc", testPath("msvc")};
   Second.CommandLine = {"missing-clang-cl", "/imsvc", testPath("other-msvc")};
   EXPECT_NE(compileCommandToolchainFingerprint(First, &Cache),

@@ -269,7 +269,8 @@ TEST(SerializationTest, CompleteGraphRoundTrip) {
   Graph.CommandDigest = graphDigest("command");
   Graph.TargetTriple = "x86_64-unknown-linux-gnu";
   Graph.Language = "cpp";
-  Graph.Sources.push_back({Graph.MainFileURI, graphDigest("int main();"), 1});
+  Graph.Sources.push_back({Graph.MainFileURI, graphDigest("int main();"),
+                           graphDigest("int main();"), 1});
   GraphSymbol Symbol;
   Symbol.USR = "c:@F@main#";
   Symbol.ID = Symbol.USR;
@@ -302,6 +303,8 @@ TEST(SerializationTest, CompleteGraphRoundTrip) {
   EXPECT_EQ(Graph.MainFileURI, RoundTrip.MainFileURI);
   EXPECT_EQ(Graph.CommandLine, RoundTrip.CommandLine);
   EXPECT_EQ(Graph.Sources.front().Digest, RoundTrip.Sources.front().Digest);
+  EXPECT_EQ(Graph.Sources.front().DiskDigest,
+            RoundTrip.Sources.front().DiskDigest);
   EXPECT_EQ(Graph.Symbols.front().ID, RoundTrip.Symbols.front().ID);
   EXPECT_EQ(Graph.Occurrences.front().Roles,
             RoundTrip.Occurrences.front().Roles);

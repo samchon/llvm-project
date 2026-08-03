@@ -1023,10 +1023,14 @@ TEST_F(BackgroundIndexTest, QueryDriverCachesOnlyCompleteSuccess) {
 }
 
 TEST_F(BackgroundIndexTest, QueryDriverScopeDeduplicatesEveryStatus) {
-  for (unsigned Status : {1u, 2u, 3u})
+  for (unsigned Status : {1u, 2u, 3u}) {
     EXPECT_EQ(1u,
               runSystemIncludeExtractorCacheForTest({Status, 0},
                                                     /*OperationLocal=*/true));
+    EXPECT_EQ(1u, runSystemIncludeExtractorCacheForTest(
+                      {Status, 0}, /*OperationLocal=*/true,
+                      /*RefreshQueries=*/true));
+  }
 }
 
 TEST_F(BackgroundIndexTest, QueryDriverTerminationOwnsDescendants) {

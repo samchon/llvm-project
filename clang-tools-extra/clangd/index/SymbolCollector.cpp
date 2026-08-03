@@ -50,6 +50,7 @@
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/Casting.h"
 #include "llvm/Support/ErrorHandling.h"
+#include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/Path.h"
 #include <cassert>
 #include <memory>
@@ -1233,6 +1234,13 @@ void SymbolCollector::recordGraphSource(FileID FID, llvm::StringRef URI,
   GraphSource Source;
   Source.URI = URI.str();
   Source.Digest = graphDigest(Contents);
+  const auto &SM = ASTCtx->getSourceManager();
+  if (auto File = SM.getFileEntryRefForID(FID)) {
+    auto Canonical = getCanonicalPath(*File, SM.getFileManager());
+    llvm::StringRef DiskPath = Canonical ? *Canonical : File->getName();
+    if (auto DiskContents = llvm::MemoryBuffer::getFile(DiskPath))
+      Source.DiskDigest = graphDigest((*DiskContents)->getBuffer());
+  }
   Source.Flags = static_cast<uint32_t>(Flags);
   Graph.Sources.push_back(std::move(Source));
   if (Flags & IncludeGraphNode::SourceFlag::IsTU)

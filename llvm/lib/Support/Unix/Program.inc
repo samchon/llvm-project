@@ -306,36 +306,30 @@ static bool Execute(ProcessInfo &PI, StringRef Program,
       close(OwnershipPipe[0]);
       const bool Owned =
           DetachProcess ? ::setsid() != -1 : ::setpgid(0, 0) != -1;
-      const char Ready = 1;
-      ssize_t Written;
-      do {
-        Written = Owned ? ::write(OwnershipPipe[1], &Ready, sizeof(Ready)) : -1;
-      } while (Written == -1 && Owned && errno == EINTR);
-      close(OwnershipPipe[1]);
-      if (Written != 1)
+      if (!Owned)
         _exit(126);
     }
     // Redirect file descriptors...
     if (!Redirects.empty()) {
       // Redirect stdin
       if (RedirectIO(Redirects[0], 0, ErrMsg)) {
-        return false;
+        _exit(126);
       }
       // Redirect stdout
       if (RedirectIO(Redirects[1], 1, ErrMsg)) {
-        return false;
+        _exit(126);
       }
       if (Redirects[1] && Redirects[2] && *Redirects[1] == *Redirects[2]) {
         // If stdout and stderr should go to the same place, redirect stderr
         // to the FD already open for stdout.
         if (-1 == dup2(1, 2)) {
           MakeErrMsg(ErrMsg, "Can't redirect stderr to stdout");
-          return false;
+          _exit(126);
         }
       } else {
         // Just redirect stderr
         if (RedirectIO(Redirects[2], 2, ErrMsg)) {
-          return false;
+          _exit(126);
         }
       }
     }
@@ -344,13 +338,27 @@ static bool Execute(ProcessInfo &PI, StringRef Program,
       // Detach from controlling terminal
       if (::setsid() == -1) {
         MakeErrMsg(ErrMsg, "Could not detach process, ::setsid failed");
-        return false;
+        _exit(126);
       }
     }
 
     // Set memory limits
     if (MemoryLimit != 0) {
       SetMemoryLimits(MemoryLimit);
+    }
+
+    // Do not tell the parent the owned process is ready until every fallible
+    // child-side setup step has completed. After this point only exec remains,
+    // and its failure is reported through the child's exit status.
+    if (OwnProcessTree) {
+      const char Ready = 1;
+      ssize_t Written;
+      do {
+        Written = ::write(OwnershipPipe[1], &Ready, sizeof(Ready));
+      } while (Written == -1 && errno == EINTR);
+      close(OwnershipPipe[1]);
+      if (Written != 1)
+        _exit(126);
     }
 
     // Execute!
@@ -499,7 +507,7 @@ ProcessInfo llvm::sys::Wait(const ProcessInfo &PI,
           alarm(0);
           sigaction(SIGALRM, &Old, nullptr);
         }
-        return WaitResult;
+        return ProcessInfo();
       }
       if (SecondsToWait && errno == EINTR && !Polling) {
         // Kill the child.

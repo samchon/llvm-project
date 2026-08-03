@@ -131,7 +131,11 @@ struct GraphModule {
 
 struct GraphSource {
   std::string URI;
+  /// SHA-256 of the exact bytes consumed by Clang.
   std::string Digest;
+  /// SHA-256 of the same canonical file's native on-disk bytes at collection
+  /// time, or empty when the source has no readable disk identity.
+  std::string DiskDigest;
   uint32_t Flags = 0;
 };
 

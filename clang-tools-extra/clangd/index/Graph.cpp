@@ -198,15 +198,17 @@ bool moduleFromJSON(const llvm::json::Value &Value, GraphModule &Module,
 }
 
 llvm::json::Value sourceJSON(const GraphSource &Source) {
-  return llvm::json::Object{
-      {"uri", Source.URI}, {"digest", Source.Digest}, {"flags", Source.Flags}};
+  return llvm::json::Object{{"uri", Source.URI},
+                            {"digest", Source.Digest},
+                            {"diskDigest", Source.DiskDigest},
+                            {"flags", Source.Flags}};
 }
 
 bool sourceFromJSON(const llvm::json::Value &Value, GraphSource &Source,
                     llvm::json::Path Path) {
   llvm::json::ObjectMapper O(Value, Path);
   return O && O.map("uri", Source.URI) && O.map("digest", Source.Digest) &&
-         O.map("flags", Source.Flags);
+         O.map("diskDigest", Source.DiskDigest) && O.map("flags", Source.Flags);
 }
 
 llvm::json::Value diagnosticJSON(const GraphDiagnostic &Diagnostic) {

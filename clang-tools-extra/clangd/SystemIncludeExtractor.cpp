@@ -320,6 +320,33 @@ private:
   llvm::DenseMap<DriverArgs, DriverQueryResult<DriverInfo>> Queries;
 };
 
+template <typename Query>
+std::optional<DriverInfo>
+queryDriver(SuccessfulDriverQueryCache &Shared, ScopedDriverQueryCache *Scoped,
+            const DriverArgs &Args, bool Refresh, Query &&RunQuery) {
+  if (Scoped) {
+    if (const auto *Existing = Scoped->get(Args))
+      return Existing->Value;
+    if (!Refresh)
+      if (auto Existing = Shared.get(Args)) {
+        Scoped->publish(Args,
+                        {DriverQueryStatus::Success, std::optional(*Existing)});
+        return Existing;
+      }
+
+    auto Queried = RunQuery();
+    if (Queried.Status == DriverQueryStatus::Success)
+      Queried.Value = Shared.publish(Args, Queried, /*Replace=*/Refresh);
+    auto Result = Queried.Value;
+    Scoped->publish(Args, std::move(Queried));
+    return Result;
+  }
+
+  if (auto Existing = Shared.get(Args))
+    return Existing;
+  return Shared.publish(Args, RunQuery(), /*Replace=*/false);
+}
+
 bool isValidTarget(llvm::StringRef Triple) {
   std::shared_ptr<TargetOptions> TargetOpts(new TargetOptions);
   TargetOpts->Triple = Triple.str();
@@ -660,23 +687,10 @@ public:
     Args.DriverFingerprint = Fingerprints->get(Cmd);
     if (ActiveDriverFingerprints)
       Shared->DriverFingerprints.update(Cmd, Args.DriverFingerprint);
-    std::optional<DriverInfo> Info;
-    if (Scoped && RefreshQueriesInActiveScope) {
-      if (const auto *Existing = Scoped->Queries.get(Args)) {
-        Info = Existing->Value;
-      } else {
-        auto Queried = extractSystemIncludesAndTarget(Args);
-        if (Queried.Status == DriverQueryStatus::Success)
-          Info = Shared->Queries.publish(Args, Queried, /*Replace=*/true);
-        Scoped->Queries.publish(Args, std::move(Queried));
-      }
-    } else {
-      Info = Shared->Queries.get(Args);
-      if (!Info)
-        Info =
-            Shared->Queries.publish(Args, extractSystemIncludesAndTarget(Args),
-                                    /*Replace=*/false);
-    }
+    std::optional<DriverInfo> Info =
+        queryDriver(Shared->Queries, Scoped ? &Scoped->Queries : nullptr, Args,
+                    RefreshQueriesInActiveScope,
+                    [&] { return extractSystemIncludesAndTarget(Args); });
     if (Info) {
       setTarget(addSystemIncludes(Cmd, Info->SystemIncludes), Info->Target);
     }
@@ -701,7 +715,8 @@ runSystemIncludeExtractorForTest(llvm::ArrayRef<llvm::StringRef> Argv,
 
 unsigned
 runSystemIncludeExtractorCacheForTest(llvm::ArrayRef<unsigned> QueryStatuses,
-                                      bool OperationLocal) {
+                                      bool OperationLocal,
+                                      bool RefreshQueries) {
   SuccessfulDriverQueryCache Cache;
   ScopedDriverQueryCache ScopedCache;
   DriverArgs Args = DriverArgs::getEmpty();
@@ -709,20 +724,16 @@ runSystemIncludeExtractorCacheForTest(llvm::ArrayRef<unsigned> QueryStatuses,
   Args.Lang = "c++";
   unsigned Queries = 0;
   for (unsigned RawStatus : QueryStatuses) {
-    if (OperationLocal ? ScopedCache.get(Args) != nullptr
-                       : Cache.get(Args).has_value())
-      continue;
-    ++Queries;
-    assert(RawStatus <= unsigned(DriverQueryStatus::TimedOut));
-    const auto Status = static_cast<DriverQueryStatus>(RawStatus);
-    DriverQueryResult<DriverInfo> Result{Status,
-                                         Status == DriverQueryStatus::Success
-                                             ? std::optional(DriverInfo{})
-                                             : std::nullopt};
-    if (OperationLocal)
-      ScopedCache.publish(Args, std::move(Result));
-    else
-      Cache.publish(Args, std::move(Result), /*Replace=*/false);
+    queryDriver(Cache, OperationLocal ? &ScopedCache : nullptr, Args,
+                RefreshQueries, [&] {
+                  ++Queries;
+                  assert(RawStatus <= unsigned(DriverQueryStatus::TimedOut));
+                  const auto Status = static_cast<DriverQueryStatus>(RawStatus);
+                  return DriverQueryResult<DriverInfo>{
+                      Status, Status == DriverQueryStatus::Success
+                                  ? std::optional(DriverInfo{})
+                                  : std::nullopt};
+                });
   }
   return Queries;
 }

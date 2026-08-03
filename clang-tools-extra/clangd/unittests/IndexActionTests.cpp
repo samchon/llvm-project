@@ -16,6 +16,9 @@
 #include "clang/Basic/SourceLocation.h"
 #include "clang/Basic/SourceManager.h"
 #include "clang/Tooling/Tooling.h"
+#include "llvm/Support/FileSystem.h"
+#include "llvm/Support/FileUtilities.h"
+#include "llvm/Support/raw_ostream.h"
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
 #include <string>
@@ -214,6 +217,30 @@ Derived make() { return Derived{}; }
     return !Symbol.Declaration.valid() ||
            Symbol.Declaration.EndColumn >= Symbol.Declaration.StartColumn;
   }));
+}
+
+TEST_F(IndexActionTest, GraphDistinguishesCheckerAndDiskDigests) {
+  Opts.CollectGraph = true;
+  int FD = -1;
+  llvm::SmallString<128> Main;
+  ASSERT_FALSE(llvm::sys::fs::createTemporaryFile("clangd-graph-source", "cpp",
+                                                  FD, Main));
+  llvm::FileRemover Cleanup(Main);
+  constexpr llvm::StringLiteral DiskContents = "int fromDisk;\n";
+  {
+    llvm::raw_fd_ostream OS(FD, /*shouldClose=*/true);
+    OS << DiskContents;
+  }
+  constexpr llvm::StringLiteral CheckerContents = "int fromOverlay;\n";
+  addFile(Main, CheckerContents);
+
+  IndexFileIn Indexed = runIndexingAction(Main);
+  ASSERT_EQ(1u, Indexed.Graphs.size());
+  ASSERT_EQ(1u, Indexed.Graphs.front().Sources.size());
+  const GraphSource &Source = Indexed.Graphs.front().Sources.front();
+  EXPECT_EQ(graphDigest(CheckerContents), Source.Digest);
+  EXPECT_EQ(graphDigest(DiskContents), Source.DiskDigest);
+  EXPECT_NE(Source.Digest, Source.DiskDigest);
 }
 
 TEST_F(IndexActionTest, GraphOffsetsAreFixedUTF16AndDoNotSaturate) {

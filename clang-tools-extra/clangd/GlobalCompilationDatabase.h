@@ -224,7 +224,8 @@ runSystemIncludeExtractorForTest(llvm::ArrayRef<llvm::StringRef> Argv,
 /// cancellation (2), and timeout (3) query outcomes.
 unsigned
 runSystemIncludeExtractorCacheForTest(llvm::ArrayRef<unsigned> QueryStatuses,
-                                      bool OperationLocal = false);
+                                      bool OperationLocal = false,
+                                      bool RefreshQueries = false);
 
 /// Bounds driver hashing and optional query-driver refresh to one CDB
 /// operation. Identical work is deduplicated within the scope. A refresh scope

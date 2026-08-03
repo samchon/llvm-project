@@ -31,6 +31,7 @@
 #include "llvm/Support/Program.h"
 #include "llvm/Support/SHA256.h"
 #include <iterator>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <vector>
@@ -231,6 +232,7 @@ compileCommandDriverFingerprint(const tooling::CompileCommand &Command) {
 }
 
 struct CompileCommandDriverFingerprintCache::Impl {
+  std::mutex Mu;
   llvm::StringMap<std::string> Fingerprints;
 };
 
@@ -247,11 +249,19 @@ CompileCommandDriverFingerprintCache::operator=(
 std::string CompileCommandDriverFingerprintCache::get(
     const tooling::CompileCommand &Command) {
   const std::string Driver = resolvedCompileCommandDriver(Command);
+  std::lock_guard<std::mutex> Lock(State->Mu);
   auto Existing = State->Fingerprints.find(Driver);
   if (Existing != State->Fingerprints.end())
     return Existing->getValue();
   return State->Fingerprints.try_emplace(Driver, driverFingerprint(Driver))
       .first->getValue();
+}
+
+void CompileCommandDriverFingerprintCache::update(
+    const tooling::CompileCommand &Command, llvm::StringRef Fingerprint) {
+  const std::string Driver = resolvedCompileCommandDriver(Command);
+  std::lock_guard<std::mutex> Lock(State->Mu);
+  State->Fingerprints[Driver] = Fingerprint.str();
 }
 
 std::string compileCommandToolchainFingerprint(
@@ -267,9 +277,62 @@ std::string compileCommandToolchainFingerprint(
     Hash.update(llvm::StringRef(&Separator, 1));
   };
   Add(Driver);
-  Add(Command.Directory);
-  for (const auto &Argument : Command.CommandLine)
-    Add(Argument);
+  auto AddPath = [&](llvm::StringRef Value) {
+    llvm::SmallString<256> Absolute(Value);
+    if (!llvm::sys::path::is_absolute(Absolute))
+      llvm::sys::path::make_absolute(Command.Directory, Absolute);
+    llvm::sys::path::remove_dots(Absolute, /*remove_dot_dot=*/true);
+    llvm::sys::path::convert_to_slash(Absolute);
+    Add(Absolute);
+  };
+  auto AddSeparate = [&](llvm::StringRef Option, size_t &Index) {
+    Add(Option);
+    if (++Index < Command.CommandLine.size())
+      AddPath(Command.CommandLine[Index]);
+  };
+  auto AddJoinedPath = [&](llvm::StringRef Argument,
+                           llvm::StringRef Prefix) -> bool {
+    if (!Argument.consume_front(Prefix) || Argument.empty())
+      return false;
+    Add(Prefix);
+    AddPath(Argument);
+    return true;
+  };
+  for (size_t I = 1; I < Command.CommandLine.size(); ++I) {
+    llvm::StringRef Argument = Command.CommandLine[I];
+    if (Argument == "-isystem" || Argument == "-internal-isystem" ||
+        Argument == "-internal-externc-isystem" || Argument == "-isysroot" ||
+        Argument == "--sysroot" || Argument == "-resource-dir" ||
+        Argument == "--gcc-toolchain" || Argument == "-gcc-toolchain" ||
+        Argument == "-iframework" || Argument == "/imsvc" ||
+        Argument == "/external:I") {
+      AddSeparate(Argument, I);
+      continue;
+    }
+    if (AddJoinedPath(Argument, "--sysroot=") ||
+        AddJoinedPath(Argument, "-resource-dir=") ||
+        AddJoinedPath(Argument, "--gcc-toolchain=") ||
+        AddJoinedPath(Argument, "-gcc-toolchain=") ||
+        AddJoinedPath(Argument, "-isystem") ||
+        AddJoinedPath(Argument, "-internal-isystem") ||
+        AddJoinedPath(Argument, "-internal-externc-isystem") ||
+        AddJoinedPath(Argument, "-isysroot") ||
+        AddJoinedPath(Argument, "-iframework") ||
+        AddJoinedPath(Argument, "/imsvc") ||
+        AddJoinedPath(Argument, "/external:I"))
+      continue;
+    if (Argument == "-target" || Argument == "--target" ||
+        Argument == "-arch" || Argument == "-stdlib" ||
+        Argument == "--stdlib") {
+      Add(Argument);
+      if (++I < Command.CommandLine.size())
+        Add(Command.CommandLine[I]);
+      continue;
+    }
+    if (Argument.starts_with("--target=") || Argument.starts_with("-stdlib=") ||
+        Argument.starts_with("--stdlib="))
+      Add(Argument);
+  }
   return llvm::toHex(Hash.final(), /*LowerCase=*/true);
 }
 

@@ -9,6 +9,7 @@
 #include "CompileCommands.h"
 #include "Config.h"
 #include "TestFS.h"
+#include "index/Graph.h"
 #include "support/Context.h"
 
 #include "clang/Testing/CommandLineArgs.h"
@@ -105,6 +106,31 @@ TEST(CompileCommandDriverFingerprint, ToolchainIncludesEffectiveQueryOutput) {
   const std::string First = compileCommandToolchainFingerprint(Command, &Cache);
   Command.CommandLine[2] = testPath("v2");
   EXPECT_NE(First, compileCommandToolchainFingerprint(Command, &Cache));
+}
+
+TEST(CompileCommandDriverFingerprint, ToolchainExcludesTUConfiguration) {
+  tooling::CompileCommand First;
+  First.Directory = testPath("first");
+  First.Filename = testPath("first/input.cc");
+  First.CommandLine = {"missing-clang++",
+                       "-isystem",
+                       testPath("toolchain/include"),
+                       "--target=x86_64-unknown-linux-gnu",
+                       "-DFIRST",
+                       "-o",
+                       "first.o",
+                       First.Filename};
+  tooling::CompileCommand Second = First;
+  Second.Directory = testPath("second");
+  Second.Filename = testPath("second/input.cc");
+  Second.CommandLine[4] = "-DSECOND";
+  Second.CommandLine[6] = "second.o";
+  Second.CommandLine[7] = Second.Filename;
+
+  CompileCommandDriverFingerprintCache Cache;
+  EXPECT_EQ(compileCommandToolchainFingerprint(First, &Cache),
+            compileCommandToolchainFingerprint(Second, &Cache));
+  EXPECT_NE(graphCommandDigest(First), graphCommandDigest(Second));
 }
 
 // Make use of all features and assert the exact command we get out.

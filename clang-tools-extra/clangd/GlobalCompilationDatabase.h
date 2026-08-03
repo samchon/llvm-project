@@ -16,8 +16,10 @@
 #include "support/ThreadsafeFS.h"
 #include "clang/Tooling/ArgumentsAdjusters.h"
 #include "clang/Tooling/CompilationDatabase.h"
+#include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/FunctionExtras.h"
 #include "llvm/ADT/StringMap.h"
+#include <chrono>
 #include <cstdint>
 #include <memory>
 #include <mutex>
@@ -212,13 +214,22 @@ using SystemIncludeExtractorFn = llvm::unique_function<void(
 SystemIncludeExtractorFn
 getSystemIncludeExtractor(llvm::ArrayRef<std::string> QueryDriverGlobs);
 
+/// Exercises the bounded, cancellable query-driver process runner.
+std::optional<std::string>
+runSystemIncludeExtractorForTest(llvm::ArrayRef<llvm::StringRef> Argv,
+                                 bool OutputIsStderr,
+                                 std::chrono::milliseconds Timeout);
+
 /// Bounds driver hashing and optional query-driver refresh to one CDB
 /// operation. Identical work is deduplicated within the scope. A refresh scope
 /// is used by graph publication to validate arbitrary wrapper-owned toolchain
 /// state rather than trusting a process-lifetime memoized result.
 class SystemIncludeExtractorScope {
 public:
-  explicit SystemIncludeExtractorScope(bool RefreshQueries);
+  explicit SystemIncludeExtractorScope(
+      bool RefreshQueries,
+      std::shared_ptr<CompileCommandDriverFingerprintCache> DriverFingerprints =
+          nullptr);
   ~SystemIncludeExtractorScope();
   SystemIncludeExtractorScope(const SystemIncludeExtractorScope &) = delete;
   SystemIncludeExtractorScope &
@@ -230,7 +241,7 @@ private:
   uint64_t Previous = 0;
   bool PreviousRefresh = false;
   CompileCommandDriverFingerprintCache *PreviousDriverFingerprints = nullptr;
-  std::unique_ptr<CompileCommandDriverFingerprintCache> DriverFingerprints;
+  std::shared_ptr<CompileCommandDriverFingerprintCache> DriverFingerprints;
 };
 
 /// Wraps another compilation database, and supports overriding the commands

@@ -15,14 +15,17 @@
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/FileUtilities.h"
+#include "llvm/Support/Process.h"
 #include "llvm/Support/ScopedPrinter.h"
 #include "llvm/Support/raw_ostream.h"
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
 #include <chrono>
 #include <condition_variable>
+#include <cstdlib>
 #include <deque>
 #include <mutex>
+#include <thread>
 
 using ::testing::_;
 using ::testing::AllOf;
@@ -72,6 +75,31 @@ void expectContentModified(llvm::Expected<llvm::json::Value> Result) {
       });
   EXPECT_TRUE(Matched);
 }
+
+bool updateEnvironment(llvm::StringRef Name,
+                       const std::optional<std::string> &Value) {
+#if defined(_WIN32)
+  return ::_putenv_s(Name.str().c_str(), Value ? Value->c_str() : "") == 0;
+#else
+  return Value ? ::setenv(Name.str().c_str(), Value->c_str(), 1) == 0
+               : ::unsetenv(Name.str().c_str()) == 0;
+#endif
+}
+
+class ScopedEnvironmentUnset {
+public:
+  explicit ScopedEnvironmentUnset(llvm::StringRef Name)
+      : Name(Name.str()), Previous(llvm::sys::Process::GetEnv(Name)),
+        Cleared(updateEnvironment(Name, std::nullopt)) {}
+  ~ScopedEnvironmentUnset() { updateEnvironment(Name, Previous); }
+
+  explicit operator bool() const { return Cleared; }
+
+private:
+  std::string Name;
+  std::optional<std::string> Previous;
+  bool Cleared;
+};
 
 class MemoryShardStorage : public BackgroundIndexStorage {
   mutable std::mutex StorageMu;
@@ -883,6 +911,51 @@ TEST_F(BackgroundIndexTest, GraphSnapshotHonorsRequestCancellation) {
   llvm::consumeError(std::move(Error));
 }
 
+TEST(SystemIncludeExtractorSubprocess, DISABLED_Sleeps) {
+  std::this_thread::sleep_for(std::chrono::seconds(60));
+}
+
+TEST_F(BackgroundIndexTest, QueryDriverExecutionIsCancellable) {
+  ScopedEnvironmentUnset TotalShards("GTEST_TOTAL_SHARDS");
+  ScopedEnvironmentUnset ShardIndex("GTEST_SHARD_INDEX");
+  ASSERT_TRUE(TotalShards);
+  ASSERT_TRUE(ShardIndex);
+  const std::string Executable =
+      llvm::sys::fs::getMainExecutable(nullptr, nullptr);
+  llvm::SmallVector<llvm::StringRef> Args = {
+      Executable, "--gtest_also_run_disabled_tests",
+      "--gtest_filter=SystemIncludeExtractorSubprocess.DISABLED_Sleeps"};
+  auto Task = cancelableTask();
+  std::thread Canceller([&] {
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    Task.second();
+  });
+  const auto Started = std::chrono::steady_clock::now();
+  WithContext Cancellable(std::move(Task.first));
+  EXPECT_FALSE(runSystemIncludeExtractorForTest(Args, /*OutputIsStderr=*/false,
+                                                std::chrono::seconds(30)));
+  Canceller.join();
+  EXPECT_LT(std::chrono::steady_clock::now() - Started,
+            std::chrono::seconds(5));
+}
+
+TEST_F(BackgroundIndexTest, QueryDriverExecutionHasFiniteTimeout) {
+  ScopedEnvironmentUnset TotalShards("GTEST_TOTAL_SHARDS");
+  ScopedEnvironmentUnset ShardIndex("GTEST_SHARD_INDEX");
+  ASSERT_TRUE(TotalShards);
+  ASSERT_TRUE(ShardIndex);
+  const std::string Executable =
+      llvm::sys::fs::getMainExecutable(nullptr, nullptr);
+  llvm::SmallVector<llvm::StringRef> Args = {
+      Executable, "--gtest_also_run_disabled_tests",
+      "--gtest_filter=SystemIncludeExtractorSubprocess.DISABLED_Sleeps"};
+  const auto Started = std::chrono::steady_clock::now();
+  EXPECT_FALSE(runSystemIncludeExtractorForTest(
+      Args, /*OutputIsStderr=*/false, std::chrono::milliseconds(100)));
+  EXPECT_LT(std::chrono::steady_clock::now() - Started,
+            std::chrono::seconds(5));
+}
+
 TEST_F(BackgroundIndexTest, WatchedMetadataIsNotATranslationUnit) {
   MockFS FS;
   llvm::StringMap<std::string> Storage;
@@ -1291,6 +1364,41 @@ TEST_F(BackgroundIndexTest, CompleteMultiConfigurationGraphSnapshot) {
 
   CDB.Commands[File][1].CommandLine.push_back("-DCOMMAND_MOVED");
   expectContentModified(Idx.graphSnapshot({}));
+}
+
+TEST_F(BackgroundIndexTest, SharedDriverProducesOneToolchainCoordinate) {
+  MockFS FS;
+  llvm::StringMap<std::string> Storage;
+  size_t CacheHits = 0;
+  MemoryShardStorage MSS(Storage, CacheHits);
+  MultiCommandCDB CDB;
+  std::vector<std::string> Files;
+  for (const char *Name : {"first.cc", "second.cc"}) {
+    const std::string File = testPath(Name);
+    Files.push_back(File);
+    FS.Files[File] =
+        (llvm::Twine("int ") + llvm::sys::path::stem(Name) + "();").str();
+    tooling::CompileCommand Command;
+    Command.Directory = testRoot();
+    Command.Filename = File;
+    Command.CommandLine = {
+        "clang++", "-fsyntax-only",
+        (llvm::Twine("-DGRAPH_") + llvm::sys::path::stem(Name).upper()).str(),
+        File};
+    CDB.Commands[File] = {std::move(Command)};
+  }
+
+  BackgroundIndex Idx(FS, CDB, [&](llvm::StringRef) { return &MSS; }, {});
+  Idx.enqueue(Files);
+  ASSERT_TRUE(Idx.blockUntilIdleForTest());
+  auto Snapshot = Idx.graphSnapshot({});
+  ASSERT_TRUE(bool(Snapshot)) << llvm::toString(Snapshot.takeError());
+  const auto *Universe = Snapshot->getAsObject()->getObject("universe");
+  ASSERT_TRUE(Universe);
+  ASSERT_TRUE(Universe->getArray("toolchains"));
+  ASSERT_TRUE(Universe->getArray("configurations"));
+  EXPECT_EQ(1u, Universe->getArray("toolchains")->size());
+  EXPECT_EQ(2u, Universe->getArray("configurations")->size());
 }
 
 TEST_F(BackgroundIndexTest, GeneratedHeaderCreationRetriesFailedGraph) {

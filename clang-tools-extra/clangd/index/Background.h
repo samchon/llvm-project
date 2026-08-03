@@ -30,6 +30,7 @@
 #include <condition_variable>
 #include <deque>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <queue>
@@ -298,7 +299,9 @@ private:
 
   BackgroundQueue::Task
   changedFilesTask(const std::vector<std::string> &ChangedFiles);
-  BackgroundQueue::Task indexFileTask(std::string Path);
+  BackgroundQueue::Task indexFileTask(
+      std::string Path,
+      std::shared_ptr<CompileCommandDriverFingerprintCache> DriverFingerprints);
   void enqueueGraphReindex(llvm::ArrayRef<std::string> MainFiles);
 
   // from lowest to highest priority

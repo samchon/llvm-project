@@ -63,8 +63,9 @@ compileCommandDriverFingerprint(const tooling::CompileCommand &Command);
 /// Deduplicates exact driver hashing within one bounded operation.
 ///
 /// A cache instance is intentionally scoped by its caller (for example, one
-/// graph validation or one TU/configuration batch). The first command for a
-/// resolved driver reads its exact bytes; later commands reuse that result.
+/// graph validation or one project indexing batch). The first command for a
+/// resolved driver reads its exact bytes; concurrent and later commands reuse
+/// that result.
 class CompileCommandDriverFingerprintCache {
 public:
   CompileCommandDriverFingerprintCache();
@@ -78,14 +79,17 @@ public:
   operator=(const CompileCommandDriverFingerprintCache &) = delete;
 
   std::string get(const tooling::CompileCommand &Command);
+  void update(const tooling::CompileCommand &Command,
+              llvm::StringRef Fingerprint);
 
 private:
   struct Impl;
   std::unique_ptr<Impl> State;
 };
 
-/// Fingerprints the exact driver together with the effective command that
-/// determines its target and include universe.
+/// Fingerprints the exact driver together with effective toolchain coordinates
+/// such as target, sysroot, resource directory, and system include paths.
+/// Per-TU configuration remains represented by graphCommandDigest().
 std::string compileCommandToolchainFingerprint(
     const tooling::CompileCommand &Command,
     CompileCommandDriverFingerprintCache *DriverCache = nullptr);

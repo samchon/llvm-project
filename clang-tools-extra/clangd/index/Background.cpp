@@ -300,7 +300,10 @@ BackgroundQueue::Task BackgroundIndex::changedFilesTask(
     log("Enqueueing {0} commands for indexing", ChangedFiles.size());
     SPAN_ATTACH(Tracer, "files", int64_t(ChangedFiles.size()));
 
-    SystemIncludeExtractorScope SystemIncludes(/*RefreshQueries=*/false);
+    auto DriverFingerprints =
+        std::make_shared<CompileCommandDriverFingerprintCache>();
+    SystemIncludeExtractorScope SystemIncludes(/*RefreshQueries=*/false,
+                                               DriverFingerprints);
     auto NeedsReIndexing = loadProject(std::move(ChangedFiles));
     {
       std::lock_guard<std::mutex> Lock(GraphMu);
@@ -315,7 +318,7 @@ BackgroundQueue::Task BackgroundIndex::changedFilesTask(
     std::vector<BackgroundQueue::Task> Tasks;
     Tasks.reserve(NeedsReIndexing.size());
     for (const auto &File : NeedsReIndexing)
-      Tasks.push_back(indexFileTask(std::move(File)));
+      Tasks.push_back(indexFileTask(File, DriverFingerprints));
     Queue.append(std::move(Tasks));
   });
 
@@ -333,8 +336,10 @@ void BackgroundIndex::enqueueGraphReindex(
   }
   std::vector<BackgroundQueue::Task> Tasks;
   Tasks.reserve(MainFiles.size());
+  auto DriverFingerprints =
+      std::make_shared<CompileCommandDriverFingerprintCache>();
   for (const auto &File : MainFiles)
-    Tasks.push_back(indexFileTask(File));
+    Tasks.push_back(indexFileTask(File, DriverFingerprints));
   Queue.append(std::move(Tasks));
 }
 
@@ -356,14 +361,18 @@ static bool isGraphTranslationUnit(llvm::StringRef Path) {
   return false;
 }
 
-BackgroundQueue::Task BackgroundIndex::indexFileTask(std::string Path) {
+BackgroundQueue::Task BackgroundIndex::indexFileTask(
+    std::string Path,
+    std::shared_ptr<CompileCommandDriverFingerprintCache> DriverFingerprints) {
   std::string Tag = filenameWithoutExtension(Path).str();
   uint64_t Key = llvm::xxh3_64bits(graphMainKey(Path));
-  BackgroundQueue::Task T([this, Path(std::move(Path))] {
+  BackgroundQueue::Task T([this, Path(std::move(Path)),
+                           DriverFingerprints(std::move(DriverFingerprints))] {
     std::optional<WithContext> WithProvidedContext;
     if (ContextProvider)
       WithProvidedContext.emplace(ContextProvider(Path));
-    SystemIncludeExtractorScope SystemIncludes(/*RefreshQueries=*/false);
+    SystemIncludeExtractorScope SystemIncludes(/*RefreshQueries=*/false,
+                                               DriverFingerprints);
     auto Commands = CDB.getCompileCommands(Path);
     std::optional<std::string> LegacyCommandDigest;
     std::optional<tooling::CompileCommand> UnsupportedLegacyCommand;
@@ -1188,6 +1197,8 @@ BackgroundIndex::graphSnapshot(const GraphSnapshotParams &Params) {
           Expected[graphCommandDigest(Command)] =
               compileCommandToolchainFingerprint(
                   Command, &RefreshSystemIncludes.driverFingerprints());
+      if (llvm::Error Err = CheckCancellation())
+        return Err;
       if (Expected.size() != Main.second.size() ||
           llvm::any_of(Expected, [&](const auto &Entry) {
             auto Actual = Main.second.find(Entry.getKey());
@@ -1198,6 +1209,8 @@ BackgroundIndex::graphSnapshot(const GraphSnapshotParams &Params) {
       }
     }
     if (!Mismatched.empty()) {
+      if (llvm::Error Err = CheckCancellation())
+        return Err;
       enqueueGraphReindex(Mismatched);
       return contentModified(
           "graph snapshot is reindexing {0} translation units with moved "
@@ -1393,6 +1406,8 @@ BackgroundIndex::graphSnapshot(const GraphSnapshotParams &Params) {
         Expected[graphCommandDigest(Command)] =
             compileCommandToolchainFingerprint(
                 Command, &RefreshSystemIncludes.driverFingerprints());
+    if (llvm::Error Err = CheckCancellation())
+      return std::move(Err);
     if (Expected.size() != Main.second.size() ||
         llvm::any_of(Expected, [&](const auto &Entry) {
           auto Actual = Main.second.find(Entry.getKey());
@@ -1403,6 +1418,8 @@ BackgroundIndex::graphSnapshot(const GraphSnapshotParams &Params) {
     }
   }
   if (!Mismatched.empty()) {
+    if (llvm::Error Err = CheckCancellation())
+      return std::move(Err);
     enqueueGraphReindex(Mismatched);
     return contentModified(
         "graph snapshot is reindexing {0} translation units with moved "

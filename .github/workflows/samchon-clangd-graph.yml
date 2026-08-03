@@ -26,7 +26,7 @@ jobs:
     name: ${{ matrix.os }}
     if: github.repository == 'samchon/llvm-project'
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 120
+    timeout-minutes: 240
     strategy:
       fail-fast: false
       matrix:

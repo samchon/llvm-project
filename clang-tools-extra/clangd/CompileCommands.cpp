@@ -285,53 +285,52 @@ std::string compileCommandToolchainFingerprint(
     llvm::sys::path::convert_to_slash(Absolute);
     Add(Absolute);
   };
-  auto AddSeparate = [&](llvm::StringRef Option, size_t &Index) {
-    Add(Option);
-    if (++Index < Command.CommandLine.size())
-      AddPath(Command.CommandLine[Index]);
-  };
-  auto AddJoinedPath = [&](llvm::StringRef Argument,
-                           llvm::StringRef Prefix) -> bool {
-    if (!Argument.consume_front(Prefix) || Argument.empty())
-      return false;
-    Add(Prefix);
-    AddPath(Argument);
-    return true;
-  };
-  for (size_t I = 1; I < Command.CommandLine.size(); ++I) {
-    llvm::StringRef Argument = Command.CommandLine[I];
-    if (Argument == "-isystem" || Argument == "-internal-isystem" ||
-        Argument == "-internal-externc-isystem" || Argument == "-isysroot" ||
-        Argument == "--sysroot" || Argument == "-resource-dir" ||
-        Argument == "--gcc-toolchain" || Argument == "-gcc-toolchain" ||
-        Argument == "-iframework" || Argument == "/imsvc" ||
-        Argument == "/external:I") {
-      AddSeparate(Argument, I);
+  llvm::SmallVector<const char *, 16> OriginalArgs;
+  OriginalArgs.reserve(Command.CommandLine.size());
+  for (const std::string &Argument : Command.CommandLine)
+    OriginalArgs.push_back(Argument.c_str());
+  if (OriginalArgs.empty())
+    return llvm::toHex(Hash.final(), /*LowerCase=*/true);
+  const bool IsCLMode = driver::IsClangCL(driver::getDriverMode(
+      OriginalArgs.front(), llvm::ArrayRef(OriginalArgs).drop_front()));
+  unsigned MissingArgIndex = 0;
+  unsigned MissingArgCount = 0;
+  auto Args = getDriverOptTable().ParseArgs(
+      llvm::ArrayRef(OriginalArgs).drop_front(), MissingArgIndex,
+      MissingArgCount,
+      llvm::opt::Visibility(IsCLMode ? options::CLOption
+                                     : options::ClangOption));
+  for (const llvm::opt::Arg *Arg : Args) {
+    const llvm::opt::Option Option = Arg->getOption();
+    const bool IsPath = Option.matches(options::OPT_isystem) ||
+                        Option.matches(options::OPT_isystem_after) ||
+                        Option.matches(options::OPT_internal_isystem) ||
+                        Option.matches(options::OPT_internal_externc_isystem) ||
+                        Option.matches(options::OPT_isysroot) ||
+                        Option.matches(options::OPT__sysroot_EQ) ||
+                        Option.matches(options::OPT_resource_dir) ||
+                        Option.matches(options::OPT_resource_dir_EQ) ||
+                        Option.matches(options::OPT_gcc_toolchain) ||
+                        Option.matches(options::OPT_iframework) ||
+                        Option.matches(options::OPT_iframeworkwithsysroot) ||
+                        Option.matches(options::OPT_iwithsysroot) ||
+                        Option.matches(options::OPT_stdlibxx_isystem) ||
+                        Option.matches(options::OPT__SLASH_imsvc) ||
+                        Option.matches(options::OPT__SLASH_winsysroot);
+    const bool IsCoordinate =
+        IsPath || Option.matches(options::OPT_target) ||
+        Option.matches(options::OPT_target_legacy_spelling) ||
+        Option.matches(options::OPT_arch) ||
+        Option.matches(options::OPT_stdlib_EQ);
+    if (!IsCoordinate)
       continue;
+    Add(Option.getUnaliasedOption().getName());
+    for (llvm::StringRef Value : Arg->getValues()) {
+      if (IsPath && !Value.starts_with("="))
+        AddPath(Value);
+      else
+        Add(Value);
     }
-    if (AddJoinedPath(Argument, "--sysroot=") ||
-        AddJoinedPath(Argument, "-resource-dir=") ||
-        AddJoinedPath(Argument, "--gcc-toolchain=") ||
-        AddJoinedPath(Argument, "-gcc-toolchain=") ||
-        AddJoinedPath(Argument, "-isystem") ||
-        AddJoinedPath(Argument, "-internal-isystem") ||
-        AddJoinedPath(Argument, "-internal-externc-isystem") ||
-        AddJoinedPath(Argument, "-isysroot") ||
-        AddJoinedPath(Argument, "-iframework") ||
-        AddJoinedPath(Argument, "/imsvc") ||
-        AddJoinedPath(Argument, "/external:I"))
-      continue;
-    if (Argument == "-target" || Argument == "--target" ||
-        Argument == "-arch" || Argument == "-stdlib" ||
-        Argument == "--stdlib") {
-      Add(Argument);
-      if (++I < Command.CommandLine.size())
-        Add(Command.CommandLine[I]);
-      continue;
-    }
-    if (Argument.starts_with("--target=") || Argument.starts_with("-stdlib=") ||
-        Argument.starts_with("--stdlib="))
-      Add(Argument);
   }
   return llvm::toHex(Hash.final(), /*LowerCase=*/true);
 }

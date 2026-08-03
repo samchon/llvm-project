@@ -47,8 +47,9 @@ using process_t = procid_t;
 struct ProcessInfo {
   static constexpr procid_t InvalidPid = 0;
 
-  procid_t Pid;      /// The process identifier.
-  process_t Process; /// Platform-dependent process object.
+  procid_t Pid;           /// The process identifier.
+  process_t Process;      /// Platform-dependent process object.
+  process_t ProcessGroup; /// Owned process tree, or the invalid platform value.
 
   /// The return code, set after execution.
   int ReturnCode;
@@ -156,7 +157,18 @@ LLVM_ABI ProcessInfo ExecuteNoWait(
     /// If true the executed program detatches from the controlling
     /// terminal. I/O streams such as llvm::outs, llvm::errs, and stdin will
     /// be closed until redirected to another output location
-    bool DetachProcess = false);
+    bool DetachProcess = false,
+    /// If true, the process and all descendants are placed in a private
+    /// platform ownership boundary. Wait closes that boundary after the root
+    /// exits, and TerminateProcessTree retires the whole tree.
+    bool OwnProcessTree = false);
+
+/// Forcefully terminates the process and every descendant in the private
+/// ownership boundary requested through ExecuteNoWait, then waits for the
+/// exact root process. Falls back to terminating only the root when no such
+/// boundary exists.
+LLVM_ABI ProcessInfo TerminateProcessTree(const ProcessInfo &PI,
+                                          std::string *ErrMsg = nullptr);
 
 /// Return true if the given arguments fit within system-specific
 /// argument length limits.

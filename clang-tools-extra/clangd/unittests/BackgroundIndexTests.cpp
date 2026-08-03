@@ -13,6 +13,7 @@
 #include "clang/Tooling/ArgumentsAdjusters.h"
 #include "clang/Tooling/CompilationDatabase.h"
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/ScopeExit.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/FileUtilities.h"
 #include "llvm/Support/Process.h"
@@ -915,6 +916,38 @@ TEST(SystemIncludeExtractorSubprocess, DISABLED_Sleeps) {
   std::this_thread::sleep_for(std::chrono::seconds(60));
 }
 
+TEST(SystemIncludeExtractorSubprocess, DISABLED_Exits) {}
+
+TEST(SystemIncludeExtractorSubprocess, DISABLED_WritesAfterDelay) {
+  const auto Ready = llvm::sys::Process::GetEnv("CLANGD_QUERY_DRIVER_READY");
+  const auto Done = llvm::sys::Process::GetEnv("CLANGD_QUERY_DRIVER_DONE");
+  ASSERT_TRUE(Ready);
+  ASSERT_TRUE(Done);
+  std::error_code EC;
+  llvm::raw_fd_ostream(*Ready, EC).close();
+  ASSERT_FALSE(EC);
+  std::this_thread::sleep_for(std::chrono::seconds(2));
+  llvm::raw_fd_ostream(*Done, EC).close();
+  ASSERT_FALSE(EC);
+}
+
+TEST(SystemIncludeExtractorSubprocess, DISABLED_SpawnsGrandchild) {
+  const std::string Executable =
+      llvm::sys::fs::getMainExecutable(nullptr, nullptr);
+  llvm::SmallVector<llvm::StringRef> Args = {
+      Executable, "--gtest_also_run_disabled_tests",
+      "--gtest_filter=SystemIncludeExtractorSubprocess."
+      "DISABLED_WritesAfterDelay"};
+  std::string Error;
+  bool ExecutionFailed = false;
+  auto Grandchild = llvm::sys::ExecuteNoWait(
+      Executable, Args, /*Env=*/std::nullopt, /*Redirects=*/{},
+      /*MemoryLimit=*/0, &Error, &ExecutionFailed);
+  ASSERT_FALSE(ExecutionFailed) << Error;
+  ASSERT_NE(Grandchild.Pid, llvm::sys::ProcessInfo::InvalidPid);
+  std::this_thread::sleep_for(std::chrono::seconds(60));
+}
+
 TEST_F(BackgroundIndexTest, QueryDriverExecutionIsCancellable) {
   ScopedEnvironmentUnset TotalShards("GTEST_TOTAL_SHARDS");
   ScopedEnvironmentUnset ShardIndex("GTEST_SHARD_INDEX");
@@ -954,6 +987,78 @@ TEST_F(BackgroundIndexTest, QueryDriverExecutionHasFiniteTimeout) {
       Args, /*OutputIsStderr=*/false, std::chrono::milliseconds(100)));
   EXPECT_LT(std::chrono::steady_clock::now() - Started,
             std::chrono::seconds(5));
+}
+
+TEST_F(BackgroundIndexTest, QueryDriverExecutionIsConcurrentAndExact) {
+  ScopedEnvironmentUnset TotalShards("GTEST_TOTAL_SHARDS");
+  ScopedEnvironmentUnset ShardIndex("GTEST_SHARD_INDEX");
+  ASSERT_TRUE(TotalShards);
+  ASSERT_TRUE(ShardIndex);
+  const std::string Executable =
+      llvm::sys::fs::getMainExecutable(nullptr, nullptr);
+  llvm::SmallVector<llvm::StringRef> SlowArgs = {
+      Executable, "--gtest_also_run_disabled_tests",
+      "--gtest_filter=SystemIncludeExtractorSubprocess.DISABLED_Sleeps"};
+  llvm::SmallVector<llvm::StringRef> FastArgs = {
+      Executable, "--gtest_also_run_disabled_tests",
+      "--gtest_filter=SystemIncludeExtractorSubprocess.DISABLED_Exits"};
+  std::optional<std::string> Slow;
+  std::optional<std::string> Fast;
+  std::thread SlowQuery([&] {
+    Slow = runSystemIncludeExtractorForTest(SlowArgs, /*OutputIsStderr=*/false,
+                                            std::chrono::milliseconds(100));
+  });
+  std::thread FastQuery([&] {
+    Fast = runSystemIncludeExtractorForTest(FastArgs, /*OutputIsStderr=*/false,
+                                            std::chrono::seconds(5));
+  });
+  SlowQuery.join();
+  FastQuery.join();
+  EXPECT_FALSE(Slow);
+  EXPECT_TRUE(Fast);
+}
+
+TEST_F(BackgroundIndexTest, QueryDriverCachesOnlyCompleteSuccess) {
+  EXPECT_EQ(4u, runSystemIncludeExtractorCacheForTest({1, 2, 3, 0, 1}));
+}
+
+TEST_F(BackgroundIndexTest, QueryDriverTerminationOwnsDescendants) {
+  ScopedEnvironmentUnset TotalShards("GTEST_TOTAL_SHARDS");
+  ScopedEnvironmentUnset ShardIndex("GTEST_SHARD_INDEX");
+  ASSERT_TRUE(TotalShards);
+  ASSERT_TRUE(ShardIndex);
+  llvm::SmallString<128> Ready;
+  llvm::SmallString<128> Done;
+  ASSERT_FALSE(
+      llvm::sys::fs::createTemporaryFile("clangd-query-ready", "", Ready));
+  ASSERT_FALSE(
+      llvm::sys::fs::createTemporaryFile("clangd-query-done", "", Done));
+  ASSERT_FALSE(llvm::sys::fs::remove(Ready));
+  ASSERT_FALSE(llvm::sys::fs::remove(Done));
+  llvm::FileRemover RemoveReady(Ready);
+  llvm::FileRemover RemoveDone(Done);
+  const auto PreviousReady =
+      llvm::sys::Process::GetEnv("CLANGD_QUERY_DRIVER_READY");
+  const auto PreviousDone =
+      llvm::sys::Process::GetEnv("CLANGD_QUERY_DRIVER_DONE");
+  ASSERT_TRUE(
+      updateEnvironment("CLANGD_QUERY_DRIVER_READY", Ready.str().str()));
+  ASSERT_TRUE(updateEnvironment("CLANGD_QUERY_DRIVER_DONE", Done.str().str()));
+  auto RestoreEnvironment = llvm::make_scope_exit([&] {
+    updateEnvironment("CLANGD_QUERY_DRIVER_READY", PreviousReady);
+    updateEnvironment("CLANGD_QUERY_DRIVER_DONE", PreviousDone);
+  });
+  const std::string Executable =
+      llvm::sys::fs::getMainExecutable(nullptr, nullptr);
+  llvm::SmallVector<llvm::StringRef> Args = {
+      Executable, "--gtest_also_run_disabled_tests",
+      "--gtest_filter=SystemIncludeExtractorSubprocess."
+      "DISABLED_SpawnsGrandchild"};
+  EXPECT_FALSE(runSystemIncludeExtractorForTest(Args, /*OutputIsStderr=*/false,
+                                                std::chrono::seconds(1)));
+  EXPECT_TRUE(llvm::sys::fs::exists(Ready));
+  std::this_thread::sleep_for(std::chrono::milliseconds(2500));
+  EXPECT_FALSE(llvm::sys::fs::exists(Done));
 }
 
 TEST_F(BackgroundIndexTest, WatchedMetadataIsNotATranslationUnit) {

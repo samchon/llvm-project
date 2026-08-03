@@ -57,7 +57,8 @@ extern char **environ;
 using namespace llvm;
 using namespace sys;
 
-ProcessInfo::ProcessInfo() : Pid(0), ReturnCode(0) {}
+ProcessInfo::ProcessInfo()
+    : Pid(0), Process(0), ProcessGroup(0), ReturnCode(0) {}
 
 ErrorOr<std::string> sys::findProgramByName(StringRef Name,
                                             ArrayRef<StringRef> Paths) {
@@ -87,7 +88,8 @@ ErrorOr<std::string> sys::findProgramByName(StringRef Name,
   return errc::no_such_file_or_directory;
 }
 
-static bool RedirectIO(std::optional<StringRef> Path, int FD, std::string *ErrMsg) {
+static bool RedirectIO(std::optional<StringRef> Path, int FD,
+                       std::string *ErrMsg) {
   if (!Path) // Noop
     return false;
   std::string File;
@@ -138,7 +140,7 @@ static void TimeOutHandler(int Sig) {}
 
 static void SetMemoryLimits(unsigned size) {
   struct rlimit r;
-  __typeof__(r.rlim_cur) limit = (__typeof__(r.rlim_cur))(size)*1048576;
+  __typeof__(r.rlim_cur) limit = (__typeof__(r.rlim_cur))(size) * 1048576;
 
   // Heap size
   getrlimit(RLIMIT_DATA, &r);
@@ -166,7 +168,8 @@ static bool Execute(ProcessInfo &PI, StringRef Program,
                     std::optional<ArrayRef<StringRef>> Env,
                     ArrayRef<std::optional<StringRef>> Redirects,
                     unsigned MemoryLimit, std::string *ErrMsg,
-                    BitVector *AffinityMask, bool DetachProcess) {
+                    BitVector *AffinityMask, bool DetachProcess,
+                    bool OwnProcessTree) {
   assert(!AffinityMask && "Starting a process with an affinity mask is "
                           "currently not supported on Unix!");
 
@@ -232,25 +235,48 @@ static bool Execute(ProcessInfo &PI, StringRef Program,
       Envp = const_cast<const char **>(*_NSGetEnviron());
 #endif
 
+    posix_spawnattr_t AttributesStore;
+    posix_spawnattr_t *Attributes = nullptr;
+    if (OwnProcessTree) {
+      int AttrError = posix_spawnattr_init(&AttributesStore);
+      const bool AttributesInitialized = AttrError == 0;
+      if (!AttrError)
+        AttrError =
+            posix_spawnattr_setflags(&AttributesStore, POSIX_SPAWN_SETPGROUP);
+      if (!AttrError)
+        AttrError = posix_spawnattr_setpgroup(&AttributesStore, 0);
+      if (AttrError) {
+        if (AttributesInitialized)
+          posix_spawnattr_destroy(&AttributesStore);
+        if (FileActions)
+          posix_spawn_file_actions_destroy(FileActions);
+        return !MakeErrMsg(ErrMsg, "posix_spawn process group failed",
+                           AttrError);
+      }
+      Attributes = &AttributesStore;
+    }
+
     constexpr int maxRetries = 8;
     int retries = 0;
     pid_t PID;
     int Err;
     do {
       PID = 0; // Make Valgrind happy.
-      Err = posix_spawn(&PID, Program.str().c_str(), FileActions,
-                        /*attrp*/ nullptr, const_cast<char **>(Argv),
-                        const_cast<char **>(Envp));
+      Err = posix_spawn(&PID, Program.str().c_str(), FileActions, Attributes,
+                        const_cast<char **>(Argv), const_cast<char **>(Envp));
     } while (Err == EINTR && ++retries < maxRetries);
 
     if (FileActions)
       posix_spawn_file_actions_destroy(FileActions);
+    if (Attributes)
+      posix_spawnattr_destroy(Attributes);
 
     if (Err)
       return !MakeErrMsg(ErrMsg, "posix_spawn failed", Err);
 
     PI.Pid = PID;
     PI.Process = PID;
+    PI.ProcessGroup = OwnProcessTree ? PID : 0;
 
     return true;
   }
@@ -266,6 +292,8 @@ static bool Execute(ProcessInfo &PI, StringRef Program,
 
   // Child process: Execute the program.
   case 0: {
+    if (OwnProcessTree && !DetachProcess && ::setpgid(0, 0) == -1)
+      _exit(126);
     // Redirect file descriptors...
     if (!Redirects.empty()) {
       // Redirect stdin
@@ -327,6 +355,7 @@ static bool Execute(ProcessInfo &PI, StringRef Program,
 
   PI.Pid = child;
   PI.Process = child;
+  PI.ProcessGroup = OwnProcessTree ? child : 0;
 
   return true;
 }
@@ -393,16 +422,17 @@ ProcessInfo llvm::sys::Wait(const ProcessInfo &PI,
   } else {
     if (*SecondsToWait == 0)
       WaitPidOptions = WNOHANG;
-
-    // Install a timeout handler.  The handler itself does nothing, but the
-    // simple fact of having a handler at all causes the wait below to return
-    // with EINTR, unlike if we used SIG_IGN.
-    memset(&Act, 0, sizeof(Act));
-    Act.sa_handler = TimeOutHandler;
-    sigemptyset(&Act.sa_mask);
-    sigaction(SIGALRM, &Act, &Old);
-    // FIXME The alarm signal may be delivered to another thread.
-    alarm(*SecondsToWait);
+    else {
+      // Install a timeout handler.  The handler itself does nothing, but the
+      // simple fact of having a handler at all causes the wait below to return
+      // with EINTR, unlike if we used SIG_IGN.
+      memset(&Act, 0, sizeof(Act));
+      Act.sa_handler = TimeOutHandler;
+      sigemptyset(&Act.sa_mask);
+      sigaction(SIGALRM, &Act, &Old);
+      // FIXME The alarm signal may be delivered to another thread.
+      alarm(*SecondsToWait);
+    }
   }
 
   // Parent process: Wait for the child process to terminate.
@@ -425,16 +455,15 @@ ProcessInfo llvm::sys::Wait(const ProcessInfo &PI,
     } else {
       if (SecondsToWait && errno == EINTR && !Polling) {
         // Kill the child.
-        kill(PI.Pid, SIGKILL);
+        kill(PI.ProcessGroup ? -PI.ProcessGroup : PI.Pid, SIGKILL);
 
         // Turn off the alarm and restore the signal handler
         alarm(0);
         sigaction(SIGALRM, &Old, nullptr);
 
-        // Wait for child to die
-        // FIXME This could grab some other child process out from another
-        // waiting thread and then leave a zombie anyway.
-        if (wait(&status) != ChildPid)
+        // Wait for the exact root child. Concurrent callers must never reap
+        // one another's processes.
+        if (::waitpid(ChildPid, &status, 0) != ChildPid)
           MakeErrMsg(ErrMsg, "Child timed out but wouldn't die");
         else
           MakeErrMsg(ErrMsg, "Child timed out", 0);
@@ -450,10 +479,15 @@ ProcessInfo llvm::sys::Wait(const ProcessInfo &PI,
   }
 
   // We exited normally without timeout, so turn off the timer.
-  if (SecondsToWait && !WaitUntilTerminates) {
+  if (SecondsToWait && *SecondsToWait > 0 && !WaitUntilTerminates) {
     alarm(0);
     sigaction(SIGALRM, &Old, nullptr);
   }
+
+  // The root has been reaped. A wrapper must not leave detached descendants
+  // behind after the query it represented has completed.
+  if (PI.ProcessGroup)
+    kill(-PI.ProcessGroup, SIGKILL);
 
 #ifndef __Fuchsia__
   if (ProcStat) {
@@ -499,6 +533,15 @@ ProcessInfo llvm::sys::Wait(const ProcessInfo &PI,
     WaitResult.ReturnCode = -2;
   }
   return WaitResult;
+}
+
+ProcessInfo llvm::sys::TerminateProcessTree(const ProcessInfo &PI,
+                                            std::string *ErrMsg) {
+  assert(PI.Pid && "invalid pid to terminate, process not started?");
+  if (kill(PI.ProcessGroup ? -PI.ProcessGroup : PI.Pid, SIGKILL) == -1 &&
+      errno != ESRCH)
+    MakeErrMsg(ErrMsg, "Failed to terminate process tree");
+  return Wait(PI, std::nullopt, ErrMsg);
 }
 
 std::error_code llvm::sys::ChangeStdinMode(fs::OpenFlags Flags) {

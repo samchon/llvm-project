@@ -220,6 +220,11 @@ runSystemIncludeExtractorForTest(llvm::ArrayRef<llvm::StringRef> Argv,
                                  bool OutputIsStderr,
                                  std::chrono::milliseconds Timeout);
 
+/// Exercises shared-cache publication for success (0), execution failure (1),
+/// cancellation (2), and timeout (3) query outcomes.
+unsigned
+runSystemIncludeExtractorCacheForTest(llvm::ArrayRef<unsigned> QueryStatuses);
+
 /// Bounds driver hashing and optional query-driver refresh to one CDB
 /// operation. Identical work is deduplicated within the scope. A refresh scope
 /// is used by graph publication to validate arbitrary wrapper-owned toolchain

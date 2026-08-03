@@ -89,6 +89,13 @@ struct DriverInfo {
   std::string Target;
 };
 
+enum class DriverQueryStatus { Success, Failed, Cancelled, TimedOut };
+
+template <typename T> struct DriverQueryResult {
+  DriverQueryStatus Status;
+  std::optional<T> Value;
+};
+
 struct DriverArgs {
   // Name of the driver program to execute or absolute path to it.
   std::string Driver;
@@ -268,6 +275,34 @@ template <> struct DenseMapInfo<DriverArgs> {
 } // namespace llvm
 namespace clang::clangd {
 namespace {
+class SuccessfulDriverQueryCache {
+public:
+  std::optional<DriverInfo> get(const DriverArgs &Args) const {
+    std::lock_guard<std::mutex> Lock(Mu);
+    auto Existing = Queries.find(Args);
+    return Existing == Queries.end() ? std::nullopt
+                                     : std::optional(Existing->second);
+  }
+
+  std::optional<DriverInfo> publish(const DriverArgs &Args,
+                                    DriverQueryResult<DriverInfo> Result,
+                                    bool Replace) {
+    if (Result.Status != DriverQueryStatus::Success || !Result.Value)
+      return std::nullopt;
+    std::lock_guard<std::mutex> Lock(Mu);
+    if (Replace) {
+      Queries[Args] = std::move(*Result.Value);
+      return Queries.lookup(Args);
+    }
+    auto Inserted = Queries.try_emplace(Args, std::move(*Result.Value));
+    return Inserted.first->second;
+  }
+
+private:
+  mutable std::mutex Mu;
+  llvm::DenseMap<DriverArgs, DriverInfo> Queries;
+};
+
 bool isValidTarget(llvm::StringRef Triple) {
   std::shared_ptr<TargetOptions> TargetOpts(new TargetOptions);
   TargetOpts->Triple = Triple.str();
@@ -340,7 +375,7 @@ std::optional<DriverInfo> parseDriverOutput(llvm::StringRef Output) {
   return std::move(Info);
 }
 
-std::optional<std::string>
+DriverQueryResult<std::string>
 run(llvm::ArrayRef<llvm::StringRef> Argv, bool OutputIsStderr,
     std::chrono::milliseconds QueryTimeout = std::chrono::seconds(30)) {
   llvm::SmallString<128> OutputPath;
@@ -349,7 +384,7 @@ run(llvm::ArrayRef<llvm::StringRef> Argv, bool OutputIsStderr,
     elog("System include extraction: failed to create temporary file with "
          "error {0}",
          EC.message());
-    return std::nullopt;
+    return {DriverQueryStatus::Failed, std::nullopt};
   }
   llvm::scope_exit CleanUp(
       [&OutputPath]() { llvm::sys::fs::remove(OutputPath); });
@@ -361,11 +396,13 @@ run(llvm::ArrayRef<llvm::StringRef> Argv, bool OutputIsStderr,
   bool ExecutionFailed = false;
   llvm::sys::ProcessInfo Process = llvm::sys::ExecuteNoWait(
       Argv.front(), Argv, /*Env=*/std::nullopt, Redirects,
-      /*MemoryLimit=*/0, &ErrMsg, &ExecutionFailed);
+      /*MemoryLimit=*/0, &ErrMsg, &ExecutionFailed,
+      /*AffinityMask=*/nullptr, /*DetachProcess=*/false,
+      /*OwnProcessTree=*/true);
   if (ExecutionFailed || Process.Pid == llvm::sys::ProcessInfo::InvalidPid) {
     elog("System include extraction: failed to start driver: {0}. Args: [{1}]",
          ErrMsg, printArgv(Argv));
-    return std::nullopt;
+    return {DriverQueryStatus::Failed, std::nullopt};
   }
   constexpr auto PollInterval = std::chrono::milliseconds(10);
   const auto Deadline = std::chrono::steady_clock::now() + QueryTimeout;
@@ -382,18 +419,13 @@ run(llvm::ArrayRef<llvm::StringRef> Argv, bool OutputIsStderr,
     const bool TimedOut = std::chrono::steady_clock::now() >= Deadline;
     if (Cancelled || TimedOut) {
       std::string StopError;
-      // Wait() with a finite non-polling deadline terminates the child if it
-      // does not exit. This keeps both timeout and request cancellation
-      // bounded on every supported platform.
-      llvm::sys::ProcessInfo Stopped =
-          llvm::sys::Wait(Process, /*SecondsToWait=*/1, &StopError,
-                          /*ProcStat=*/nullptr, /*Polling=*/false);
-      if (Stopped.ReturnCode == -2)
-        StopError.clear();
+      llvm::sys::TerminateProcessTree(Process, &StopError);
       elog("System include extraction: driver execution {0}{1}{2}. Args: [{3}]",
            Cancelled ? "cancelled" : "timed out", StopError.empty() ? "" : ": ",
            StopError.empty() ? "" : StopError, printArgv(Argv));
-      return std::nullopt;
+      return {Cancelled ? DriverQueryStatus::Cancelled
+                        : DriverQueryStatus::TimedOut,
+              std::nullopt};
     }
     std::this_thread::sleep_for(PollInterval);
   }
@@ -401,16 +433,17 @@ run(llvm::ArrayRef<llvm::StringRef> Argv, bool OutputIsStderr,
     elog("System include extraction: driver execution failed with return code: "
          "{0} - '{1}'. Args: [{2}]",
          llvm::to_string(RC), ErrMsg, printArgv(Argv));
-    return std::nullopt;
+    return {DriverQueryStatus::Failed, std::nullopt};
   }
 
   auto BufOrError = llvm::MemoryBuffer::getFile(OutputPath);
   if (!BufOrError) {
     elog("System include extraction: failed to read {0} with error {1}",
          OutputPath, BufOrError.getError().message());
-    return std::nullopt;
+    return {DriverQueryStatus::Failed, std::nullopt};
   }
-  return BufOrError.get().get()->getBuffer().str();
+  return {DriverQueryStatus::Success,
+          BufOrError.get().get()->getBuffer().str()};
 }
 
 std::optional<std::string>
@@ -441,7 +474,7 @@ resolveQueryDriver(llvm::StringRef InputDriver,
   return Driver;
 }
 
-std::optional<DriverInfo>
+DriverQueryResult<DriverInfo>
 extractSystemIncludesAndTarget(const DriverArgs &InputArgs) {
   trace::Span Tracer("Extract system includes and target");
 
@@ -455,12 +488,12 @@ extractSystemIncludesAndTarget(const DriverArgs &InputArgs) {
   // Input needs to go after Lang flags.
   Args.push_back("-");
   auto Output = run(Args, /*OutputIsStderr=*/true);
-  if (!Output)
-    return std::nullopt;
+  if (Output.Status != DriverQueryStatus::Success)
+    return {Output.Status, std::nullopt};
 
-  std::optional<DriverInfo> Info = parseDriverOutput(*Output);
+  std::optional<DriverInfo> Info = parseDriverOutput(*Output.Value);
   if (!Info)
-    return std::nullopt;
+    return {DriverQueryStatus::Failed, std::nullopt};
 
   switch (Config::current().CompileFlags.BuiltinHeaders) {
   case Config::BuiltinHeaderPolicy::Clangd: {
@@ -469,17 +502,18 @@ extractSystemIncludesAndTarget(const DriverArgs &InputArgs) {
     // We should keep using clangd's versions, so exclude the queried
     // builtins. They're not specially marked in the -v output, but we can
     // get the path with `$DRIVER -print-file-name=include`.
-    if (auto BuiltinHeaders = run({Driver, "-print-file-name=include"},
-                                  /*OutputIsStderr=*/false)) {
-      auto Path = llvm::StringRef(*BuiltinHeaders).trim();
-      if (!Path.empty() && llvm::sys::path::is_absolute(Path)) {
-        auto Size = Info->SystemIncludes.size();
-        llvm::erase(Info->SystemIncludes, Path);
-        vlog("System includes extractor: builtin headers {0} {1}", Path,
-             (Info->SystemIncludes.size() != Size)
-                 ? "excluded"
-                 : "not found in driver's response");
-      }
+    auto BuiltinHeaders = run({Driver, "-print-file-name=include"},
+                              /*OutputIsStderr=*/false);
+    if (BuiltinHeaders.Status != DriverQueryStatus::Success)
+      return {BuiltinHeaders.Status, std::nullopt};
+    auto Path = llvm::StringRef(*BuiltinHeaders.Value).trim();
+    if (!Path.empty() && llvm::sys::path::is_absolute(Path)) {
+      auto Size = Info->SystemIncludes.size();
+      llvm::erase(Info->SystemIncludes, Path);
+      vlog("System includes extractor: builtin headers {0} {1}", Path,
+           (Info->SystemIncludes.size() != Size)
+               ? "excluded"
+               : "not found in driver's response");
     }
     break;
   }
@@ -491,7 +525,7 @@ extractSystemIncludesAndTarget(const DriverArgs &InputArgs) {
   log("System includes extractor: successfully executed {0}\n\tgot includes: "
       "\"{1}\"\n\tgot target: \"{2}\"",
       Driver, llvm::join(Info->SystemIncludes, ", "), Info->Target);
-  return Info;
+  return {DriverQueryStatus::Success, std::move(Info)};
 }
 
 tooling::CompileCommand &
@@ -585,7 +619,7 @@ public:
 
     struct ThreadCache {
       uint64_t Scope = 0;
-      llvm::DenseMap<DriverArgs, std::optional<DriverInfo>> Queries;
+      llvm::DenseMap<DriverArgs, DriverInfo> Queries;
     };
     thread_local std::map<const State *, ThreadCache> ScopedCaches;
     ThreadCache *Scoped = nullptr;
@@ -615,27 +649,20 @@ public:
       if (Existing != Scoped->Queries.end()) {
         Info = Existing->second;
       } else {
-        Info = extractSystemIncludesAndTarget(Args);
-        Scoped->Queries.try_emplace(Args, Info);
-        std::lock_guard<std::mutex> Lock(Shared->Mu);
-        Shared->QueriedDrivers[Args] = Info;
-      }
-    } else {
-      bool Found = false;
-      {
-        std::lock_guard<std::mutex> Lock(Shared->Mu);
-        auto Existing = Shared->QueriedDrivers.find(Args);
-        if (Existing != Shared->QueriedDrivers.end()) {
-          Info = Existing->second;
-          Found = true;
+        auto Queried = extractSystemIncludesAndTarget(Args);
+        if (Queried.Status == DriverQueryStatus::Success) {
+          Info = Queried.Value;
+          Scoped->Queries.try_emplace(Args, *Info);
+          Info = Shared->Queries.publish(Args, std::move(Queried),
+                                         /*Replace=*/true);
         }
       }
-      if (!Found) {
-        auto Queried = extractSystemIncludesAndTarget(Args);
-        std::lock_guard<std::mutex> Lock(Shared->Mu);
-        auto Inserted = Shared->QueriedDrivers.try_emplace(Args, Queried);
-        Info = Inserted.first->second;
-      }
+    } else {
+      Info = Shared->Queries.get(Args);
+      if (!Info)
+        Info =
+            Shared->Queries.publish(Args, extractSystemIncludesAndTarget(Args),
+                                    /*Replace=*/false);
     }
     if (Info) {
       setTarget(addSystemIncludes(Cmd, Info->SystemIncludes), Info->Target);
@@ -644,8 +671,7 @@ public:
 
 private:
   struct State {
-    std::mutex Mu;
-    llvm::DenseMap<DriverArgs, std::optional<DriverInfo>> QueriedDrivers;
+    SuccessfulDriverQueryCache Queries;
     CompileCommandDriverFingerprintCache DriverFingerprints;
   };
   std::shared_ptr<State> Shared;
@@ -657,7 +683,29 @@ std::optional<std::string>
 runSystemIncludeExtractorForTest(llvm::ArrayRef<llvm::StringRef> Argv,
                                  bool OutputIsStderr,
                                  std::chrono::milliseconds Timeout) {
-  return run(Argv, OutputIsStderr, Timeout);
+  return run(Argv, OutputIsStderr, Timeout).Value;
+}
+
+unsigned
+runSystemIncludeExtractorCacheForTest(llvm::ArrayRef<unsigned> QueryStatuses) {
+  SuccessfulDriverQueryCache Cache;
+  DriverArgs Args = DriverArgs::getEmpty();
+  Args.Driver = "test-driver";
+  Args.Lang = "c++";
+  unsigned Queries = 0;
+  for (unsigned RawStatus : QueryStatuses) {
+    if (Cache.get(Args))
+      continue;
+    ++Queries;
+    assert(RawStatus <= unsigned(DriverQueryStatus::TimedOut));
+    const auto Status = static_cast<DriverQueryStatus>(RawStatus);
+    Cache.publish(Args,
+                  {Status, Status == DriverQueryStatus::Success
+                               ? std::optional(DriverInfo{})
+                               : std::nullopt},
+                  /*Replace=*/false);
+  }
+  return Queries;
 }
 
 SystemIncludeExtractorScope::SystemIncludeExtractorScope(

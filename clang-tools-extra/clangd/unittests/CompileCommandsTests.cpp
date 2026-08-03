@@ -133,6 +133,31 @@ TEST(CompileCommandDriverFingerprint, ToolchainExcludesTUConfiguration) {
   EXPECT_NE(graphCommandDigest(First), graphCommandDigest(Second));
 }
 
+TEST(CompileCommandDriverFingerprint, ToolchainUsesDriverOptionSemantics) {
+  tooling::CompileCommand First;
+  First.Directory = testRoot();
+  First.Filename = "/imsvc-first.cc";
+  First.CommandLine = {"missing-clang++", "-isystem-after",
+                       testPath("after"), "-iframeworkwithsysroot",
+                       "=Frameworks",     "--",
+                       First.Filename};
+  tooling::CompileCommand Second = First;
+  Second.Filename = "/imsvc-second.cc";
+  Second.CommandLine.back() = Second.Filename;
+
+  CompileCommandDriverFingerprintCache Cache;
+  EXPECT_EQ(compileCommandToolchainFingerprint(First, &Cache),
+            compileCommandToolchainFingerprint(Second, &Cache));
+  Second.CommandLine[2] = testPath("other-after");
+  EXPECT_NE(compileCommandToolchainFingerprint(First, &Cache),
+            compileCommandToolchainFingerprint(Second, &Cache));
+
+  First.CommandLine = {"missing-clang-cl", "/imsvc", testPath("msvc")};
+  Second.CommandLine = {"missing-clang-cl", "/imsvc", testPath("other-msvc")};
+  EXPECT_NE(compileCommandToolchainFingerprint(First, &Cache),
+            compileCommandToolchainFingerprint(Second, &Cache));
+}
+
 // Make use of all features and assert the exact command we get out.
 // Other tests just verify presence/absence of certain args.
 TEST(CommandMangler, Everything) {

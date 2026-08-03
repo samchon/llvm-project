@@ -55,6 +55,7 @@ public:
   std::unique_ptr<FrontendAction> create() override {
     SymbolCollector::Options Opts;
     Opts.CountReferences = true;
+    Opts.CollectGraph = true;
     Opts.FileFilter = [&](const SourceManager &SM, FileID FID) {
       const auto F = SM.getFileEntryRefForID(FID);
       if (!F)
@@ -91,7 +92,11 @@ public:
             Relations.insert(R);
           }
         },
-        /*IncludeGraphCallback=*/nullptr);
+        /*IncludeGraphCallback=*/nullptr,
+        [&](GraphTU G) {
+          std::lock_guard<std::mutex> Lock(GraphsMu);
+          Graphs.push_back(std::move(G));
+        });
   }
 
   bool runInvocation(std::shared_ptr<CompilerInvocation> Invocation,
@@ -109,6 +114,7 @@ public:
     Result.Symbols = std::move(Symbols).build();
     Result.Refs = std::move(Refs).build();
     Result.Relations = std::move(Relations).build();
+    Result.Graphs = std::move(Graphs);
   }
 
 private:
@@ -121,6 +127,8 @@ private:
   RefSlab::Builder Refs;
   std::mutex RelsMu;
   RelationSlab::Builder Relations;
+  std::mutex GraphsMu;
+  std::vector<GraphTU> Graphs;
 };
 
 } // namespace

@@ -943,16 +943,45 @@ void BackgroundIndex::enqueueGraphDependents(
     enqueue(Work);
 }
 
-// Digest of a view's body as it was published. Sources carry no disk digest
-// here: disk state belongs to the snapshot that validates it, not to the body,
-// and a body has to digest identically whether it was just produced or just
-// read back from the shard that stored it.
-static std::string graphBodyDigest(GraphTU Graph) {
-  for (auto &Source : Graph.Sources)
-    Source.DiskDigest.clear();
-  std::string Text;
-  llvm::raw_string_ostream OS(Text);
-  OS << toJSON(Graph);
+// Identity of a published body, cheap enough to take on every translation
+// unit. It is deliberately not a digest of the body's contents: hashing those
+// meant copying the body and serializing it to JSON once per translation
+// unit, on top of the serialization that already writes the shard. A C++ unit
+// carries an occurrence for every reference, so that second pass starved
+// indexing on plain C and took a 16 GiB host from 5,831 MiB free to 209 MiB
+// in a single step on C++.
+//
+// A published body is only ever replaced by a reindex, and a reindex moves
+// the revision a snapshot plan is fenced against. So this has one job: catch
+// a shard that is not the one the plan was built from. Producer, command,
+// toolchain and every source digest already identify that, and the element
+// counts catch a shard rewritten or truncated under the same identity.
+static std::string graphBodyDigest(const GraphTU &Graph) {
+  std::string Material;
+  llvm::raw_string_ostream OS(Material);
+  auto Field = [&](llvm::StringRef Value) {
+    OS << Value.size() << ':' << Value;
+  };
+  Field(Graph.ProducerFingerprint);
+  Field(Graph.MainFileURI);
+  Field(Graph.CommandDigest);
+  Field(Graph.ToolchainFingerprint);
+  Field(Graph.TargetTriple);
+  Field(Graph.Language);
+  OS << (Graph.HadErrors ? '!' : '.');
+  // Disk digests are deliberately absent: they belong to the snapshot that
+  // validates a source, not to the body, and a body has to identify the same
+  // way whether it was just produced or just read back from its shard.
+  for (const auto &Source : Graph.Sources) {
+    Field(Source.URI);
+    Field(Source.Digest);
+  }
+  for (const size_t Count :
+       {Graph.Symbols.size(), Graph.Occurrences.size(), Graph.Relations.size(),
+        Graph.Macros.size(), Graph.Includes.size(),
+        Graph.MissingIncludes.size(), Graph.Modules.size(),
+        Graph.Diagnostics.size()})
+    OS << Count << ',';
   return graphDigest(OS.str());
 }
 

@@ -496,12 +496,12 @@ BackgroundQueue::Task BackgroundIndex::indexFileTask(
       }
     } else {
       // An erroneous or incomplete batch must not replace the last complete
-      // graph generation, including in the persisted main-file shard.
-      std::lock_guard<std::mutex> Lock(GraphMu);
-      auto Published = Graphs.find(GraphKey);
-      if (Published != Graphs.end())
-        for (const auto &Configuration : Published->second)
-          CompleteGraphs.push_back(Configuration.second);
+      // graph generation, including in the persisted main-file shard. The
+      // bodies are no longer resident, so the shard that published them is
+      // what restores them; if it cannot be read there is nothing complete to
+      // preserve and the shard is rewritten without views, exactly as it would
+      // have been before any complete generation existed.
+      CompleteGraphs = loadGraphBodies(Path);
     }
 
     // Preserve clangd's pre-graph behavior: one representative command owns
@@ -531,9 +531,9 @@ BackgroundQueue::Task BackgroundIndex::indexFileTask(
       if (!CompleteGraphs.empty()) {
         auto &Published = Graphs[GraphKey];
         auto &Timings = GraphSemanticMillis[GraphKey];
-        for (auto &Graph : CompleteGraphs) {
+        for (const auto &Graph : CompleteGraphs) {
           Timings[Graph.CommandDigest] = CompleteTimings[Graph.CommandDigest];
-          Published.emplace(Graph.CommandDigest, std::move(Graph));
+          Published.emplace(Graph.CommandDigest, graphViewOf(Graph));
         }
       }
       GraphPending.erase(GraphKey);
@@ -794,7 +794,10 @@ BackgroundIndex::loadProject(std::vector<std::string> MainFiles) {
   const std::vector<LoadedShard> Result =
       loadIndexShards(MainFiles, IndexStorageFactory, CDB);
   size_t LoadedShards = 0;
-  std::vector<GraphTU> LoadedGraphs;
+  // Views rather than bodies: these shards are the whole compilation
+  // database's graph, and carrying a second copy of every body across the
+  // load would put startup alone in reach of the host's memory.
+  std::vector<GraphView> LoadedViews;
   {
     // Update in-memory state.
     std::lock_guard<std::mutex> Lock(ShardVersionsMu);
@@ -804,7 +807,7 @@ BackgroundIndex::loadProject(std::vector<std::string> MainFiles) {
       for (const auto &Graph : LS.Shard->Graphs)
         if (Graph.ProducerFingerprint == graphProducerFingerprint() &&
             (Graph.Language == "c" || Graph.Language == "cpp"))
-          LoadedGraphs.push_back(Graph);
+          LoadedViews.push_back(graphViewOf(Graph));
       auto SS =
           LS.Shard->Symbols
               ? std::make_unique<SymbolSlab>(std::move(*LS.Shard->Symbols))
@@ -826,14 +829,14 @@ BackgroundIndex::loadProject(std::vector<std::string> MainFiles) {
                             LS.CountReferences);
     }
   }
-  if (!LoadedGraphs.empty()) {
+  if (!LoadedViews.empty()) {
     std::lock_guard<std::mutex> Lock(GraphMu);
-    for (auto &Graph : LoadedGraphs) {
-      if (Graph.MainFile.empty() || Graph.CommandDigest.empty())
+    for (auto &View : LoadedViews) {
+      if (View.MainFile.empty() || View.CommandDigest.empty())
         continue;
-      const std::string MainKey = graphMainKey(Graph.MainFile);
-      const std::string CommandDigest = Graph.CommandDigest;
-      Graphs[MainKey][CommandDigest] = std::move(Graph);
+      const std::string MainKey = graphMainKey(View.MainFile);
+      const std::string CommandDigest = View.CommandDigest;
+      Graphs[MainKey][CommandDigest] = std::move(View);
       GraphSemanticMillis[MainKey][CommandDigest] = 0;
     }
     ++GraphRevision;
@@ -940,6 +943,65 @@ void BackgroundIndex::enqueueGraphDependents(
     enqueue(Work);
 }
 
+// Digest of a view's body as it was published. Sources carry no disk digest
+// here: disk state belongs to the snapshot that validates it, not to the body,
+// and a body has to digest identically whether it was just produced or just
+// read back from the shard that stored it.
+static std::string graphBodyDigest(GraphTU Graph) {
+  for (auto &Source : Graph.Sources)
+    Source.DiskDigest.clear();
+  std::string Text;
+  llvm::raw_string_ostream OS(Text);
+  OS << toJSON(Graph);
+  return graphDigest(OS.str());
+}
+
+BackgroundIndex::GraphView
+BackgroundIndex::graphViewOf(const GraphTU &Graph) {
+  GraphView View;
+  View.MainFile = Graph.MainFile;
+  View.MainFileURI = Graph.MainFileURI;
+  View.Directory = Graph.Directory;
+  View.CommandDigest = Graph.CommandDigest;
+  View.ToolchainFingerprint = Graph.ToolchainFingerprint;
+  View.ProducerFingerprint = Graph.ProducerFingerprint;
+  View.TargetTriple = Graph.TargetTriple;
+  View.HadErrors = Graph.HadErrors;
+  View.Sources = Graph.Sources;
+  for (const auto &Source : Graph.Sources)
+    if (Source.URI == Graph.MainFileURI) {
+      View.CheckerDigest = Source.Digest;
+      break;
+    }
+  std::string Interface;
+  llvm::raw_string_ostream InterfaceOS(Interface);
+  for (const auto &Symbol : Graph.Symbols)
+    if (Symbol.Exported)
+      InterfaceOS << Symbol.ID.size() << ':' << Symbol.ID
+                  << Symbol.Signature.size() << ':' << Symbol.Signature;
+  View.InterfaceFingerprint = graphDigest(InterfaceOS.str());
+  View.BodyDigest = graphBodyDigest(Graph);
+  return View;
+}
+
+std::vector<GraphTU>
+BackgroundIndex::loadGraphBodies(llvm::StringRef MainFile) {
+  auto *Storage = IndexStorageFactory(MainFile);
+  if (!Storage)
+    return {};
+  auto Shard = Storage->loadShard(MainFile);
+  if (!Shard)
+    return {};
+  std::vector<GraphTU> Bodies;
+  // The same admission rule the shard load applies, so a body can only come
+  // back under the identity that published it.
+  for (auto &Graph : Shard->Graphs)
+    if (Graph.ProducerFingerprint == graphProducerFingerprint() &&
+        (Graph.Language == "c" || Graph.Language == "cpp"))
+      Bodies.push_back(std::move(Graph));
+  return Bodies;
+}
+
 llvm::Expected<llvm::json::Value>
 BackgroundIndex::graphSnapshot(const GraphSnapshotParams &Params) {
   const auto RequestStarted = std::chrono::steady_clock::now();
@@ -995,12 +1057,6 @@ BackgroundIndex::graphSnapshot(const GraphSnapshotParams &Params) {
       {"renders", "unsupported"}, {"tests", "unsupported"},
       {"references", "complete"}};
 
-  auto JSONText = [](const llvm::json::Value &Value) {
-    std::string Text;
-    llvm::raw_string_ostream OS(Text);
-    OS << Value;
-    return OS.str();
-  };
   auto NativeDiskDigest = [](llvm::StringRef File) {
     auto Buffer = llvm::MemoryBuffer::getFile(File);
     return Buffer ? graphDigest((*Buffer)->getBuffer()) : std::string();
@@ -1013,6 +1069,9 @@ BackgroundIndex::graphSnapshot(const GraphSnapshotParams &Params) {
     const size_t End = std::min(Plan.Upserts.size(), Offset + PageSize);
     std::vector<GraphTU> Page;
     Page.reserve(End - Offset);
+    // One main file owns every configuration's view, so a page that spans
+    // several configurations of the same file reads its shard once.
+    llvm::StringMap<std::vector<GraphTU>> Loaded;
     for (size_t I = Offset; I < End; ++I) {
       const auto &Shard = Cache.Shards[Plan.Upserts[I]];
       auto Main = Graphs.find(Shard.MainKey);
@@ -1021,7 +1080,24 @@ BackgroundIndex::graphSnapshot(const GraphSnapshotParams &Params) {
       auto Configuration = Main->getValue().find(Shard.CommandDigest);
       if (Configuration == Main->getValue().end())
         return contentModified("graph snapshot changed between pages");
-      Page.push_back(Configuration->second);
+      auto Bodies = Loaded.find(Shard.MainFile);
+      if (Bodies == Loaded.end())
+        Bodies =
+            Loaded.try_emplace(Shard.MainFile, loadGraphBodies(Shard.MainFile))
+                .first;
+      auto Body = llvm::find_if(Bodies->getValue(), [&](const GraphTU &Graph) {
+        return Graph.CommandDigest == Shard.CommandDigest;
+      });
+      if (Body == Bodies->getValue().end())
+        return contentModified(
+            "graph snapshot shard no longer publishes a view for {0}",
+            Shard.Key);
+      // A body is immutable once published, so a shard that no longer digests
+      // to what was published was replaced underneath this cursor.
+      if (graphBodyDigest(*Body) != Shard.BodyDigest)
+        return contentModified("graph snapshot shard changed while paging: {0}",
+                               Shard.Key);
+      Page.push_back(std::move(*Body));
       Page.back().Sources = Shard.Sources;
     }
     return Page;
@@ -1042,13 +1118,12 @@ BackgroundIndex::graphSnapshot(const GraphSnapshotParams &Params) {
         return std::move(Err);
       const auto &Shard = Cache.Shards[Plan.Upserts[I]];
       const auto &Graph = PageGraphs[I - Offset];
+      // The shard this page carries was proved against its published digest
+      // while it was being read, before its sources were given the disk state
+      // this snapshot validated. Everything else in Shard.Digest is metadata
+      // that came from the same frozen cache, so recomputing it here could
+      // only restate what CopyPage already established.
       llvm::json::Value GraphJSON = toJSON(Graph);
-      std::string ShardDigest =
-          graphDigest(Shard.Key + "\n" + Shard.CheckerDigest + "\n" +
-                      Shard.InterfaceFingerprint + "\n" + JSONText(GraphJSON));
-      if (ShardDigest != Shard.Digest)
-        return contentModified("graph snapshot shard changed while paging: {0}",
-                               Shard.Key);
       llvm::json::Array CoverageJSON;
       for (const auto &Row : Coverage)
         CoverageJSON.push_back(
@@ -1366,8 +1441,11 @@ BackgroundIndex::graphSnapshot(const GraphSnapshotParams &Params) {
     }
   }
 
+  // Freezing copies views, never bodies. Copying every body here doubled the
+  // whole compilation database's graph in memory for the duration of a
+  // snapshot, on top of the copy the index already held.
   struct FrozenGraph {
-    GraphTU Graph;
+    GraphView Graph;
     std::string MainKey;
     uint64_t SemanticMillis = 0;
   };
@@ -1493,26 +1571,21 @@ BackgroundIndex::graphSnapshot(const GraphSnapshotParams &Params) {
       return std::move(Err);
     const auto &Graph = Entry.Graph;
     std::string Key = Graph.MainFileURI + "#" + Graph.CommandDigest;
-    std::string CheckerDigest;
-    for (const auto &Source : Graph.Sources)
-      if (Source.URI == Graph.MainFileURI) {
-        CheckerDigest = Source.Digest;
-        break;
-      }
-    if (CheckerDigest.empty())
+    if (Graph.CheckerDigest.empty())
       return error("graph snapshot has no main-file checker: {0}",
                    Graph.MainFile);
-    std::string Interface;
-    llvm::raw_string_ostream InterfaceOS(Interface);
-    for (const auto &Symbol : Graph.Symbols)
-      if (Symbol.Exported)
-        InterfaceOS << Symbol.ID.size() << ':' << Symbol.ID
-                    << Symbol.Signature.size() << ':' << Symbol.Signature;
-    std::string InterfaceFingerprint = graphDigest(InterfaceOS.str());
-    llvm::json::Value GraphJSON = toJSON(Graph);
+    // The body's own contribution was digested when the view was published,
+    // because a published body never changes. What a snapshot adds is the disk
+    // state each source was just validated against.
+    std::string DiskMaterial;
+    llvm::raw_string_ostream DiskOS(DiskMaterial);
+    for (const auto &Source : Graph.Sources)
+      DiskOS << Source.URI.size() << ':' << Source.URI
+             << Source.DiskDigest.size() << ':' << Source.DiskDigest;
     std::string ShardDigest =
-        graphDigest(Key + "\n" + CheckerDigest + "\n" + InterfaceFingerprint +
-                    "\n" + JSONText(GraphJSON));
+        graphDigest(Key + "\n" + Graph.CheckerDigest + "\n" +
+                    Graph.InterfaceFingerprint + "\n" + Graph.BodyDigest +
+                    "\n" + DiskOS.str());
     GraphSnapshotShardCache Cached;
     Cached.MainKey = Entry.MainKey;
     Cached.MainFile = Graph.MainFile;
@@ -1521,8 +1594,9 @@ BackgroundIndex::graphSnapshot(const GraphSnapshotParams &Params) {
     Cached.ToolchainFingerprint = Graph.ToolchainFingerprint;
     Cached.Key = std::move(Key);
     Cached.Digest = std::move(ShardDigest);
-    Cached.CheckerDigest = std::move(CheckerDigest);
-    Cached.InterfaceFingerprint = std::move(InterfaceFingerprint);
+    Cached.CheckerDigest = Graph.CheckerDigest;
+    Cached.InterfaceFingerprint = Graph.InterfaceFingerprint;
+    Cached.BodyDigest = Graph.BodyDigest;
     Cached.Sources = Graph.Sources;
     Cached.SemanticMillis = Entry.SemanticMillis;
     Built.Shards.push_back(std::move(Cached));

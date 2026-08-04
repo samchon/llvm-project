@@ -237,11 +237,46 @@ private:
   llvm::StringMap<ShardVersion> ShardVersions; // Key is absolute file path.
   std::mutex ShardVersionsMu;
 
+  // Resident metadata of one complete TU/configuration view. The view's body
+  // is not held here: it is already persisted in the main-file shard, which
+  // update() stores whenever that shard owns a complete view, and a snapshot
+  // loads it one page at a time.
+  //
+  // Retaining every body made resident memory a function of the whole
+  // compilation database rather than of the indexer's width, which exhausted a
+  // 16 GiB host even at -j=1. CheckerDigest, InterfaceFingerprint and
+  // BodyDigest are derived once while the body is in hand, because a published
+  // body never changes: only a reindex replaces it, and that replaces this
+  // record too.
+  struct GraphView {
+    std::string MainFile;
+    std::string MainFileURI;
+    std::string Directory;
+    std::string CommandDigest;
+    std::string ToolchainFingerprint;
+    std::string ProducerFingerprint;
+    std::string TargetTriple;
+    bool HadErrors = false;
+    std::vector<GraphSource> Sources;
+    std::string CheckerDigest;
+    std::string InterfaceFingerprint;
+    std::string BodyDigest;
+  };
+
+  /// Derives the resident metadata of a complete view from its body. A body
+  /// carrying no checker for its own main file yields an empty CheckerDigest,
+  /// which a snapshot rejects: dropping the view here would instead leave the
+  /// main file permanently short of a configuration and reindexing forever.
+  static GraphView graphViewOf(const GraphTU &Graph);
+
+  /// Loads the complete views persisted in one main file's shard.
+  std::vector<GraphTU> loadGraphBodies(llvm::StringRef MainFile);
+
   // Complete TU/configuration views. The outer key is the absolute main file,
   // the inner key is graphCommandDigest(). A batch replaces all views for one
   // main file atomically, so snapshots cannot mix old and new configurations.
   mutable std::mutex GraphMu;
-  llvm::StringMap<std::map<std::string, GraphTU>> Graphs;
+  llvm::StringMap<std::map<std::string, GraphView>> Graphs;
   size_t GraphDiscoveryPending = 0;
   llvm::StringSet<> GraphPending;
   llvm::StringMap<std::string> GraphFailures;
@@ -262,6 +297,9 @@ private:
     std::string Digest;
     std::string CheckerDigest;
     std::string InterfaceFingerprint;
+    // Digest of the published body, carried so that a page can prove the shard
+    // it loads is still the one this cache was planned against.
+    std::string BodyDigest;
     std::vector<GraphSource> Sources;
     uint64_t SemanticMillis = 0;
   };

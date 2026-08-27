@@ -1510,7 +1510,7 @@ BackgroundIndex::graphSnapshot(const GraphSnapshotParams &Params) {
         Split.second.getAsInteger(10, ParsedOffset))
       return error("graph snapshot cursor is malformed");
     Offset = static_cast<size_t>(ParsedOffset);
-    GraphSnapshotCache Cache;
+    std::shared_ptr<const GraphSnapshotCache> Cache;
     GraphSnapshotPlan Plan;
     std::vector<GraphTU> PageGraphs;
     {
@@ -1524,19 +1524,19 @@ BackgroundIndex::graphSnapshot(const GraphSnapshotParams &Params) {
       if (GraphDiscoveryPending != 0 || !GraphPending.empty() ||
           !GraphFailures.empty())
         return contentModified("graph snapshot state moved between pages");
-      Cache = *CachedGraphSnapshot;
+      Cache = CachedGraphSnapshot;
       Plan = Active->getValue();
-      auto Page = CopyPageLocked(Cache, Plan, Offset);
+      auto Page = CopyPageLocked(*Cache, Plan, Offset);
       if (!Page)
         return Page.takeError();
       PageGraphs = std::move(*Page);
     }
-    return EncodePage(Cache, Plan, Offset, std::move(PageGraphs),
+    return EncodePage(*Cache, Plan, Offset, std::move(PageGraphs),
                       elapsedMillis(RequestStarted));
   }
 
   {
-    GraphSnapshotCache Cache;
+    std::shared_ptr<const GraphSnapshotCache> Cache;
     bool Reused = false;
     {
       std::lock_guard<std::mutex> Lock(GraphMu);
@@ -1566,13 +1566,13 @@ BackgroundIndex::graphSnapshot(const GraphSnapshotParams &Params) {
             "graph snapshot is not ready: initial indexing has not completed");
       if (CachedGraphSnapshot &&
           CachedGraphSnapshot->Revision == GraphRevision) {
-        Cache = *CachedGraphSnapshot;
+        Cache = CachedGraphSnapshot;
         Reused = true;
       }
     }
     if (Reused) {
       bool DiskDigestsMoved = false;
-      if (llvm::Error Err = ValidateCachedSnapshot(Cache, DiskDigestsMoved))
+      if (llvm::Error Err = ValidateCachedSnapshot(*Cache, DiskDigestsMoved))
         return std::move(Err);
       if (!DiskDigestsMoved) {
         GraphSnapshotPlan Plan;
@@ -1585,13 +1585,13 @@ BackgroundIndex::graphSnapshot(const GraphSnapshotParams &Params) {
               !GraphFailures.empty())
             return contentModified(
                 "graph snapshot state moved while its cache was validated");
-          Plan = CreatePlanLocked(Cache, false);
-          auto Page = CopyPageLocked(Cache, Plan, 0);
+          Plan = CreatePlanLocked(*Cache, false);
+          auto Page = CopyPageLocked(*Cache, Plan, 0);
           if (!Page)
             return Page.takeError();
           PageGraphs = std::move(*Page);
         }
-        auto Encoded = EncodePage(Cache, Plan, 0, std::move(PageGraphs),
+        auto Encoded = EncodePage(*Cache, Plan, 0, std::move(PageGraphs),
                                   elapsedMillis(RequestStarted));
         if (!Encoded)
           return Encoded.takeError();
@@ -1600,13 +1600,13 @@ BackgroundIndex::graphSnapshot(const GraphSnapshotParams &Params) {
         {
           std::lock_guard<std::mutex> Lock(GraphMu);
           if (!CachedGraphSnapshot ||
-              CachedGraphSnapshot->Revision != Cache.Revision ||
-              CachedGraphSnapshot->Generation != Cache.Generation ||
+              CachedGraphSnapshot->Revision != Cache->Revision ||
+              CachedGraphSnapshot->Generation != Cache->Generation ||
               GraphDiscoveryPending != 0 || !GraphPending.empty() ||
               !GraphFailures.empty())
             return contentModified(
                 "graph snapshot state moved before publication");
-          PublishPlanLocked(Cache, Plan);
+          PublishPlanLocked(*Cache, Plan);
         }
         return Encoded;
       }
@@ -1805,7 +1805,7 @@ BackgroundIndex::graphSnapshot(const GraphSnapshotParams &Params) {
   Built.Generation = graphDigest(Built.UniverseDigest + GenerationOS.str());
   Built.ShardMillis = elapsedMillis(ShardStarted);
 
-  GraphSnapshotCache Cache;
+  std::shared_ptr<const GraphSnapshotCache> Cache;
   GraphSnapshotPlan Plan;
   std::vector<GraphTU> PageGraphs;
   if (llvm::Error Err = CheckCancellation())
@@ -1816,16 +1816,17 @@ BackgroundIndex::graphSnapshot(const GraphSnapshotParams &Params) {
         !GraphPending.empty() || !GraphFailures.empty())
       return contentModified(
           "graph snapshot state moved while it was being frozen");
-    CachedGraphSnapshot = std::move(Built);
-    Cache = *CachedGraphSnapshot;
-    Plan = CreatePlanLocked(Cache, true);
-    auto Page = CopyPageLocked(Cache, Plan, 0);
+    CachedGraphSnapshot =
+        std::make_shared<const GraphSnapshotCache>(std::move(Built));
+    Cache = CachedGraphSnapshot;
+    Plan = CreatePlanLocked(*Cache, true);
+    auto Page = CopyPageLocked(*Cache, Plan, 0);
     if (!Page)
       return Page.takeError();
     PageGraphs = std::move(*Page);
   }
   auto Encoded =
-      EncodePage(Cache, Plan, 0, std::move(PageGraphs), ValidationMillis);
+      EncodePage(*Cache, Plan, 0, std::move(PageGraphs), ValidationMillis);
   if (!Encoded)
     return Encoded.takeError();
   if (llvm::Error Err = CheckCancellation())
@@ -1833,12 +1834,12 @@ BackgroundIndex::graphSnapshot(const GraphSnapshotParams &Params) {
   {
     std::lock_guard<std::mutex> Lock(GraphMu);
     if (!CachedGraphSnapshot ||
-        CachedGraphSnapshot->Revision != Cache.Revision ||
-        CachedGraphSnapshot->Generation != Cache.Generation ||
+        CachedGraphSnapshot->Revision != Cache->Revision ||
+        CachedGraphSnapshot->Generation != Cache->Generation ||
         GraphDiscoveryPending != 0 || !GraphPending.empty() ||
         !GraphFailures.empty())
       return contentModified("graph snapshot state moved before publication");
-    PublishPlanLocked(Cache, Plan);
+    PublishPlanLocked(*Cache, Plan);
   }
   return Encoded;
 }

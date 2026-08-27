@@ -347,7 +347,17 @@ private:
     uint64_t ShardMillis = 0;
     bool CacheHit = false;
   };
-  mutable std::optional<GraphSnapshotCache> CachedGraphSnapshot;
+  // Shared, and const because it is shared.
+  //
+  // A page took a copy of this while holding the mutex, so that the reads and
+  // encoding after it happened outside the lock. That is O(shards) per page --
+  // every shard's metadata and its source list -- paid O(shards) times. On a
+  // 242 translation-unit project it came to nine seconds a page and
+  // seventy-three minutes to walk one generation, against a job that is killed
+  // at 150; the indexing it was waiting on took seven. A generation is
+  // immutable once built, so a page can hold a reference to it and let the
+  // lock go just the same.
+  mutable std::shared_ptr<const GraphSnapshotCache> CachedGraphSnapshot;
   // Several clients may page through the same immutable cache concurrently.
   // Plans are bounded by sequence and invalidated by graph revision changes.
   mutable llvm::StringMap<GraphSnapshotPlan> ActiveGraphSnapshotPlans;

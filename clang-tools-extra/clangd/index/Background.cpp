@@ -177,6 +177,90 @@ std::string graphMainKey(llvm::StringRef Path) {
   return maybeCaseFoldPath(llvm::sys::path::convert_to_slash(removeDots(Path)));
 }
 
+/**
+ * A lower bound on the heap one fact array actually holds.
+ *
+ * Counts are not the quantity that exhausts a host, and every trace so far has
+ * had only counts. A short string lives inside its object and is already paid
+ * for by `sizeof`, so only the longer ones are added here; allocator overhead
+ * is left out, which makes this an underestimate rather than a flattering one.
+ */
+static size_t graphStringBytes(llvm::StringRef Value) {
+  return Value.size() <= 15 ? 0 : Value.size() + 1;
+}
+
+static size_t graphRangeBytes(const GraphRange &Range) {
+  return graphStringBytes(Range.FileURI);
+}
+
+static size_t graphSymbolBytes(const GraphTU &Graph) {
+  size_t Bytes = Graph.Symbols.size() * sizeof(GraphSymbol);
+  for (const auto &Symbol : Graph.Symbols) {
+    Bytes += graphStringBytes(Symbol.USR) + graphStringBytes(Symbol.ID) +
+             graphStringBytes(Symbol.Name) +
+             graphStringBytes(Symbol.QualifiedName) +
+             graphStringBytes(Symbol.OwnerUSR) +
+             graphStringBytes(Symbol.Signature) +
+             graphRangeBytes(Symbol.Declaration) +
+             graphRangeBytes(Symbol.Definition) +
+             Symbol.Attributes.size() * sizeof(GraphAttribute);
+    for (const auto &Attribute : Symbol.Attributes)
+      Bytes += graphStringBytes(Attribute.Name) +
+               graphRangeBytes(Attribute.Range);
+  }
+  return Bytes;
+}
+
+static size_t graphOccurrenceBytes(const GraphTU &Graph) {
+  size_t Bytes = Graph.Occurrences.size() * sizeof(GraphOccurrence);
+  for (const auto &Occurrence : Graph.Occurrences)
+    Bytes += graphStringBytes(Occurrence.USR) +
+             graphStringBytes(Occurrence.ID) +
+             graphStringBytes(Occurrence.ContainerID) +
+             graphRangeBytes(Occurrence.Spelling) +
+             graphRangeBytes(Occurrence.Expansion);
+  return Bytes;
+}
+
+static size_t graphRelationBytes(const GraphTU &Graph) {
+  size_t Bytes = Graph.Relations.size() * sizeof(GraphRelation);
+  for (const auto &Relation : Graph.Relations)
+    Bytes += graphStringBytes(Relation.SubjectID) +
+             graphStringBytes(Relation.ObjectID) +
+             graphRangeBytes(Relation.Evidence);
+  return Bytes;
+}
+
+static size_t graphOtherBytes(const GraphTU &Graph) {
+  size_t Bytes = Graph.Sources.size() * sizeof(GraphSource) +
+                 Graph.Macros.size() * sizeof(GraphMacro) +
+                 Graph.Includes.size() * sizeof(GraphInclude) +
+                 Graph.Modules.size() * sizeof(GraphModule) +
+                 Graph.Diagnostics.size() * sizeof(GraphDiagnostic);
+  for (const auto &Source : Graph.Sources)
+    Bytes += graphStringBytes(Source.URI) + graphStringBytes(Source.Digest) +
+             graphStringBytes(Source.DiskDigest);
+  for (const auto &Macro : Graph.Macros)
+    Bytes += graphStringBytes(Macro.USR) + graphStringBytes(Macro.ID) +
+             graphStringBytes(Macro.Name) +
+             graphRangeBytes(Macro.Definition) +
+             graphRangeBytes(Macro.Spelling) +
+             graphRangeBytes(Macro.Expansion);
+  for (const auto &Include : Graph.Includes)
+    Bytes += graphStringBytes(Include.SourceURI) +
+             graphStringBytes(Include.TargetURI) +
+             graphStringBytes(Include.Spelling) +
+             graphRangeBytes(Include.Evidence);
+  for (const auto &Module : Graph.Modules)
+    Bytes += graphStringBytes(Module.Name) + graphRangeBytes(Module.Evidence);
+  for (const auto &Diagnostic : Graph.Diagnostics)
+    Bytes += graphStringBytes(Diagnostic.Message) +
+             graphStringBytes(Diagnostic.Code) +
+             graphStringBytes(Diagnostic.Severity) +
+             graphRangeBytes(Diagnostic.Range);
+  return Bytes;
+}
+
 uint64_t elapsedMillis(std::chrono::steady_clock::time_point Started) {
   auto Elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
                      std::chrono::steady_clock::now() - Started)
@@ -523,12 +607,20 @@ BackgroundQueue::Task BackgroundIndex::indexFileTask(
     size_t Occurrences = 0;
     size_t Symbols = 0;
     size_t Relations = 0;
+    size_t SymbolBytes = 0;
+    size_t OccurrenceBytes = 0;
+    size_t RelationBytes = 0;
+    size_t OtherBytes = 0;
     if (!Failure)
       for (const auto &Graph : CompleteGraphs) {
         Published.emplace(Graph.CommandDigest, graphViewOf(Graph));
         Occurrences += Graph.Occurrences.size();
         Symbols += Graph.Symbols.size();
         Relations += Graph.Relations.size();
+        SymbolBytes += graphSymbolBytes(Graph);
+        OccurrenceBytes += graphOccurrenceBytes(Graph);
+        RelationBytes += graphRelationBytes(Graph);
+        OtherBytes += graphOtherBytes(Graph);
       }
 
     // Preserve clangd's pre-graph behavior: one representative command owns
@@ -561,10 +653,17 @@ BackgroundQueue::Task BackgroundIndex::indexFileTask(
           Timings[Entry.first] = CompleteTimings[Entry.first];
         Graphs[GraphKey] = std::move(Published);
       }
-      if (Occurrences > GraphPeakOccurrences) {
+      const size_t Bytes =
+          SymbolBytes + OccurrenceBytes + RelationBytes + OtherBytes;
+      if (Bytes > GraphPeakBytes) {
         GraphPeakOccurrences = Occurrences;
         GraphPeakSymbols = Symbols;
         GraphPeakRelations = Relations;
+        GraphPeakBytes = Bytes;
+        GraphPeakSymbolBytes = SymbolBytes;
+        GraphPeakOccurrenceBytes = OccurrenceBytes;
+        GraphPeakRelationBytes = RelationBytes;
+        GraphPeakOtherBytes = OtherBytes;
         GraphPeakFile = Path;
       }
       GraphPending.erase(GraphKey);
@@ -626,8 +725,13 @@ void BackgroundIndex::update(
   // Build and store new slabs for each updated file.
   for (const auto &FileIt : FilesToUpdate) {
     auto Uri = FileIt.first();
+    // Claimed before the shard is built, so the copy inside `getShard` finds
+    // nothing left to duplicate. Exactly one shard owns each body, and a body
+    // is the largest object either object holds.
+    auto ClaimedGraphs = ShardedIndex.claimGraphs(Uri);
     auto IF = ShardedIndex.getShard(Uri);
     assert(IF && "no shard for file in Index.Sources?");
+    IF->Graphs = std::move(ClaimedGraphs);
     PathRef Path = FileIt.getValue().first;
 
     // Only store command line hash for main files of the TU, since our
@@ -1444,9 +1548,12 @@ BackgroundIndex::graphSnapshot(const GraphSnapshotParams &Params) {
         return contentModified(
             "graph snapshot is not ready: {0} translation units are still "
             "indexing; the largest body built so far holds {1} occurrences, "
-            "{2} symbols and {3} relations, from {4}",
+            "{2} symbols and {3} relations, {4} MiB in all ({5} symbols, {6} "
+            "occurrences, {7} relations, {8} rest), from {9}",
             GraphPending.size(), GraphPeakOccurrences, GraphPeakSymbols,
-            GraphPeakRelations,
+            GraphPeakRelations, GraphPeakBytes >> 20,
+            GraphPeakSymbolBytes >> 20, GraphPeakOccurrenceBytes >> 20,
+            GraphPeakRelationBytes >> 20, GraphPeakOtherBytes >> 20,
             GraphPeakFile.empty() ? llvm::StringRef("no unit has completed")
                                   : llvm::StringRef(GraphPeakFile));
       if (!GraphFailures.empty()) {

@@ -296,6 +296,15 @@ private:
   size_t GraphPeakOccurrences = 0;
   size_t GraphPeakSymbols = 0;
   size_t GraphPeakRelations = 0;
+  // Bytes, because counts were never the quantity that exhausts a host, and
+  // split per family because the next question after "how much" is "which
+  // array". The peak is selected on total bytes rather than on occurrence
+  // count for the same reason.
+  size_t GraphPeakBytes = 0;
+  size_t GraphPeakSymbolBytes = 0;
+  size_t GraphPeakOccurrenceBytes = 0;
+  size_t GraphPeakRelationBytes = 0;
+  size_t GraphPeakOtherBytes = 0;
   std::string GraphPeakFile;
   mutable std::string PublishedGeneration;
   mutable llvm::StringMap<std::string> PublishedManifest;

@@ -183,6 +183,14 @@ struct FileShardedIndex {
   /// they are empty.
   std::optional<IndexFileIn> getShard(llvm::StringRef Uri) const;
 
+  /// Hands over the complete graph views owned by \p Uri, removing them here.
+  ///
+  /// A body is by far the largest object a shard carries, exactly one shard
+  /// owns each one, and `getShard` copies it. Claiming first leaves that copy
+  /// with nothing to duplicate, so a completed translation unit is resident
+  /// once while it is written rather than twice.
+  std::vector<GraphTU> claimGraphs(llvm::StringRef Uri);
+
 private:
   // Contains all the information that belongs to a single file.
   struct FileShard {
@@ -197,7 +205,11 @@ private:
   };
 
   // Keeps all the information alive.
-  const IndexFileIn Index;
+  //
+  // Not const, so `claimGraphs` can move the graph bodies out. Nothing points
+  // into `Graphs`: the shard maps below hold pointers into the symbol, ref and
+  // relation slabs, which are never moved from.
+  IndexFileIn Index;
   // Mapping from URIs to slab information.
   llvm::StringMap<FileShard> Shards;
   // Used to build RefSlabs.

@@ -285,6 +285,18 @@ private:
   llvm::StringMap<std::map<std::string, uint64_t>> GraphSemanticMillis;
   uint64_t GraphRevision = 0;
   mutable uint64_t GraphSequence = 0;
+  // The largest complete body this index has built, and the unit it came from.
+  //
+  // A translation unit's body is by far the largest object the indexer holds,
+  // and its size is what decides whether an indexing width fits in a host. It
+  // is reported in the not-ready answer because that is the only thing a
+  // reader has while indexing is in flight: a host that dies during the
+  // countdown otherwise leaves no way to tell an oversized unit from an
+  // unbounded one.
+  size_t GraphPeakOccurrences = 0;
+  size_t GraphPeakSymbols = 0;
+  size_t GraphPeakRelations = 0;
+  std::string GraphPeakFile;
   mutable std::string PublishedGeneration;
   mutable llvm::StringMap<std::string> PublishedManifest;
   struct GraphSnapshotShardCache {

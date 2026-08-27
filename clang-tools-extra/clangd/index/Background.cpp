@@ -482,16 +482,27 @@ BackgroundQueue::Task BackgroundIndex::indexFileTask(
               MissingInputs.insert(std::move(Candidate));
         }
 
+    // One resident copy of a translation unit's body, not three.
+    //
+    // A unit's graph body is the largest object this indexer ever holds: an
+    // occurrence per reference, each carrying its own USR, endpoint key,
+    // container key and two file URIs. Lifting it out of Results by copy and
+    // then handing the shard writer a second copy made the peak three bodies
+    // per worker rather than one, which is what exhausted a 16 GiB host in
+    // fifteen seconds with most of the compilation database still to index.
+    // Nothing needs a copy: the bodies leave Results by move, and the resident
+    // metadata is derived while they are still in hand.
     std::vector<GraphTU> CompleteGraphs;
     std::map<std::string, uint64_t> CompleteTimings;
     if (!Failure) {
       CompleteGraphs.reserve(Results.size());
-      for (const auto &Result : Results) {
+      for (auto &Result : Results) {
         assert(Result.Index.Graphs.size() <= 1);
         if (!Result.Index.Graphs.empty()) {
-          CompleteGraphs.push_back(Result.Index.Graphs.front());
           CompleteTimings[Result.Index.Graphs.front().CommandDigest] =
               Result.SemanticMillis;
+          CompleteGraphs.push_back(std::move(Result.Index.Graphs.front()));
+          Result.Index.Graphs.clear();
         }
       }
     } else {
@@ -504,6 +515,22 @@ BackgroundQueue::Task BackgroundIndex::indexFileTask(
       CompleteGraphs = loadGraphBodies(Path);
     }
 
+    // Derived here because this is the last point at which the bodies are in
+    // hand. update() persists them into the main-file shard and does not give
+    // them back, and holding a copy to derive from afterwards is precisely the
+    // copy this avoids.
+    std::map<std::string, GraphView> Published;
+    size_t Occurrences = 0;
+    size_t Symbols = 0;
+    size_t Relations = 0;
+    if (!Failure)
+      for (const auto &Graph : CompleteGraphs) {
+        Published.emplace(Graph.CommandDigest, graphViewOf(Graph));
+        Occurrences += Graph.Occurrences.size();
+        Symbols += Graph.Symbols.size();
+        Relations += Graph.Relations.size();
+      }
+
     // Preserve clangd's pre-graph behavior: one representative command owns
     // the ordinary slabs, and even a diagnostic result updates them. All
     // configurations are analyzed only for the complete graph generation.
@@ -512,7 +539,7 @@ BackgroundQueue::Task BackgroundIndex::indexFileTask(
              graphCommandDigest(*Result.Index.Cmd) == *LegacyCommandDigest;
     });
     if (Legacy != Results.end()) {
-      Legacy->Index.Graphs = CompleteGraphs;
+      Legacy->Index.Graphs = std::move(CompleteGraphs);
       update(Path, std::move(Legacy->Index), Legacy->ShardVersionsSnapshot,
              Legacy->HadErrors);
       Rebuilder.indexedTU();
@@ -528,13 +555,17 @@ BackgroundQueue::Task BackgroundIndex::indexFileTask(
       std::lock_guard<std::mutex> Lock(GraphMu);
       Graphs.erase(GraphKey);
       GraphSemanticMillis.erase(GraphKey);
-      if (!CompleteGraphs.empty()) {
-        auto &Published = Graphs[GraphKey];
+      if (!Published.empty()) {
         auto &Timings = GraphSemanticMillis[GraphKey];
-        for (const auto &Graph : CompleteGraphs) {
-          Timings[Graph.CommandDigest] = CompleteTimings[Graph.CommandDigest];
-          Published.emplace(Graph.CommandDigest, graphViewOf(Graph));
-        }
+        for (const auto &Entry : Published)
+          Timings[Entry.first] = CompleteTimings[Entry.first];
+        Graphs[GraphKey] = std::move(Published);
+      }
+      if (Occurrences > GraphPeakOccurrences) {
+        GraphPeakOccurrences = Occurrences;
+        GraphPeakSymbols = Symbols;
+        GraphPeakRelations = Relations;
+        GraphPeakFile = Path;
       }
       GraphPending.erase(GraphKey);
       GraphFailures.erase(GraphKey);
@@ -1410,9 +1441,14 @@ BackgroundIndex::graphSnapshot(const GraphSnapshotParams &Params) {
             "graph snapshot is not ready: project changes are still being "
             "discovered");
       if (!GraphPending.empty())
-        return contentModified("graph snapshot is not ready: {0} translation "
-                               "units are still indexing",
-                               GraphPending.size());
+        return contentModified(
+            "graph snapshot is not ready: {0} translation units are still "
+            "indexing; the largest body built so far holds {1} occurrences, "
+            "{2} symbols and {3} relations, from {4}",
+            GraphPending.size(), GraphPeakOccurrences, GraphPeakSymbols,
+            GraphPeakRelations,
+            GraphPeakFile.empty() ? llvm::StringRef("no unit has completed")
+                                  : llvm::StringRef(GraphPeakFile));
       if (!GraphFailures.empty()) {
         const auto &Failure = *GraphFailures.begin();
         return error("graph snapshot is not publishable: {0}: {1}",

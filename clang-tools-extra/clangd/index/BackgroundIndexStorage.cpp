@@ -11,6 +11,7 @@
 #include "support/Logger.h"
 #include "support/Path.h"
 #include "llvm/ADT/SmallString.h"
+#include "llvm/ADT/Twine.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/Error.h"
 #include "llvm/Support/FileSystem.h"
@@ -81,6 +82,41 @@ public:
       return llvm::Error::success();
     });
   }
+
+  // Named by the body's own digest, so the name is the content: two
+  // translation units that saw the same header the same way write the same
+  // file. The first writer wins and the rest are no-ops, which is why a header
+  // included by two hundred units costs one body rather than two hundred.
+  std::string storeGraphBody(llvm::StringRef Digest,
+                             llvm::StringRef Body) const override {
+    llvm::SmallString<128> Path(DiskShardRoot);
+    llvm::sys::path::append(Path, llvm::Twine(Digest) + ".graph.json");
+    if (llvm::sys::fs::exists(Path))
+      return std::string(Path);
+    // Written through a unique temporary and renamed, so a reader never sees a
+    // partial body under a name that promises a complete one.
+    llvm::SmallString<128> Temp;
+    int FD = 0;
+    if (llvm::sys::fs::createUniqueFile(llvm::Twine(Path) + ".%%%%%%%%", FD,
+                                        Temp)) {
+      elog("Failed to open a temporary for graph body {0}", Digest);
+      return std::string();
+    }
+    {
+      llvm::raw_fd_ostream OS(FD, /*shouldClose=*/true);
+      OS << Body;
+    }
+    if (auto EC = llvm::sys::fs::rename(Temp, Path)) {
+      llvm::sys::fs::remove(Temp);
+      // Losing a rename race means somebody else published the same bytes,
+      // because the name is the digest of exactly these bytes.
+      if (!llvm::sys::fs::exists(Path)) {
+        elog("Failed to publish graph body {0}: {1}", Digest, EC.message());
+        return std::string();
+      }
+    }
+    return std::string(Path);
+  }
 };
 
 // Doesn't persist index shards anywhere (used when the CDB dir is unknown).
@@ -97,6 +133,12 @@ public:
     vlog("Couldn't find project for {0}, indexing in-memory only",
          ShardIdentifier);
     return llvm::Error::success();
+  }
+
+  // No project directory means nowhere a consumer could read a body from, so
+  // this storage never offers a path and the snapshot carries bodies instead.
+  std::string storeGraphBody(llvm::StringRef, llvm::StringRef) const override {
+    return std::string();
   }
 };
 

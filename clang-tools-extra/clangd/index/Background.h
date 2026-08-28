@@ -59,6 +59,22 @@ public:
   virtual std::unique_ptr<IndexFileIn>
   loadShard(llvm::StringRef ShardIdentifier) const = 0;
 
+  // Writes one graph body and returns the absolute path it can be read from,
+  // or an empty string when this storage cannot serve bodies by path.
+  //
+  // A graph body is the largest thing this index produces and the only part a
+  // consumer wants whole. Sending it through the language-server pipe means
+  // building it as a `json::Value` tree, serializing that, and parsing it
+  // again on the other side, for every request that carries it -- and a
+  // consumer walking a whole compilation database asks for all of them.
+  //
+  // `Digest` is the body's own content digest, so the name is the content: two
+  // translation units that saw the same header the same way write the same
+  // file, and the second write is a no-op. A header included by two hundred
+  // units is stored once rather than two hundred times.
+  virtual std::string storeGraphBody(llvm::StringRef Digest,
+                                     llvm::StringRef Body) const = 0;
+
   // The factory provides storage for each File.
   // It keeps ownership of the storage instances, and should manage caching
   // itself. Factory must be threadsafe and never returns nullptr.
@@ -261,13 +277,18 @@ private:
     std::string CheckerDigest;
     std::string InterfaceFingerprint;
     std::string BodyDigest;
+    /// Absolute path the body was published to, empty when it was not.
+    std::string BodyPath;
   };
 
   /// Derives the resident metadata of a complete view from its body. A body
   /// carrying no checker for its own main file yields an empty CheckerDigest,
   /// which a snapshot rejects: dropping the view here would instead leave the
   /// main file permanently short of a configuration and reindexing forever.
-  static GraphView graphViewOf(const GraphTU &Graph);
+  /// Derives the resident view of a completed body, publishing the body to
+  /// \p Storage first when it can.
+  GraphView graphViewOf(const GraphTU &Graph,
+                        BackgroundIndexStorage *Storage) const;
 
   /// Loads the complete views persisted in one main file's shard.
   std::vector<GraphTU> loadGraphBodies(llvm::StringRef MainFile);
@@ -321,6 +342,7 @@ private:
     // Digest of the published body, carried so that a page can prove the shard
     // it loads is still the one this cache was planned against.
     std::string BodyDigest;
+    std::string BodyPath;
     std::vector<GraphSource> Sources;
     uint64_t SemanticMillis = 0;
   };

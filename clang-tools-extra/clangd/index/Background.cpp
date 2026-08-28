@@ -613,7 +613,8 @@ BackgroundQueue::Task BackgroundIndex::indexFileTask(
     size_t OtherBytes = 0;
     if (!Failure)
       for (const auto &Graph : CompleteGraphs) {
-        Published.emplace(Graph.CommandDigest, graphViewOf(Graph));
+        Published.emplace(Graph.CommandDigest,
+                          graphViewOf(Graph, IndexStorageFactory(Path)));
         Occurrences += Graph.Occurrences.size();
         Symbols += Graph.Symbols.size();
         Relations += Graph.Relations.size();
@@ -942,7 +943,8 @@ BackgroundIndex::loadProject(std::vector<std::string> MainFiles) {
       for (const auto &Graph : LS.Shard->Graphs)
         if (Graph.ProducerFingerprint == graphProducerFingerprint() &&
             (Graph.Language == "c" || Graph.Language == "cpp"))
-          LoadedViews.push_back(graphViewOf(Graph));
+          LoadedViews.push_back(
+              graphViewOf(Graph, IndexStorageFactory(LS.AbsolutePath)));
       auto SS =
           LS.Shard->Symbols
               ? std::make_unique<SymbolSlab>(std::move(*LS.Shard->Symbols))
@@ -1121,7 +1123,8 @@ static std::string graphBodyDigest(const GraphTU &Graph) {
 }
 
 BackgroundIndex::GraphView
-BackgroundIndex::graphViewOf(const GraphTU &Graph) {
+BackgroundIndex::graphViewOf(const GraphTU &Graph,
+                            BackgroundIndexStorage *Storage) const {
   GraphView View;
   View.MainFile = Graph.MainFile;
   View.MainFileURI = Graph.MainFileURI;
@@ -1145,6 +1148,18 @@ BackgroundIndex::graphViewOf(const GraphTU &Graph) {
                   << Symbol.Signature.size() << ':' << Symbol.Signature;
   View.InterfaceFingerprint = graphDigest(InterfaceOS.str());
   View.BodyDigest = graphBodyDigest(Graph);
+  // Published here, while the body is in hand and already being digested, so
+  // a snapshot can name it instead of carrying it. A body is the largest
+  // thing this index makes; putting it through the language-server pipe means
+  // building a `json::Value` tree, serializing it and parsing it again on the
+  // far side, once per request that carries it -- and a consumer walking a
+  // compilation database asks for every one of them.
+  if (Storage != nullptr) {
+    std::string Body;
+    llvm::raw_string_ostream BodyOS(Body);
+    BodyOS << toJSON(Graph);
+    View.BodyPath = Storage->storeGraphBody(View.BodyDigest, BodyOS.str());
+  }
   return View;
 }
 
@@ -1238,6 +1253,13 @@ BackgroundIndex::graphSnapshot(const GraphSnapshotParams &Params) {
     llvm::StringMap<std::vector<GraphTU>> Loaded;
     for (size_t I = Offset; I < End; ++I) {
       const auto &Shard = Cache.Shards[Plan.Upserts[I]];
+      // A shard whose body is already published needs nothing read here. The
+      // page names the file; the client reads it. Loading it to hand it back
+      // would be this process reading a body off disk so it can put the same
+      // bytes through a pipe -- which on a real compilation database was the
+      // largest single cost of answering a generation.
+      if (!Shard.BodyPath.empty())
+        continue;
       auto Main = Graphs.find(Shard.MainKey);
       if (Main == Graphs.end())
         return contentModified("graph snapshot changed between pages");
@@ -1274,35 +1296,55 @@ BackgroundIndex::graphSnapshot(const GraphSnapshotParams &Params) {
     if (llvm::Error Err = CheckCancellation())
       return std::move(Err);
     const size_t End = std::min(Plan.Upserts.size(), Offset + PageSize);
-    if (PageGraphs.size() != End - Offset)
-      return error("graph snapshot page does not match its plan");
+    // Only the shards without a published body were read, so the bodies in
+    // hand are a subset of the page and are consumed in the page's own order.
+    size_t NextGraph = 0;
     llvm::json::Array Upserts;
     for (size_t I = Offset; I < End; ++I) {
       if (llvm::Error Err = CheckCancellation())
         return std::move(Err);
       const auto &Shard = Cache.Shards[Plan.Upserts[I]];
-      const auto &Graph = PageGraphs[I - Offset];
       // The shard this page carries was proved against its published digest
       // while it was being read, before its sources were given the disk state
       // this snapshot validated. Everything else in Shard.Digest is metadata
       // that came from the same frozen cache, so recomputing it here could
       // only restate what CopyPage already established.
-      llvm::json::Value GraphJSON = toJSON(Graph);
       llvm::json::Array CoverageJSON;
       for (const auto &Row : Coverage)
         CoverageJSON.push_back(
             llvm::json::Object{{"family", Row.first}, {"state", Row.second}});
-      Upserts.push_back(llvm::json::Object{
+      // Named, not carried, whenever the body was published to a path this
+      // client can read. A body is the largest thing this index makes, and
+      // sending it means building a `json::Value` tree, serializing it, and
+      // parsing it again on the far side -- once per shard, and a consumer
+      // walking a compilation database asks for every shard there is. The
+      // path is content-addressed by `bodyDigest`, so a header two hundred
+      // units included resolves to one file rather than two hundred copies.
+      //
+      // `graph` is still carried when there is no path, which is the case for
+      // a project with nowhere to persist: a client must be able to read a
+      // generation either way, and it is the same body under either key.
+      llvm::json::Object Upsert{
           {"key", Shard.Key},
-          {"source", Graph.MainFile},
-          {"configuration", Graph.CommandDigest},
+          {"source", Shard.MainFile},
+          {"configuration", Shard.CommandDigest},
           {"checkerDigest", Shard.CheckerDigest},
           {"interfaceFingerprint", Shard.InterfaceFingerprint},
           {"digest", Shard.Digest},
-          {"graph", std::move(GraphJSON)},
-          {"coverage", std::move(CoverageJSON)}});
+          {"bodyDigest", Shard.BodyDigest},
+          {"coverage", std::move(CoverageJSON)}};
+      if (Shard.BodyPath.empty()) {
+        if (NextGraph >= PageGraphs.size())
+          return error("graph snapshot page is missing a body it must carry");
+        Upsert["graph"] = toJSON(PageGraphs[NextGraph++]);
+      } else {
+        Upsert["graphPath"] = Shard.BodyPath;
+      }
+      Upserts.push_back(std::move(Upsert));
     }
 
+    if (NextGraph != PageGraphs.size())
+      return error("graph snapshot page carried bodies it did not name");
     llvm::json::Array Manifest;
     if (Offset == 0 && !Plan.CacheHit)
       for (const auto &Shard : Cache.Shards)
@@ -1769,6 +1811,7 @@ BackgroundIndex::graphSnapshot(const GraphSnapshotParams &Params) {
     Cached.CheckerDigest = Graph.CheckerDigest;
     Cached.InterfaceFingerprint = Graph.InterfaceFingerprint;
     Cached.BodyDigest = Graph.BodyDigest;
+    Cached.BodyPath = Graph.BodyPath;
     Cached.Sources = Graph.Sources;
     Cached.SemanticMillis = Entry.SemanticMillis;
     Built.Shards.push_back(std::move(Cached));

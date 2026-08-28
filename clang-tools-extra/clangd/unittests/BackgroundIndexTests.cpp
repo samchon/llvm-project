@@ -135,6 +135,12 @@ public:
     return std::make_unique<IndexFileIn>(std::move(*IndexFile));
   }
 
+  // In-memory storage has no path a separate process could read, so it never
+  // offers one and every snapshot it serves carries its bodies inline.
+  std::string storeGraphBody(llvm::StringRef, llvm::StringRef) const override {
+    return std::string();
+  }
+
   mutable llvm::StringSet<> AccessedPaths;
 };
 

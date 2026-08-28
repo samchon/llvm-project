@@ -11,6 +11,7 @@
 
 #include "clang/Index/IndexSymbol.h"
 #include "clang/Tooling/CompilationDatabase.h"
+#include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/JSON.h"
 #include <cstdint>
@@ -203,6 +204,19 @@ bool fromJSON(const llvm::json::Value &Value, GraphTU &Graph,
 
 /// SHA-256 used by graph protocol identities and manifests.
 std::string graphDigest(llvm::StringRef Bytes);
+
+/// Splits one translation unit's facts into the files they were found in.
+///
+/// A translation unit sees every header it includes, so a header's symbols are
+/// in the body of every unit that includes it -- and in a C project whose
+/// headers are included by all 242 units, that is the same facts 242 times. The
+/// pieces are published by content digest, so splitting first means a header's
+/// piece is written once and read once no matter how many units saw it.
+///
+/// Each piece keeps the unit's own identity: it is still that unit's view of
+/// that file, under that command, and reassembling every piece of a unit gives
+/// back the unit. Keyed by file URI.
+llvm::StringMap<GraphTU> graphPiecesByFile(const GraphTU &Graph);
 std::string graphCommandDigest(const tooling::CompileCommand &Command);
 std::string graphProducerFingerprint();
 bool graphCommandIsCOrCXX(const tooling::CompileCommand &Command);

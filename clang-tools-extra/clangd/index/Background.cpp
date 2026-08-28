@@ -1155,10 +1155,49 @@ BackgroundIndex::graphViewOf(const GraphTU &Graph,
   // far side, once per request that carries it -- and a consumer walking a
   // compilation database asks for every one of them.
   if (Storage != nullptr) {
-    std::string Body;
-    llvm::raw_string_ostream BodyOS(Body);
-    BodyOS << toJSON(Graph);
-    View.BodyPath = Storage->storeGraphBody(View.BodyDigest, BodyOS.str());
+    // Split before it is written. A header's facts appear in every unit that
+    // includes it, so publishing whole bodies stores the same facts once per
+    // including unit -- on a project whose headers are included everywhere,
+    // that is the same megabytes hundreds of times. Pieces are named by their
+    // own content, so a header's piece is written once and read once.
+    //
+    // The main file's piece is named first, because it carries the unit's
+    // source set and reassembly starts from it.
+    bool Published = true;
+    std::vector<std::string> Paths;
+    auto Pieces = graphPiecesByFile(Graph);
+    auto Publish = [&](const GraphTU &Piece) {
+      std::string Body;
+      llvm::raw_string_ostream BodyOS(Body);
+      BodyOS << toJSON(Piece);
+      // Named by the bytes themselves, not by the body digest a shard
+      // carries: that digest is a summary of a unit's fields and counts,
+      // which two different pieces can share. A store keyed on it would
+      // hand one piece's facts back under the other's name.
+      std::string Path =
+          Storage->storeGraphBody(graphDigest(BodyOS.str()), BodyOS.str());
+      if (Path.empty())
+        Published = false;
+      else
+        Paths.push_back(std::move(Path));
+    };
+    auto Main = Pieces.find(Graph.MainFileURI);
+    if (Main == Pieces.end()) {
+      // Without the main file's piece there is nothing to reassemble from:
+      // it alone carries the unit's identity and source set. Carry the body
+      // instead of naming pieces that cannot be put back together.
+      Published = false;
+    } else {
+      Publish(Main->getValue());
+      for (const auto &Entry : Pieces)
+        if (Entry.getKey() != Graph.MainFileURI)
+          Publish(Entry.getValue());
+    }
+    // All or nothing: a generation that named some of its pieces and carried
+    // the rest would be two shapes at once, and a reader could not tell a
+    // missing piece from one that was never meant to be there.
+    if (Published)
+      View.BodyPaths = std::move(Paths);
   }
   return View;
 }
@@ -1258,7 +1297,7 @@ BackgroundIndex::graphSnapshot(const GraphSnapshotParams &Params) {
       // would be this process reading a body off disk so it can put the same
       // bytes through a pipe -- which on a real compilation database was the
       // largest single cost of answering a generation.
-      if (!Shard.BodyPath.empty())
+      if (!Shard.BodyPaths.empty())
         continue;
       auto Main = Graphs.find(Shard.MainKey);
       if (Main == Graphs.end())
@@ -1333,12 +1372,15 @@ BackgroundIndex::graphSnapshot(const GraphSnapshotParams &Params) {
           {"digest", Shard.Digest},
           {"bodyDigest", Shard.BodyDigest},
           {"coverage", std::move(CoverageJSON)}};
-      if (Shard.BodyPath.empty()) {
+      if (Shard.BodyPaths.empty()) {
         if (NextGraph >= PageGraphs.size())
           return error("graph snapshot page is missing a body it must carry");
         Upsert["graph"] = toJSON(PageGraphs[NextGraph++]);
       } else {
-        Upsert["graphPath"] = Shard.BodyPath;
+        llvm::json::Array Paths;
+        for (const auto &Path : Shard.BodyPaths)
+          Paths.push_back(Path);
+        Upsert["graphPaths"] = std::move(Paths);
       }
       Upserts.push_back(std::move(Upsert));
     }
@@ -1811,7 +1853,7 @@ BackgroundIndex::graphSnapshot(const GraphSnapshotParams &Params) {
     Cached.CheckerDigest = Graph.CheckerDigest;
     Cached.InterfaceFingerprint = Graph.InterfaceFingerprint;
     Cached.BodyDigest = Graph.BodyDigest;
-    Cached.BodyPath = Graph.BodyPath;
+    Cached.BodyPaths = Graph.BodyPaths;
     Cached.Sources = Graph.Sources;
     Cached.SemanticMillis = Entry.SemanticMillis;
     Built.Shards.push_back(std::move(Cached));

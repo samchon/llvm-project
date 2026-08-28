@@ -277,8 +277,14 @@ private:
     std::string CheckerDigest;
     std::string InterfaceFingerprint;
     std::string BodyDigest;
-    /// Absolute path the body was published to, empty when it was not.
-    std::string BodyPath;
+    /// Absolute paths the body's pieces were published to, in the order they
+    /// must be reassembled. Empty when nothing was published.
+    ///
+    /// A body is split by the file each fact was found in before it is
+    /// written, because a header's facts are in every unit that includes it
+    /// and the pieces are named by content: the header's piece is written once
+    /// however many units saw it, and read once however many name it.
+    std::vector<std::string> BodyPaths;
   };
 
   /// Derives the resident metadata of a complete view from its body. A body
@@ -342,7 +348,7 @@ private:
     // Digest of the published body, carried so that a page can prove the shard
     // it loads is still the one this cache was planned against.
     std::string BodyDigest;
-    std::string BodyPath;
+    std::vector<std::string> BodyPaths;
     std::vector<GraphSource> Sources;
     uint64_t SemanticMillis = 0;
   };

@@ -10,8 +10,6 @@
 #include "support/Path.h"
 #include "clang/Basic/Version.h"
 #include "clang/Driver/Types.h"
-#include "llvm/ADT/STLExtras.h"
-#include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/Support/Path.h"
 #include "llvm/Support/SHA256.h"
@@ -297,19 +295,16 @@ bool fromJSON(const llvm::json::Value &Value, GraphDiagnostic &Diagnostic,
 
 llvm::StringMap<GraphTU> graphPiecesByFile(const GraphTU &Graph) {
   llvm::StringMap<GraphTU> Pieces;
-  // Only the main file's piece carries the unit's identity, and it is the
-  // piece reassembly starts from. A header's piece must not carry it: two
-  // units that include the same header would otherwise produce two pieces
-  // differing solely in whose unit read the header, hash to two names, and be
-  // written twice -- which is exactly the duplication this split exists to
-  // remove. Identity-free, a header's facts are one file however many units
-  // saw them, and one parse however many name them.
-  auto Piece = [&](llvm::StringRef URI) -> GraphTU * {
-    if (URI.empty())
-      return nullptr;
+  // Only the main file's piece carries the unit's identity and its source
+  // list, and it is the piece reassembly starts from. A header's piece must
+  // not carry them: two units that include the same header would otherwise
+  // produce two pieces differing solely in whose unit read the header, hash
+  // to two names, and be stored twice -- which is the duplication this split
+  // exists to remove.
+  auto Piece = [&](llvm::StringRef URI) -> GraphTU & {
     auto It = Pieces.find(URI);
     if (It != Pieces.end())
-      return &It->getValue();
+      return It->getValue();
     GraphTU Empty;
     if (URI == Graph.MainFileURI) {
       Empty.ProducerFingerprint = Graph.ProducerFingerprint;
@@ -323,72 +318,71 @@ llvm::StringMap<GraphTU> graphPiecesByFile(const GraphTU &Graph) {
       Empty.TargetTriple = Graph.TargetTriple;
       Empty.Language = Graph.Language;
       Empty.HadErrors = Graph.HadErrors;
+      Empty.Sources = Graph.Sources;
     }
-    return &Pieces.try_emplace(URI, std::move(Empty)).first->getValue();
+    return Pieces.try_emplace(URI, std::move(Empty)).first->getValue();
+  };
+  // The pieces partition the unit: every fact belongs to exactly one of them,
+  // and reassembling all of them gives back the unit it came from, fact for
+  // fact. That is not a nicety -- a shard's body digest counts the facts it
+  // was made from, so a fact filed twice or filed nowhere makes a body that
+  // no longer answers to the name it was published under.
+  //
+  // A fact whose file is empty is filed under the main file rather than
+  // dropped, for the same reason.
+  auto Owner = [&](llvm::StringRef URI) -> GraphTU & {
+    return Piece(URI.empty() ? llvm::StringRef(Graph.MainFileURI) : URI);
   };
 
-  // A symbol belongs to where it is declared, and to where it is defined when
-  // that is a different file -- the same rule `FileShardedIndex` already
-  // applies to the symbol index this graph runs beside.
-  llvm::StringMap<llvm::SmallVector<llvm::StringRef, 2>> SymbolFiles;
+  // Every file the unit read gets a piece, whether or not it holds a fact:
+  // the list of pieces is what the unit saw.
+  for (const auto &Source : Graph.Sources)
+    Owner(Source.URI);
+  Piece(Graph.MainFileURI);
+
+  // A symbol belongs to where it is declared -- that is where its identity
+  // lives, and where every unit that only included the header agrees it is.
+  llvm::StringMap<llvm::StringRef> SymbolFiles;
   for (const auto &Symbol : Graph.Symbols) {
-    auto &Files = SymbolFiles[Symbol.ID];
-    if (auto *P = Piece(Symbol.Declaration.FileURI)) {
-      P->Symbols.push_back(Symbol);
-      Files.push_back(Symbol.Declaration.FileURI);
-    }
-    if (Symbol.Definition.valid() &&
-        Symbol.Definition.FileURI != Symbol.Declaration.FileURI)
-      if (auto *P = Piece(Symbol.Definition.FileURI)) {
-        P->Symbols.push_back(Symbol);
-        Files.push_back(Symbol.Definition.FileURI);
-      }
+    llvm::StringRef URI = Symbol.Declaration.FileURI;
+    if (URI.empty())
+      URI = Symbol.Definition.FileURI;
+    SymbolFiles.try_emplace(Symbol.ID, URI);
+    Owner(URI).Symbols.push_back(Symbol);
   }
   // An occurrence belongs to the file it was spelled in.
   for (const auto &Occurrence : Graph.Occurrences)
-    if (auto *P = Piece(Occurrence.Spelling.FileURI))
-      P->Occurrences.push_back(Occurrence);
-  // A relation goes to both endpoints' files, because either side may be read
-  // without the other. Two translation units that disagree would be a race the
-  // shard model already has, and content addressing makes agreement free.
+    Owner(Occurrence.Spelling.FileURI).Occurrences.push_back(Occurrence);
+  // A relation belongs to its subject's file, because a relation is something
+  // said about the subject. Where the subject is unknown to this unit it goes
+  // with the object, and failing that with the main file.
   for (const auto &Relation : Graph.Relations) {
-    llvm::SmallVector<llvm::StringRef, 4> Targets;
+    llvm::StringRef URI;
     for (const auto *ID : {&Relation.SubjectID, &Relation.ObjectID}) {
       auto It = SymbolFiles.find(*ID);
-      if (It == SymbolFiles.end())
-        continue;
-      for (llvm::StringRef URI : It->getValue())
-        if (!llvm::is_contained(Targets, URI))
-          Targets.push_back(URI);
+      if (It != SymbolFiles.end() && !It->getValue().empty()) {
+        URI = It->getValue();
+        break;
+      }
     }
-    for (llvm::StringRef URI : Targets)
-      if (auto *P = Piece(URI))
-        P->Relations.push_back(Relation);
+    Owner(URI).Relations.push_back(Relation);
   }
-  for (const auto &Macro : Graph.Macros)
-    if (auto *P = Piece(Macro.Definition.valid() ? Macro.Definition.FileURI
-                                                 : Macro.Spelling.FileURI))
-      P->Macros.push_back(Macro);
+  for (const auto &Macro : Graph.Macros) {
+    llvm::StringRef URI = Macro.Definition.FileURI;
+    if (URI.empty())
+      URI = Macro.Spelling.FileURI;
+    if (URI.empty())
+      URI = Macro.Expansion.FileURI;
+    Owner(URI).Macros.push_back(Macro);
+  }
   for (const auto &Include : Graph.Includes)
-    if (auto *P = Piece(Include.SourceURI))
-      P->Includes.push_back(Include);
+    Owner(Include.SourceURI).Includes.push_back(Include);
   for (const auto &Missing : Graph.MissingIncludes)
-    if (auto *P = Piece(Missing.SourceURI))
-      P->MissingIncludes.push_back(Missing);
+    Owner(Missing.SourceURI).MissingIncludes.push_back(Missing);
   for (const auto &Module : Graph.Modules)
-    if (auto *P = Piece(Module.Evidence.FileURI))
-      P->Modules.push_back(Module);
+    Owner(Module.Evidence.FileURI).Modules.push_back(Module);
   for (const auto &Diagnostic : Graph.Diagnostics)
-    if (auto *P = Piece(Diagnostic.Range.FileURI))
-      P->Diagnostics.push_back(Diagnostic);
-  // A source row describes a file, so it goes to that file's piece, and the
-  // main file's piece carries the whole list: reassembly needs the unit's full
-  // source set to prove what it consumed, and one piece has to hold it.
-  for (const auto &Source : Graph.Sources)
-    if (auto *P = Piece(Source.URI))
-      P->Sources.push_back(Source);
-  if (auto *Main = Piece(Graph.MainFileURI))
-    Main->Sources = Graph.Sources;
+    Owner(Diagnostic.Range.FileURI).Diagnostics.push_back(Diagnostic);
   return Pieces;
 }
 

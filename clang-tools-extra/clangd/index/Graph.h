@@ -207,15 +207,20 @@ std::string graphDigest(llvm::StringRef Bytes);
 
 /// Splits one translation unit's facts into the files they were found in.
 ///
-/// A translation unit sees every header it includes, so a header's symbols are
-/// in the body of every unit that includes it -- and in a C project whose
-/// headers are included by all 242 units, that is the same facts 242 times. The
-/// pieces are published by content digest, so splitting first means a header's
-/// piece is written once and read once no matter how many units saw it.
+/// A translation unit sees every header it includes, so a header's facts are
+/// in the body of every unit that includes it. Published by content digest,
+/// a header's piece is then written once however many units saw it, instead
+/// of once per unit.
 ///
-/// Each piece keeps the unit's own identity: it is still that unit's view of
-/// that file, under that command, and reassembling every piece of a unit gives
-/// back the unit. Keyed by file URI.
+/// The pieces partition the unit: every fact belongs to exactly one of them,
+/// and reassembling all of them gives the unit back fact for fact. A body's
+/// digest counts the facts it was made from, so a fact filed twice or filed
+/// nowhere makes a body that no longer answers to its own name.
+///
+/// Only the main file's piece carries the unit's identity and source list,
+/// and it is the piece reassembly starts from. A header's piece carries
+/// neither, which is what lets two units that include it agree byte for byte.
+/// Keyed by file URI.
 llvm::StringMap<GraphTU> graphPiecesByFile(const GraphTU &Graph);
 std::string graphCommandDigest(const tooling::CompileCommand &Command);
 std::string graphProducerFingerprint();

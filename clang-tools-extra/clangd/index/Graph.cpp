@@ -430,6 +430,31 @@ void streamPieceJSON(llvm::json::OStream &JSON, const GraphTU &Graph,
   });
 }
 
+llvm::json::Value toJSON(const GraphTU &Graph) {
+  return llvm::json::Object{
+      {"producerFingerprint", Graph.ProducerFingerprint},
+      {"mainFileUri", Graph.MainFileURI},
+      {"mainFile", Graph.MainFile},
+      {"directory", Graph.Directory},
+      {"commandLine", llvm::json::Array(Graph.CommandLine)},
+      {"output", Graph.Output},
+      {"commandDigest", Graph.CommandDigest},
+      {"toolchainFingerprint", Graph.ToolchainFingerprint},
+      {"targetTriple", Graph.TargetTriple},
+      {"language", Graph.Language},
+      {"hadErrors", Graph.HadErrors},
+      {"sources", arrayJSON(Graph.Sources, sourceJSON)},
+      {"symbols", arrayJSON(Graph.Symbols, symbolJSON)},
+      {"occurrences", arrayJSON(Graph.Occurrences, occurrenceJSON)},
+      {"relations", arrayJSON(Graph.Relations, relationJSON)},
+      {"macros", arrayJSON(Graph.Macros, macroJSON)},
+      {"includes", arrayJSON(Graph.Includes, includeJSON)},
+      {"missingIncludes",
+       arrayJSON(Graph.MissingIncludes, missingIncludeJSON)},
+      {"modules", arrayJSON(Graph.Modules, moduleJSON)},
+      {"diagnostics", arrayJSON(Graph.Diagnostics, diagnosticJSON)}};
+}
+
 bool fromJSON(const llvm::json::Value &Value, GraphTU &Graph,
               llvm::json::Path Path) {
   llvm::json::ObjectMapper O(Value, Path);

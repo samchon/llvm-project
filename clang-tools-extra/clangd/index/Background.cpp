@@ -1140,12 +1140,25 @@ BackgroundIndex::graphViewOf(const GraphTU &Graph,
       View.CheckerDigest = Source.Digest;
       break;
     }
+  // Ordered, because an interface is what a unit exports and not the order
+  // this index happened to walk it in. A published body is split by file and
+  // reassembled by whoever reads it, which returns the symbols in a different
+  // order than they left -- and a consumer recomputing this over the
+  // reassembled body has to arrive at the same fingerprint.
+  std::vector<std::string> Exports;
+  for (const auto &Symbol : Graph.Symbols)
+    if (Symbol.Exported) {
+      std::string Entry;
+      llvm::raw_string_ostream EntryOS(Entry);
+      EntryOS << Symbol.ID.size() << ':' << Symbol.ID << Symbol.Signature.size()
+              << ':' << Symbol.Signature;
+      Exports.push_back(std::move(Entry));
+    }
+  llvm::sort(Exports);
   std::string Interface;
   llvm::raw_string_ostream InterfaceOS(Interface);
-  for (const auto &Symbol : Graph.Symbols)
-    if (Symbol.Exported)
-      InterfaceOS << Symbol.ID.size() << ':' << Symbol.ID
-                  << Symbol.Signature.size() << ':' << Symbol.Signature;
+  for (const auto &Entry : Exports)
+    InterfaceOS << Entry;
   View.InterfaceFingerprint = graphDigest(InterfaceOS.str());
   View.BodyDigest = graphBodyDigest(Graph);
   // Published here, while the body is in hand and already being digested, so

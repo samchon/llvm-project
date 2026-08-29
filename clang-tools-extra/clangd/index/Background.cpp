@@ -607,9 +607,9 @@ BackgroundQueue::Task BackgroundIndex::indexFileTask(
     }
 
     // Derived here because this is the last point at which the bodies are in
-    // hand. update() persists them into the main-file shard and does not give
-    // them back, and holding a copy to derive from afterwards is precisely the
-    // copy this avoids.
+    // hand, and released here for the same reason: a body that has been
+    // published is on disk, and the shard that follows records what the unit
+    // is and where its facts are rather than the facts themselves.
     std::map<std::string, GraphView> Published;
     size_t Occurrences = 0;
     size_t Symbols = 0;
@@ -619,9 +619,7 @@ BackgroundQueue::Task BackgroundIndex::indexFileTask(
     size_t RelationBytes = 0;
     size_t OtherBytes = 0;
     if (!Failure)
-      for (const auto &Graph : CompleteGraphs) {
-        Published.emplace(Graph.CommandDigest,
-                          graphViewOf(Graph, IndexStorageFactory(Path)));
+      for (auto &Graph : CompleteGraphs) {
         Occurrences += Graph.Occurrences.size();
         Symbols += Graph.Symbols.size();
         Relations += Graph.Relations.size();
@@ -629,6 +627,36 @@ BackgroundQueue::Task BackgroundIndex::indexFileTask(
         OccurrenceBytes += graphOccurrenceBytes(Graph);
         RelationBytes += graphRelationBytes(Graph);
         OtherBytes += graphOtherBytes(Graph);
+        auto View = graphViewOf(Graph, IndexStorageFactory(Path));
+        // Released as soon as it is published. A body that was written to
+        // disk is on disk, and carrying it on to be written into the
+        // main-file shard as well means every configuration of a file stands
+        // in memory at once: one C++ file compiled five ways is five bodies,
+        // and on fmt that took a sixteen gibibyte host from twelve free to
+        // one in ten seconds, with a single worker.
+        //
+        // The shard then records what the unit is and where its facts are,
+        // not the facts. A process that starts again indexes rather than
+        // reloading bodies it no longer keeps twice.
+        if (!View.BodyPaths.empty()) {
+          Graph.Symbols.clear();
+          Graph.Symbols.shrink_to_fit();
+          Graph.Occurrences.clear();
+          Graph.Occurrences.shrink_to_fit();
+          Graph.Relations.clear();
+          Graph.Relations.shrink_to_fit();
+          Graph.Macros.clear();
+          Graph.Macros.shrink_to_fit();
+          Graph.Includes.clear();
+          Graph.Includes.shrink_to_fit();
+          Graph.MissingIncludes.clear();
+          Graph.MissingIncludes.shrink_to_fit();
+          Graph.Modules.clear();
+          Graph.Modules.shrink_to_fit();
+          Graph.Diagnostics.clear();
+          Graph.Diagnostics.shrink_to_fit();
+        }
+        Published.emplace(Graph.CommandDigest, std::move(View));
       }
 
     // Preserve clangd's pre-graph behavior: one representative command owns

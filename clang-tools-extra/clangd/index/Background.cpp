@@ -368,7 +368,14 @@ void BackgroundIndex::enqueue(const std::vector<std::string> &ChangedFiles) {
   {
     std::lock_guard<std::mutex> Lock(GraphMu);
     ++GraphDiscoveryPending;
+    GraphDiscoveryStarted = std::chrono::steady_clock::now();
   }
+  // Said here, not only when the task begins. A snapshot refuses while any
+  // discovery is outstanding, and a consumer waited twenty minutes on that
+  // refusal with nothing in the log between the compilation database being
+  // reloaded and the task finally running. Whether the wait is this queue or
+  // what put work into it cannot be told from the task's own first line.
+  log("Graph discovery queued for {0} commands", ChangedFiles.size());
   Queue.push(changedFilesTask(ChangedFiles));
 }
 
@@ -1640,7 +1647,11 @@ BackgroundIndex::graphSnapshot(const GraphSnapshotParams &Params) {
       if (GraphDiscoveryPending != 0)
         return contentModified(
             "graph snapshot is not ready: project changes are still being "
-            "discovered");
+            "discovered ({0} outstanding, the oldest for {1} ms)",
+            GraphDiscoveryPending,
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - GraphDiscoveryStarted)
+                .count());
       if (!GraphPending.empty())
         return contentModified(
             "graph snapshot is not ready: {0} translation units are still "

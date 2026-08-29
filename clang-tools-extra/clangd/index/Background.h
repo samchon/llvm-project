@@ -29,6 +29,7 @@
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Support/Threading.h"
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <deque>
 #include <map>
@@ -313,6 +314,9 @@ private:
   mutable std::mutex GraphMu;
   llvm::StringMap<std::map<std::string, GraphView>> Graphs;
   size_t GraphDiscoveryPending = 0;
+  /// When the oldest outstanding discovery was queued, so a refusal can say
+  /// whether it is reporting progress or a stall.
+  std::chrono::steady_clock::time_point GraphDiscoveryStarted;
   llvm::StringSet<> GraphPending;
   llvm::StringMap<std::string> GraphFailures;
   llvm::StringMap<std::string> GraphFailureTUs;

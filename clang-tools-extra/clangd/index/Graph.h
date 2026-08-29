@@ -177,6 +177,8 @@ struct GraphTU {
 };
 
 llvm::json::Value toJSON(const GraphTU &Graph);
+
+
 bool fromJSON(const llvm::json::Value &Value, GraphRange &Range,
               llvm::json::Path Path);
 bool fromJSON(const llvm::json::Value &Value, GraphAttribute &Attribute,
@@ -205,6 +207,26 @@ bool fromJSON(const llvm::json::Value &Value, GraphTU &Graph,
 /// SHA-256 used by graph protocol identities and manifests.
 std::string graphDigest(llvm::StringRef Bytes);
 
+/// One file's share of a translation unit's facts, as indices into it.
+///
+/// A view rather than a copy. One C++ unit's body holds 342 MiB of facts, and
+/// splitting it by copying them into per-file bodies held that twice; two
+/// workers doing it at once exhausted a sixteen gibibyte host while the last
+/// units were still indexing. Four bytes a fact says the same thing.
+struct GraphPiece {
+  /// Whether this is the main file's piece, which alone carries the unit's
+  /// identity and its whole source list, and which reassembly starts from.
+  bool Main = false;
+  std::vector<uint32_t> Symbols;
+  std::vector<uint32_t> Occurrences;
+  std::vector<uint32_t> Relations;
+  std::vector<uint32_t> Macros;
+  std::vector<uint32_t> Includes;
+  std::vector<uint32_t> MissingIncludes;
+  std::vector<uint32_t> Modules;
+  std::vector<uint32_t> Diagnostics;
+};
+
 /// Splits one translation unit's facts into the files they were found in.
 ///
 /// A translation unit sees every header it includes, so a header's facts are
@@ -218,10 +240,18 @@ std::string graphDigest(llvm::StringRef Bytes);
 /// nowhere makes a body that no longer answers to its own name.
 ///
 /// Only the main file's piece carries the unit's identity and source list,
-/// and it is the piece reassembly starts from. A header's piece carries
-/// neither, which is what lets two units that include it agree byte for byte.
+/// which is what lets two units that include one header agree byte for byte.
 /// Keyed by file URI.
-llvm::StringMap<GraphTU> graphPiecesByFile(const GraphTU &Graph);
+llvm::StringMap<GraphPiece> graphPiecesByFile(const GraphTU &Graph);
+
+/// Writes one piece as JSON straight to a stream.
+///
+/// `toJSON` builds the whole answer first: a `json::Value` tree of every fact
+/// and then the text of that tree, each a multiple of the facts again. This
+/// writes one fact at a time and lets it go, so publishing a body costs the
+/// body and a buffer.
+void streamPieceJSON(llvm::json::OStream &JSON, const GraphTU &Graph,
+                     const GraphPiece &Piece);
 std::string graphCommandDigest(const tooling::CompileCommand &Command);
 std::string graphProducerFingerprint();
 bool graphCommandIsCOrCXX(const tooling::CompileCommand &Command);

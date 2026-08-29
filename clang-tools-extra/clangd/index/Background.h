@@ -24,7 +24,9 @@
 #include "clang/Tooling/CompilationDatabase.h"
 #include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/StringSet.h"
+#include "llvm/ADT/STLFunctionalExtras.h"
 #include "llvm/Support/Error.h"
+#include "llvm/Support/raw_ostream.h"
 #include "llvm/Support/Threading.h"
 #include <atomic>
 #include <condition_variable>
@@ -68,12 +70,18 @@ public:
   // again on the other side, for every request that carries it -- and a
   // consumer walking a whole compilation database asks for all of them.
   //
-  // `Digest` is the body's own content digest, so the name is the content: two
+  // The body is written by `Write` rather than handed over, and the name is
+  // the digest of the bytes it wrote, so the name is the content: two
   // translation units that saw the same header the same way write the same
   // file, and the second write is a no-op. A header included by two hundred
   // units is stored once rather than two hundred times.
-  virtual std::string storeGraphBody(llvm::StringRef Digest,
-                                     llvm::StringRef Body) const = 0;
+  //
+  // Written rather than handed over because a body handed over is a body that
+  // exists twice. One C++ unit's body holds 342 MiB of facts; building the
+  // text of it beside the facts themselves, in two workers at once, is what
+  // exhausted a 16 GiB host while the last units were still indexing.
+  virtual std::string storeGraphBody(
+      llvm::function_ref<void(llvm::raw_ostream &)> Write) const = 0;
 
   // The factory provides storage for each File.
   // It keeps ownership of the storage instances, and should manage caching

@@ -10,12 +10,14 @@
 #include "index/Background.h"
 #include "support/Logger.h"
 #include "support/Path.h"
+#include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/Twine.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/Error.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/MemoryBuffer.h"
+#include "llvm/Support/SHA256.h"
 #include "llvm/Support/Path.h"
 #include "llvm/Support/raw_ostream.h"
 #include <functional>
@@ -24,6 +26,36 @@
 namespace clang {
 namespace clangd {
 namespace {
+
+/// A stream that hashes what passes through it on the way to a file.
+///
+/// A published body is named by its own content, and the obvious way to learn
+/// that name is to build the body and hash it. On a C++ translation unit the
+/// body is hundreds of megabytes, and holding one to hash it -- in two
+/// workers at once, while the last units are still indexing -- is what
+/// exhausted a sixteen gibibyte host. Hashing it as it is written costs a
+/// buffer.
+class HashingStream : public llvm::raw_ostream {
+public:
+  explicit HashingStream(llvm::raw_ostream &Out) : Out(Out) {}
+  ~HashingStream() override { flush(); }
+
+  /// The name the bytes written so far have earned. Flush first.
+  std::string digest() { return llvm::toHex(Hash.final(), /*LowerCase=*/true); }
+
+private:
+  void write_impl(const char *Ptr, size_t Size) override {
+    Hash.update(llvm::ArrayRef<uint8_t>(
+        reinterpret_cast<const uint8_t *>(Ptr), Size));
+    Out.write(Ptr, Size);
+    Written += Size;
+  }
+  uint64_t current_pos() const override { return Written; }
+
+  llvm::raw_ostream &Out;
+  llvm::SHA256 Hash;
+  uint64_t Written = 0;
+};
 
 std::string getShardPathFromFilePath(llvm::StringRef ShardRoot,
                                      llvm::StringRef FilePath) {
@@ -87,24 +119,35 @@ public:
   // translation units that saw the same header the same way write the same
   // file. The first writer wins and the rest are no-ops, which is why a header
   // included by two hundred units costs one body rather than two hundred.
-  std::string storeGraphBody(llvm::StringRef Digest,
-                             llvm::StringRef Body) const override {
-    llvm::SmallString<128> Path(DiskShardRoot);
-    llvm::sys::path::append(Path, llvm::Twine(Digest) + ".graph.json");
-    if (llvm::sys::fs::exists(Path))
-      return std::string(Path);
-    // Written through a unique temporary and renamed, so a reader never sees a
-    // partial body under a name that promises a complete one.
+  //
+  // The body is written into a temporary and hashed as it goes, then renamed
+  // to the name those bytes earned. Nothing holds the whole body: it is
+  // hundreds of megabytes on a C++ unit, and holding one to hash it, in two
+  // workers at once, was the difference between publishing a generation and
+  // exhausting the host.
+  std::string storeGraphBody(
+      llvm::function_ref<void(llvm::raw_ostream &)> Write) const override {
+    llvm::SmallString<128> Pattern(DiskShardRoot);
+    llvm::sys::path::append(Pattern, "graph-body.%%%%%%%%");
     llvm::SmallString<128> Temp;
     int FD = 0;
-    if (llvm::sys::fs::createUniqueFile(llvm::Twine(Path) + ".%%%%%%%%", FD,
-                                        Temp)) {
-      elog("Failed to open a temporary for graph body {0}", Digest);
+    if (llvm::sys::fs::createUniqueFile(Pattern, FD, Temp)) {
+      elog("Failed to open a temporary for a graph body");
       return std::string();
     }
+    std::string Digest;
     {
-      llvm::raw_fd_ostream OS(FD, /*shouldClose=*/true);
-      OS << Body;
+      llvm::raw_fd_ostream Out(FD, /*shouldClose=*/true);
+      HashingStream Hashing(Out);
+      Write(Hashing);
+      Hashing.flush();
+      Digest = Hashing.digest();
+    }
+    llvm::SmallString<128> Path(DiskShardRoot);
+    llvm::sys::path::append(Path, llvm::Twine(Digest) + ".graph.json");
+    if (llvm::sys::fs::exists(Path)) {
+      llvm::sys::fs::remove(Temp);
+      return std::string(Path);
     }
     if (auto EC = llvm::sys::fs::rename(Temp, Path)) {
       llvm::sys::fs::remove(Temp);
@@ -137,7 +180,8 @@ public:
 
   // No project directory means nowhere a consumer could read a body from, so
   // this storage never offers a path and the snapshot carries bodies instead.
-  std::string storeGraphBody(llvm::StringRef, llvm::StringRef) const override {
+  std::string storeGraphBody(
+      llvm::function_ref<void(llvm::raw_ostream &)>) const override {
     return std::string();
   }
 };

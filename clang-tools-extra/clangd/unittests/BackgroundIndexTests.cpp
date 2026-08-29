@@ -137,7 +137,8 @@ public:
 
   // In-memory storage has no path a separate process could read, so it never
   // offers one and every snapshot it serves carries its bodies inline.
-  std::string storeGraphBody(llvm::StringRef, llvm::StringRef) const override {
+  std::string storeGraphBody(
+      llvm::function_ref<void(llvm::raw_ostream &)>) const override {
     return std::string();
   }
 

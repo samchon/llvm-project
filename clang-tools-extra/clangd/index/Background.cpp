@@ -1179,16 +1179,16 @@ BackgroundIndex::graphViewOf(const GraphTU &Graph,
     bool Published = true;
     std::vector<std::string> Paths;
     auto Pieces = graphPiecesByFile(Graph);
-    auto Publish = [&](const GraphTU &Piece) {
-      std::string Body;
-      llvm::raw_string_ostream BodyOS(Body);
-      BodyOS << toJSON(Piece);
-      // Named by the bytes themselves, not by the body digest a shard
-      // carries: that digest is a summary of a unit's fields and counts,
-      // which two different pieces can share. A store keyed on it would
-      // hand one piece's facts back under the other's name.
-      std::string Path =
-          Storage->storeGraphBody(graphDigest(BodyOS.str()), BodyOS.str());
+    auto Publish = [&](const GraphPiece &Piece) {
+      // Streamed into the store rather than built and handed over. The store
+      // names a body by the digest of the bytes it wrote, which is the only
+      // name that separates two pieces: the body digest a shard carries is a
+      // summary of a unit's fields and counts, and two different pieces can
+      // share one.
+      std::string Path = Storage->storeGraphBody([&](llvm::raw_ostream &OS) {
+        llvm::json::OStream JSON(OS);
+        streamPieceJSON(JSON, Graph, Piece);
+      });
       if (Path.empty())
         Published = false;
       else

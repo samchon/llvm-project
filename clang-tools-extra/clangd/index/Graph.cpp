@@ -293,70 +293,48 @@ bool fromJSON(const llvm::json::Value &Value, GraphDiagnostic &Diagnostic,
   return diagnosticFromJSON(Value, Diagnostic, Path);
 }
 
-llvm::StringMap<GraphTU> graphPiecesByFile(const GraphTU &Graph) {
-  llvm::StringMap<GraphTU> Pieces;
-  // Only the main file's piece carries the unit's identity and its source
-  // list, and it is the piece reassembly starts from. A header's piece must
-  // not carry them: two units that include the same header would otherwise
-  // produce two pieces differing solely in whose unit read the header, hash
-  // to two names, and be stored twice -- which is the duplication this split
-  // exists to remove.
-  auto Piece = [&](llvm::StringRef URI) -> GraphTU & {
-    auto It = Pieces.find(URI);
+llvm::StringMap<GraphPiece> graphPiecesByFile(const GraphTU &Graph) {
+  llvm::StringMap<GraphPiece> Pieces;
+  // A fact whose file is empty is filed under the main file rather than
+  // dropped: the pieces have to partition the unit, because a body's digest
+  // counts the facts it was made from, and a fact filed twice or filed
+  // nowhere makes a body that no longer answers to its own name.
+  auto Owner = [&](llvm::StringRef URI) -> GraphPiece & {
+    llvm::StringRef Key =
+        URI.empty() ? llvm::StringRef(Graph.MainFileURI) : URI;
+    auto It = Pieces.find(Key);
     if (It != Pieces.end())
       return It->getValue();
-    GraphTU Empty;
-    if (URI == Graph.MainFileURI) {
-      Empty.ProducerFingerprint = Graph.ProducerFingerprint;
-      Empty.MainFileURI = Graph.MainFileURI;
-      Empty.MainFile = Graph.MainFile;
-      Empty.Directory = Graph.Directory;
-      Empty.CommandLine = Graph.CommandLine;
-      Empty.Output = Graph.Output;
-      Empty.CommandDigest = Graph.CommandDigest;
-      Empty.ToolchainFingerprint = Graph.ToolchainFingerprint;
-      Empty.TargetTriple = Graph.TargetTriple;
-      Empty.Language = Graph.Language;
-      Empty.HadErrors = Graph.HadErrors;
-      Empty.Sources = Graph.Sources;
-    }
-    return Pieces.try_emplace(URI, std::move(Empty)).first->getValue();
-  };
-  // The pieces partition the unit: every fact belongs to exactly one of them,
-  // and reassembling all of them gives back the unit it came from, fact for
-  // fact. That is not a nicety -- a shard's body digest counts the facts it
-  // was made from, so a fact filed twice or filed nowhere makes a body that
-  // no longer answers to the name it was published under.
-  //
-  // A fact whose file is empty is filed under the main file rather than
-  // dropped, for the same reason.
-  auto Owner = [&](llvm::StringRef URI) -> GraphTU & {
-    return Piece(URI.empty() ? llvm::StringRef(Graph.MainFileURI) : URI);
+    GraphPiece Empty;
+    Empty.Main = Key == Graph.MainFileURI;
+    return Pieces.try_emplace(Key, std::move(Empty)).first->getValue();
   };
 
   // Every file the unit read gets a piece, whether or not it holds a fact:
   // the list of pieces is what the unit saw.
   for (const auto &Source : Graph.Sources)
     Owner(Source.URI);
-  Piece(Graph.MainFileURI);
+  Owner(Graph.MainFileURI);
 
   // A symbol belongs to where it is declared -- that is where its identity
   // lives, and where every unit that only included the header agrees it is.
   llvm::StringMap<llvm::StringRef> SymbolFiles;
-  for (const auto &Symbol : Graph.Symbols) {
+  for (uint32_t I = 0; I < Graph.Symbols.size(); ++I) {
+    const auto &Symbol = Graph.Symbols[I];
     llvm::StringRef URI = Symbol.Declaration.FileURI;
     if (URI.empty())
       URI = Symbol.Definition.FileURI;
     SymbolFiles.try_emplace(Symbol.ID, URI);
-    Owner(URI).Symbols.push_back(Symbol);
+    Owner(URI).Symbols.push_back(I);
   }
   // An occurrence belongs to the file it was spelled in.
-  for (const auto &Occurrence : Graph.Occurrences)
-    Owner(Occurrence.Spelling.FileURI).Occurrences.push_back(Occurrence);
+  for (uint32_t I = 0; I < Graph.Occurrences.size(); ++I)
+    Owner(Graph.Occurrences[I].Spelling.FileURI).Occurrences.push_back(I);
   // A relation belongs to its subject's file, because a relation is something
   // said about the subject. Where the subject is unknown to this unit it goes
   // with the object, and failing that with the main file.
-  for (const auto &Relation : Graph.Relations) {
+  for (uint32_t I = 0; I < Graph.Relations.size(); ++I) {
+    const auto &Relation = Graph.Relations[I];
     llvm::StringRef URI;
     for (const auto *ID : {&Relation.SubjectID, &Relation.ObjectID}) {
       auto It = SymbolFiles.find(*ID);
@@ -365,49 +343,91 @@ llvm::StringMap<GraphTU> graphPiecesByFile(const GraphTU &Graph) {
         break;
       }
     }
-    Owner(URI).Relations.push_back(Relation);
+    Owner(URI).Relations.push_back(I);
   }
-  for (const auto &Macro : Graph.Macros) {
+  for (uint32_t I = 0; I < Graph.Macros.size(); ++I) {
+    const auto &Macro = Graph.Macros[I];
     llvm::StringRef URI = Macro.Definition.FileURI;
     if (URI.empty())
       URI = Macro.Spelling.FileURI;
     if (URI.empty())
       URI = Macro.Expansion.FileURI;
-    Owner(URI).Macros.push_back(Macro);
+    Owner(URI).Macros.push_back(I);
   }
-  for (const auto &Include : Graph.Includes)
-    Owner(Include.SourceURI).Includes.push_back(Include);
-  for (const auto &Missing : Graph.MissingIncludes)
-    Owner(Missing.SourceURI).MissingIncludes.push_back(Missing);
-  for (const auto &Module : Graph.Modules)
-    Owner(Module.Evidence.FileURI).Modules.push_back(Module);
-  for (const auto &Diagnostic : Graph.Diagnostics)
-    Owner(Diagnostic.Range.FileURI).Diagnostics.push_back(Diagnostic);
+  for (uint32_t I = 0; I < Graph.Includes.size(); ++I)
+    Owner(Graph.Includes[I].SourceURI).Includes.push_back(I);
+  for (uint32_t I = 0; I < Graph.MissingIncludes.size(); ++I)
+    Owner(Graph.MissingIncludes[I].SourceURI).MissingIncludes.push_back(I);
+  for (uint32_t I = 0; I < Graph.Modules.size(); ++I)
+    Owner(Graph.Modules[I].Evidence.FileURI).Modules.push_back(I);
+  for (uint32_t I = 0; I < Graph.Diagnostics.size(); ++I)
+    Owner(Graph.Diagnostics[I].Range.FileURI).Diagnostics.push_back(I);
   return Pieces;
 }
 
-llvm::json::Value toJSON(const GraphTU &Graph) {
-  return llvm::json::Object{
-      {"producerFingerprint", Graph.ProducerFingerprint},
-      {"mainFileUri", Graph.MainFileURI},
-      {"mainFile", Graph.MainFile},
-      {"directory", Graph.Directory},
-      {"commandLine", llvm::json::Array(Graph.CommandLine)},
-      {"output", Graph.Output},
-      {"commandDigest", Graph.CommandDigest},
-      {"toolchainFingerprint", Graph.ToolchainFingerprint},
-      {"targetTriple", Graph.TargetTriple},
-      {"language", Graph.Language},
-      {"hadErrors", Graph.HadErrors},
-      {"sources", arrayJSON(Graph.Sources, sourceJSON)},
-      {"symbols", arrayJSON(Graph.Symbols, symbolJSON)},
-      {"occurrences", arrayJSON(Graph.Occurrences, occurrenceJSON)},
-      {"relations", arrayJSON(Graph.Relations, relationJSON)},
-      {"macros", arrayJSON(Graph.Macros, macroJSON)},
-      {"includes", arrayJSON(Graph.Includes, includeJSON)},
-      {"missingIncludes", arrayJSON(Graph.MissingIncludes, missingIncludeJSON)},
-      {"modules", arrayJSON(Graph.Modules, moduleJSON)},
-      {"diagnostics", arrayJSON(Graph.Diagnostics, diagnosticJSON)}};
+void streamPieceJSON(llvm::json::OStream &JSON, const GraphTU &Graph,
+                     const GraphPiece &Piece) {
+  // One fact at a time. The per-fact writers build a small value that is
+  // written and released before the next one is built, so what stands at once
+  // is a fact and a buffer rather than the whole body several times over.
+  auto Facts = [&](llvm::StringRef Name, const auto &Rows,
+                   const std::vector<uint32_t> &Indices, auto &&Row) {
+    JSON.attributeArray(Name, [&] {
+      for (uint32_t Index : Indices)
+        JSON.value(Row(Rows[Index]));
+    });
+  };
+  // Identity belongs to the main file's piece alone. A header's piece must
+  // carry none of it: two units that include the same header would otherwise
+  // write two files differing only in whose unit read it.
+  llvm::StringRef Empty;
+  JSON.object([&] {
+    JSON.attribute("producerFingerprint",
+                   Piece.Main ? llvm::StringRef(Graph.ProducerFingerprint) : Empty);
+    JSON.attribute("mainFileUri",
+                   Piece.Main ? llvm::StringRef(Graph.MainFileURI) : Empty);
+    JSON.attribute("mainFile",
+                   Piece.Main ? llvm::StringRef(Graph.MainFile) : Empty);
+    JSON.attribute("directory",
+                   Piece.Main ? llvm::StringRef(Graph.Directory) : Empty);
+    JSON.attributeArray("commandLine", [&] {
+      if (!Piece.Main)
+        return;
+      for (const auto &Argument : Graph.CommandLine)
+        JSON.value(Argument);
+    });
+    JSON.attribute("output",
+                   Piece.Main ? llvm::StringRef(Graph.Output) : Empty);
+    JSON.attribute("commandDigest",
+                   Piece.Main ? llvm::StringRef(Graph.CommandDigest) : Empty);
+    JSON.attribute("toolchainFingerprint",
+                   Piece.Main ? llvm::StringRef(Graph.ToolchainFingerprint)
+                              : Empty);
+    JSON.attribute("targetTriple",
+                   Piece.Main ? llvm::StringRef(Graph.TargetTriple) : Empty);
+    JSON.attribute("language",
+                   Piece.Main ? llvm::StringRef(Graph.Language) : Empty);
+    JSON.attribute("hadErrors", Piece.Main && Graph.HadErrors);
+    JSON.attributeArray("sources", [&] {
+      if (!Piece.Main)
+        return;
+      for (const auto &Source : Graph.Sources)
+        JSON.value(sourceJSON(Source));
+    });
+    Facts("symbols", Graph.Symbols, Piece.Symbols, symbolJSON);
+    Facts("occurrences", Graph.Occurrences, Piece.Occurrences,
+          occurrenceJSON);
+    Facts("relations", Graph.Relations, Piece.Relations,
+          relationJSON);
+    Facts("macros", Graph.Macros, Piece.Macros, macroJSON);
+    Facts("includes", Graph.Includes, Piece.Includes,
+          includeJSON);
+    Facts("missingIncludes", Graph.MissingIncludes,
+          Piece.MissingIncludes, missingIncludeJSON);
+    Facts("modules", Graph.Modules, Piece.Modules, moduleJSON);
+    Facts("diagnostics", Graph.Diagnostics, Piece.Diagnostics,
+          diagnosticJSON);
+  });
 }
 
 bool fromJSON(const llvm::json::Value &Value, GraphTU &Graph,

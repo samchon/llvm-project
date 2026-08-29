@@ -397,13 +397,59 @@ BackgroundQueue::Task BackgroundIndex::changedFilesTask(
     SystemIncludeExtractorScope SystemIncludes(/*RefreshQueries=*/false,
                                                DriverFingerprints);
     auto NeedsReIndexing = loadProject(std::move(ChangedFiles));
+    // Forget the units the database no longer names.
+    //
+    // A unit that fails to index makes the whole generation unpublishable,
+    // which is right while the database still asks for it and wrong the
+    // moment it stops. A source that is created, renamed and then removed
+    // leaves a failure behind for a path nothing compiles any more, and every
+    // snapshot after that is refused for a file the project does not have.
+    //
+    // Asked file by file rather than by enumerating the database, because a
+    // compilation database is not required to enumerate itself. Only what has
+    // been indexed or has failed is asked about, so the cost is what this
+    // index already holds.
+    std::vector<std::pair<std::string, std::string>> Held;
+    {
+      std::lock_guard<std::mutex> Lock(GraphMu);
+      for (const auto &Entry : GraphFailureTUs)
+        Held.emplace_back(Entry.getKey().str(), Entry.getValue());
+      for (const auto &Entry : Graphs)
+        if (!Entry.getValue().empty())
+          Held.emplace_back(Entry.getKey().str(),
+                            Entry.getValue().begin()->second.MainFile);
+    }
+    std::vector<std::string> Forgotten;
+    for (const auto &Entry : Held) {
+      bool Named = false;
+      for (const auto &Command : CDB.getCompileCommands(Entry.second))
+        if (graphCommandIsCOrCXX(Command)) {
+          Named = true;
+          break;
+        }
+      if (!Named)
+        Forgotten.push_back(Entry.first);
+    }
     {
       std::lock_guard<std::mutex> Lock(GraphMu);
       assert(GraphDiscoveryPending > 0);
       --GraphDiscoveryPending;
+      for (const auto &Key : Forgotten) {
+        Graphs.erase(Key);
+        GraphSemanticMillis.erase(Key);
+        GraphFailures.erase(Key);
+        GraphFailureTUs.erase(Key);
+        GraphFailureInputs.erase(Key);
+        GraphPending.erase(Key);
+      }
+      if (!Forgotten.empty())
+        ++GraphRevision;
       for (const auto &File : NeedsReIndexing)
         GraphPending.insert(graphMainKey(File));
     }
+    if (!Forgotten.empty())
+      log("Forgot {0} translation units the database no longer names",
+          Forgotten.size());
     // Run indexing for files that need to be updated.
     std::shuffle(NeedsReIndexing.begin(), NeedsReIndexing.end(),
                  std::mt19937(std::random_device{}()));

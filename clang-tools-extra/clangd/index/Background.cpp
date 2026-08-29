@@ -405,10 +405,12 @@ BackgroundQueue::Task BackgroundIndex::changedFilesTask(
     // leaves a failure behind for a path nothing compiles any more, and every
     // snapshot after that is refused for a file the project does not have.
     //
-    // Asked file by file rather than by enumerating the database, because a
-    // compilation database is not required to enumerate itself. Only what has
-    // been indexed or has failed is asked about, so the cost is what this
-    // index already holds.
+    // Asked of the filesystem, not of the database: a compilation database
+    // that does not know a file infers a command for it from a sibling, so
+    // every path it is asked about looks like one it names. A main file that
+    // is no longer there is a unit that is no longer there, and that is what
+    // the failure itself says -- no such file or directory. Only what this
+    // index already holds is asked about, so the cost is what it holds.
     std::vector<std::pair<std::string, std::string>> Held;
     {
       std::lock_guard<std::mutex> Lock(GraphMu);
@@ -420,16 +422,9 @@ BackgroundQueue::Task BackgroundIndex::changedFilesTask(
                             Entry.getValue().begin()->second.MainFile);
     }
     std::vector<std::string> Forgotten;
-    for (const auto &Entry : Held) {
-      bool Named = false;
-      for (const auto &Command : CDB.getCompileCommands(Entry.second))
-        if (graphCommandIsCOrCXX(Command)) {
-          Named = true;
-          break;
-        }
-      if (!Named)
+    for (const auto &Entry : Held)
+      if (!llvm::sys::fs::exists(Entry.second))
         Forgotten.push_back(Entry.first);
-    }
     {
       std::lock_guard<std::mutex> Lock(GraphMu);
       assert(GraphDiscoveryPending > 0);

@@ -521,6 +521,26 @@ BackgroundQueue::Task BackgroundIndex::indexFileTask(
                                    std::move(Command));
     const std::string GraphKey = graphMainKey(Path);
 
+    // A file that is gone is not a unit that failed.
+    //
+    // Discovery forgets the units the filesystem no longer has, but the tasks
+    // queued for them are already in flight: one runs a moment later, cannot
+    // open the source, and records the failure again -- and a single failure
+    // makes every snapshot after it unpublishable. A task that finds its own
+    // main file missing withdraws instead, leaving nothing behind for the
+    // next discovery to have to clean up twice.
+    if (!llvm::sys::fs::exists(Path)) {
+      std::lock_guard<std::mutex> Lock(GraphMu);
+      Graphs.erase(GraphKey);
+      GraphSemanticMillis.erase(GraphKey);
+      GraphPending.erase(GraphKey);
+      GraphFailures.erase(GraphKey);
+      GraphFailureTUs.erase(GraphKey);
+      GraphFailureInputs.erase(GraphKey);
+      ++GraphRevision;
+      return;
+    }
+
     {
       std::lock_guard<std::mutex> Lock(GraphMu);
       GraphPending.insert(GraphKey);

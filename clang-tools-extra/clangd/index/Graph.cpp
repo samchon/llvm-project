@@ -365,6 +365,43 @@ llvm::StringMap<GraphPiece> graphPiecesByFile(const GraphTU &Graph) {
   return Pieces;
 }
 
+void streamJSON(llvm::json::OStream &JSON, const GraphTU &Graph) {
+  // One fact at a time. The per-fact writers build a small value that is
+  // written and released before the next is built, so what stands at once is
+  // a fact and a buffer rather than the whole unit several times over.
+  auto Facts = [&](llvm::StringRef Name, const auto &Rows, auto &&Row) {
+    JSON.attributeArray(Name, [&] {
+      for (const auto &Entry : Rows)
+        JSON.value(Row(Entry));
+    });
+  };
+  JSON.object([&] {
+    JSON.attribute("producerFingerprint", Graph.ProducerFingerprint);
+    JSON.attribute("mainFileUri", Graph.MainFileURI);
+    JSON.attribute("mainFile", Graph.MainFile);
+    JSON.attribute("directory", Graph.Directory);
+    JSON.attributeArray("commandLine", [&] {
+      for (const auto &Argument : Graph.CommandLine)
+        JSON.value(Argument);
+    });
+    JSON.attribute("output", Graph.Output);
+    JSON.attribute("commandDigest", Graph.CommandDigest);
+    JSON.attribute("toolchainFingerprint", Graph.ToolchainFingerprint);
+    JSON.attribute("targetTriple", Graph.TargetTriple);
+    JSON.attribute("language", Graph.Language);
+    JSON.attribute("hadErrors", Graph.HadErrors);
+    Facts("sources", Graph.Sources, sourceJSON);
+    Facts("symbols", Graph.Symbols, symbolJSON);
+    Facts("occurrences", Graph.Occurrences, occurrenceJSON);
+    Facts("relations", Graph.Relations, relationJSON);
+    Facts("macros", Graph.Macros, macroJSON);
+    Facts("includes", Graph.Includes, includeJSON);
+    Facts("missingIncludes", Graph.MissingIncludes, missingIncludeJSON);
+    Facts("modules", Graph.Modules, moduleJSON);
+    Facts("diagnostics", Graph.Diagnostics, diagnosticJSON);
+  });
+}
+
 void streamPieceJSON(llvm::json::OStream &JSON, const GraphTU &Graph,
                      const GraphPiece &Piece) {
   // One fact at a time. The per-fact writers build a small value that is

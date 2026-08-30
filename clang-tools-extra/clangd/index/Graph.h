@@ -250,6 +250,16 @@ llvm::StringMap<GraphPiece> graphPiecesByFile(const GraphTU &Graph);
 /// and then the text of that tree, each a multiple of the facts again. This
 /// writes one fact at a time and lets it go, so publishing a body costs the
 /// body and a buffer.
+/// Writes one whole unit as JSON straight to a stream.
+///
+/// `toJSON` builds the answer first: a `json::Value` tree of every fact and
+/// then the text of that tree, each a multiple of the facts again. A shard
+/// records every configuration of a file, so one C++ file compiled five ways
+/// built five of those trees and five texts at once -- which is what took a
+/// sixteen gibibyte host from twelve gibibytes free to one in ten seconds,
+/// with a single worker. Streaming writes one fact at a time and lets it go.
+void streamJSON(llvm::json::OStream &JSON, const GraphTU &Graph);
+
 void streamPieceJSON(llvm::json::OStream &JSON, const GraphTU &Graph,
                      const GraphPiece &Piece);
 std::string graphCommandDigest(const tooling::CompileCommand &Command);

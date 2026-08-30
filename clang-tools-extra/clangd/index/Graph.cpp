@@ -390,6 +390,13 @@ void streamJSON(llvm::json::OStream &JSON, const GraphTU &Graph) {
     JSON.attribute("targetTriple", Graph.TargetTriple);
     JSON.attribute("language", Graph.Language);
     JSON.attribute("hadErrors", Graph.HadErrors);
+    JSON.attributeArray("bodyPaths", [&] {
+      for (const auto &Path : Graph.BodyPaths)
+        JSON.value(Path);
+    });
+    JSON.attribute("publishedInterfaceFingerprint",
+                   Graph.PublishedInterfaceFingerprint);
+    JSON.attribute("publishedBodyDigest", Graph.PublishedBodyDigest);
     Facts("sources", Graph.Sources, sourceJSON);
     Facts("symbols", Graph.Symbols, symbolJSON);
     Facts("occurrences", Graph.Occurrences, occurrenceJSON);
@@ -480,6 +487,9 @@ llvm::json::Value toJSON(const GraphTU &Graph) {
       {"targetTriple", Graph.TargetTriple},
       {"language", Graph.Language},
       {"hadErrors", Graph.HadErrors},
+      {"bodyPaths", llvm::json::Array(Graph.BodyPaths)},
+      {"publishedInterfaceFingerprint", Graph.PublishedInterfaceFingerprint},
+      {"publishedBodyDigest", Graph.PublishedBodyDigest},
       {"sources", arrayJSON(Graph.Sources, sourceJSON)},
       {"symbols", arrayJSON(Graph.Symbols, symbolJSON)},
       {"occurrences", arrayJSON(Graph.Occurrences, occurrenceJSON)},
@@ -506,6 +516,10 @@ bool fromJSON(const llvm::json::Value &Value, GraphTU &Graph,
          O.map("targetTriple", Graph.TargetTriple) &&
          O.map("language", Graph.Language) &&
          O.map("hadErrors", Graph.HadErrors) &&
+         O.mapOptional("bodyPaths", Graph.BodyPaths) &&
+         O.mapOptional("publishedInterfaceFingerprint",
+                       Graph.PublishedInterfaceFingerprint) &&
+         O.mapOptional("publishedBodyDigest", Graph.PublishedBodyDigest) &&
          O.map("sources", Graph.Sources) && O.map("symbols", Graph.Symbols) &&
          O.map("occurrences", Graph.Occurrences) &&
          O.map("relations", Graph.Relations) && O.map("macros", Graph.Macros) &&

@@ -165,6 +165,25 @@ struct GraphTU {
   std::string TargetTriple;
   std::string Language;
   bool HadErrors = false;
+
+  /// Where this unit's facts were published, main file piece first.
+  ///
+  /// A body that has been written to disk is not written into the shard a
+  /// second time. A shard is what a later discovery reads to learn what every
+  /// unit is, and reading 243 of them back with their facts in them took
+  /// seventeen minutes on libuv -- during which the index answered every
+  /// request with 'project changes are still being discovered', truthfully
+  /// and uselessly. What the shard carries instead is where the facts are.
+  std::vector<std::string> BodyPaths;
+
+  /// The two digests a view cannot recompute once the facts are elsewhere.
+  ///
+  /// Everything else a view needs is still here -- the identity, the source
+  /// list, and the main file's own digest inside it -- but the interface
+  /// fingerprint is taken over exported symbols and the body digest counts
+  /// facts, and a record that names its facts does not hold them.
+  std::string PublishedInterfaceFingerprint;
+  std::string PublishedBodyDigest;
   std::vector<GraphSource> Sources;
   std::vector<GraphSymbol> Symbols;
   std::vector<GraphOccurrence> Occurrences;

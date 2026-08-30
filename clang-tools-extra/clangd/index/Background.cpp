@@ -681,7 +681,7 @@ BackgroundQueue::Task BackgroundIndex::indexFileTask(
     size_t RelationBytes = 0;
     size_t OtherBytes = 0;
     if (!Failure)
-      for (const auto &Graph : CompleteGraphs) {
+      for (auto &Graph : CompleteGraphs) {
         Occurrences += Graph.Occurrences.size();
         Symbols += Graph.Symbols.size();
         Relations += Graph.Relations.size();
@@ -689,8 +689,35 @@ BackgroundQueue::Task BackgroundIndex::indexFileTask(
         OccurrenceBytes += graphOccurrenceBytes(Graph);
         RelationBytes += graphRelationBytes(Graph);
         OtherBytes += graphOtherBytes(Graph);
-        Published.emplace(Graph.CommandDigest,
-                          graphViewOf(Graph, IndexStorageFactory(Path)));
+        auto View = graphViewOf(Graph, IndexStorageFactory(Path));
+        // Written down before the facts go, because a view cannot recompute
+        // them without the facts and the shard is what rebuilds the view.
+        if (!View.BodyPaths.empty()) {
+          Graph.BodyPaths = View.BodyPaths;
+          Graph.PublishedInterfaceFingerprint = View.InterfaceFingerprint;
+          Graph.PublishedBodyDigest = View.BodyDigest;
+          // The shard now records where this unit's facts are rather than
+          // the facts. Carrying them twice is what made reading 243 shards
+          // back take seventeen minutes, and writing them twice is what took
+          // a sixteen gibibyte host from twelve free to one in ten seconds.
+          Graph.Symbols.clear();
+          Graph.Symbols.shrink_to_fit();
+          Graph.Occurrences.clear();
+          Graph.Occurrences.shrink_to_fit();
+          Graph.Relations.clear();
+          Graph.Relations.shrink_to_fit();
+          Graph.Macros.clear();
+          Graph.Macros.shrink_to_fit();
+          Graph.Includes.clear();
+          Graph.Includes.shrink_to_fit();
+          Graph.MissingIncludes.clear();
+          Graph.MissingIncludes.shrink_to_fit();
+          Graph.Modules.clear();
+          Graph.Modules.shrink_to_fit();
+          Graph.Diagnostics.clear();
+          Graph.Diagnostics.shrink_to_fit();
+        }
+        Published.emplace(Graph.CommandDigest, std::move(View));
       }
 
     // Preserve clangd's pre-graph behavior: one representative command owns
@@ -1195,6 +1222,33 @@ BackgroundIndex::GraphView
 BackgroundIndex::graphViewOf(const GraphTU &Graph,
                             BackgroundIndexStorage *Storage) const {
   GraphView View;
+  // A record that names its facts rather than holding them.
+  //
+  // This is a graph read back from a shard that was written after its body
+  // was published: the identity and the source list are here, the facts are
+  // on disk under the names below, and the two digests a view cannot
+  // recompute without the facts were written down when it still had them.
+  if (!Graph.BodyPaths.empty() && Graph.Symbols.empty() &&
+      Graph.Occurrences.empty()) {
+    View.MainFile = Graph.MainFile;
+    View.MainFileURI = Graph.MainFileURI;
+    View.Directory = Graph.Directory;
+    View.CommandDigest = Graph.CommandDigest;
+    View.ToolchainFingerprint = Graph.ToolchainFingerprint;
+    View.ProducerFingerprint = Graph.ProducerFingerprint;
+    View.TargetTriple = Graph.TargetTriple;
+    View.HadErrors = Graph.HadErrors;
+    View.Sources = Graph.Sources;
+    for (const auto &Source : Graph.Sources)
+      if (Source.URI == Graph.MainFileURI) {
+        View.CheckerDigest = Source.Digest;
+        break;
+      }
+    View.InterfaceFingerprint = Graph.PublishedInterfaceFingerprint;
+    View.BodyDigest = Graph.PublishedBodyDigest;
+    View.BodyPaths = Graph.BodyPaths;
+    return View;
+  }
   View.MainFile = Graph.MainFile;
   View.MainFileURI = Graph.MainFileURI;
   View.Directory = Graph.Directory;

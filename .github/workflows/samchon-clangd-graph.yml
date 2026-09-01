@@ -33,6 +33,7 @@ jobs:
         os:
           - ubuntu-24.04
           - macos-14
+          - windows-2025
     steps:
       - name: Checkout producer
         uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
@@ -45,8 +46,10 @@ jobs:
           if [[ "$RUNNER_OS" == "Linux" ]]; then
             sudo apt-get update
             sudo apt-get install --yes ninja-build
-          else
+          elif [[ "$RUNNER_OS" == "macOS" ]]; then
             brew install ninja
+          else
+            ninja --version
           fi
 
       - name: Configure
@@ -68,8 +71,12 @@ jobs:
       - name: Run unit tests
         shell: bash
         run: |
-          ./build/tools/clang/tools/extra/clangd/unittests/ClangdTests
-          ./build/unittests/Support/SupportTests
+          suffix=""
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            suffix=".exe"
+          fi
+          ./build/tools/clang/tools/extra/clangd/unittests/ClangdTests${suffix}
+          ./build/unittests/Support/SupportTests${suffix}
 
       - name: Run clangd regression tests
         run: cmake --build build --parallel 2 --target check-clangd

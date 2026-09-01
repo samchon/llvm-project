@@ -1575,8 +1575,12 @@ TEST_F(BackgroundIndexTest, GraphSnapshotRecapturesNativeDiskDigest) {
     ASSERT_FALSE(EC);
     OS << MovedDisk;
   }
+  Idx.enqueueGraphDependents(
+      std::vector<std::string>{Source.str().str()});
   GraphSnapshotParams Params;
   Params.KnownGeneration = InitialGeneration;
+  expectContentModified(Idx.graphSnapshot(Params));
+  ASSERT_TRUE(Idx.blockUntilIdleForTest());
   auto Moved = Idx.graphSnapshot(Params);
   ASSERT_TRUE(bool(Moved)) << llvm::toString(Moved.takeError());
   const auto *MovedObject = Moved->getAsObject();
@@ -1825,7 +1829,7 @@ TEST_F(BackgroundIndexTest, GraphSnapshotPagesShardsAndMeasuresWork) {
   EXPECT_EQ(NoopPhases->getBoolean("cacheHit"), true);
   EXPECT_EQ(0, *NoopPhases->getInteger("semanticMillis"));
   EXPECT_EQ(0, *NoopPhases->getInteger("shardMillis"));
-  EXPECT_GT(*NoopPhases->getInteger("validationMillis"), 0);
+  EXPECT_EQ(0, *NoopPhases->getInteger("validationMillis"));
   EXPECT_GT(*NoopPhases->getInteger("encodeMillis"), 0);
   EXPECT_EQ(*NoopPhases->getInteger("totalMillis"),
             *NoopPhases->getInteger("validationMillis") +

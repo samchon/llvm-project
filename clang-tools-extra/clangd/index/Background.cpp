@@ -1796,10 +1796,15 @@ BackgroundIndex::graphSnapshot(const GraphSnapshotParams &Params) {
       }
     }
     if (Reused) {
+      const bool KnownGenerationIsCurrent =
+          Params.KnownGeneration &&
+          *Params.KnownGeneration == Cache->Generation;
       bool DiskDigestsMoved = false;
-      if (llvm::Error Err = ValidateCachedSnapshot(*Cache, DiskDigestsMoved))
-        return std::move(Err);
-      if (!DiskDigestsMoved) {
+      if (!KnownGenerationIsCurrent)
+        if (llvm::Error Err =
+                ValidateCachedSnapshot(*Cache, DiskDigestsMoved))
+          return std::move(Err);
+      if (KnownGenerationIsCurrent || !DiskDigestsMoved) {
         GraphSnapshotPlan Plan;
         std::vector<GraphTU> PageGraphs;
         {
@@ -1816,8 +1821,9 @@ BackgroundIndex::graphSnapshot(const GraphSnapshotParams &Params) {
             return Page.takeError();
           PageGraphs = std::move(*Page);
         }
-        auto Encoded = EncodePage(*Cache, Plan, 0, std::move(PageGraphs),
-                                  elapsedMillis(RequestStarted));
+        auto Encoded = EncodePage(
+            *Cache, Plan, 0, std::move(PageGraphs),
+            KnownGenerationIsCurrent ? 0 : elapsedMillis(RequestStarted));
         if (!Encoded)
           return Encoded.takeError();
         if (llvm::Error Err = CheckCancellation())

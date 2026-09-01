@@ -423,8 +423,9 @@ BackgroundQueue::Task BackgroundIndex::changedFilesTask(
                             Entry.getValue().begin()->second.MainFile);
     }
     std::vector<std::string> Forgotten;
+    auto DiscoveryFS = TFS.view(/*CWD=*/std::nullopt);
     for (const auto &Entry : Held)
-      if (!llvm::sys::fs::exists(Entry.second))
+      if (!DiscoveryFS->exists(Entry.second))
         Forgotten.push_back(Entry.first);
     {
       std::lock_guard<std::mutex> Lock(GraphMu);
@@ -529,7 +530,7 @@ BackgroundQueue::Task BackgroundIndex::indexFileTask(
     // makes every snapshot after it unpublishable. A task that finds its own
     // main file missing withdraws instead, leaving nothing behind for the
     // next discovery to have to clean up twice.
-    if (!llvm::sys::fs::exists(Path)) {
+    if (!TFS.view(/*CWD=*/std::nullopt)->exists(Path)) {
       std::lock_guard<std::mutex> Lock(GraphMu);
       Graphs.erase(GraphKey);
       GraphSemanticMillis.erase(GraphKey);

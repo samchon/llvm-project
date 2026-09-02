@@ -2040,10 +2040,11 @@ int second() { return twin(); }
         IDs.insert(Macro.ID);
     return IDs;
   };
-  auto AnonymousIDs = [](const GraphTU &Graph) {
+  auto UnnamedRecordIDs = [](const GraphTU &Graph) {
     std::set<std::string> IDs;
     for (const auto &Symbol : Graph.Symbols)
-      if (Symbol.Anonymous)
+      if (Symbol.Anonymous && Symbol.Name != "AnonymousType" &&
+          Symbol.Kind == static_cast<uint32_t>(index::SymbolKind::Struct))
         IDs.insert(Symbol.ID);
     return IDs;
   };
@@ -2066,10 +2067,12 @@ int second() { return twin(); }
   ASSERT_EQ(1u, InitialAnonymous.size());
   ASSERT_EQ(1u, OtherAnonymous.size());
   EXPECT_NE(*InitialAnonymous.begin(), *OtherAnonymous.begin());
-  const auto InitialUnnamed = AnonymousIDs(Initial);
-  const auto OtherUnnamed = AnonymousIDs(Other);
-  ASSERT_FALSE(InitialUnnamed.empty());
-  ASSERT_FALSE(OtherUnnamed.empty());
+  const auto InitialUnnamed = UnnamedRecordIDs(Initial);
+  const auto OtherUnnamed = UnnamedRecordIDs(Other);
+  ASSERT_EQ(1u, InitialUnnamed.size());
+  ASSERT_EQ(1u, OtherUnnamed.size());
+  EXPECT_FALSE(InitialUnnamed.begin()->empty());
+  EXPECT_FALSE(OtherUnnamed.begin()->empty());
   EXPECT_TRUE(llvm::none_of(InitialUnnamed, [&](const std::string &ID) {
     return OtherUnnamed.count(ID) != 0;
   }));

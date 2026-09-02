@@ -1217,7 +1217,9 @@ TEST_F(BackgroundIndexTest, ReplacedCompilerDriverStartsANewUniverse) {
     ASSERT_FALSE(EC);
     OS << "second wrapper";
   }
-  expectContentModified(Idx.graphSnapshot({}));
+  GraphSnapshotParams Params;
+  Params.KnownGeneration = InitialGeneration;
+  expectContentModified(Idx.graphSnapshot(Params));
   ASSERT_TRUE(Idx.blockUntilIdleForTest());
   auto Reindexed = Idx.graphSnapshot({});
   ASSERT_TRUE(bool(Reindexed)) << llvm::toString(Reindexed.takeError());
@@ -1829,7 +1831,7 @@ TEST_F(BackgroundIndexTest, GraphSnapshotPagesShardsAndMeasuresWork) {
   EXPECT_EQ(NoopPhases->getBoolean("cacheHit"), true);
   EXPECT_EQ(0, *NoopPhases->getInteger("semanticMillis"));
   EXPECT_EQ(0, *NoopPhases->getInteger("shardMillis"));
-  EXPECT_EQ(0, *NoopPhases->getInteger("validationMillis"));
+  EXPECT_GT(*NoopPhases->getInteger("validationMillis"), 0);
   EXPECT_GT(*NoopPhases->getInteger("encodeMillis"), 0);
   EXPECT_EQ(*NoopPhases->getInteger("totalMillis"),
             *NoopPhases->getInteger("validationMillis") +

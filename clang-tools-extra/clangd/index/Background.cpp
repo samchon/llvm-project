@@ -1645,7 +1645,8 @@ BackgroundIndex::graphSnapshot(const GraphSnapshotParams &Params) {
     ActiveGraphSnapshotPlans[Plan.Token] = Plan;
   };
   auto ValidateCachedSnapshot = [&](const GraphSnapshotCache &Cache,
-                                    bool &DiskDigestsMoved) -> llvm::Error {
+                                    bool &DiskDigestsMoved,
+                                    bool ValidateSourceInputs) -> llvm::Error {
     std::map<std::string, llvm::StringMap<std::string>> ActualConfigurations;
     for (const auto &Shard : Cache.Shards)
       ActualConfigurations[Shard.MainFile][Shard.CommandDigest] =
@@ -1683,6 +1684,8 @@ BackgroundIndex::graphSnapshot(const GraphSnapshotParams &Params) {
           "compile commands/toolchains",
           Mismatched.size());
     }
+    if (!ValidateSourceInputs)
+      return llvm::Error::success();
     struct CheckedSource {
       std::string CheckerDigest;
       std::string DiskDigest;
@@ -1800,10 +1803,9 @@ BackgroundIndex::graphSnapshot(const GraphSnapshotParams &Params) {
           Params.KnownGeneration &&
           *Params.KnownGeneration == Cache->Generation;
       bool DiskDigestsMoved = false;
-      if (!KnownGenerationIsCurrent)
-        if (llvm::Error Err =
-                ValidateCachedSnapshot(*Cache, DiskDigestsMoved))
-          return std::move(Err);
+      if (llvm::Error Err = ValidateCachedSnapshot(
+              *Cache, DiskDigestsMoved, !KnownGenerationIsCurrent))
+        return std::move(Err);
       if (KnownGenerationIsCurrent || !DiskDigestsMoved) {
         GraphSnapshotPlan Plan;
         std::vector<GraphTU> PageGraphs;
@@ -1821,9 +1823,8 @@ BackgroundIndex::graphSnapshot(const GraphSnapshotParams &Params) {
             return Page.takeError();
           PageGraphs = std::move(*Page);
         }
-        auto Encoded = EncodePage(
-            *Cache, Plan, 0, std::move(PageGraphs),
-            KnownGenerationIsCurrent ? 0 : elapsedMillis(RequestStarted));
+        auto Encoded = EncodePage(*Cache, Plan, 0, std::move(PageGraphs),
+                                  elapsedMillis(RequestStarted));
         if (!Encoded)
           return Encoded.takeError();
         if (llvm::Error Err = CheckCancellation())

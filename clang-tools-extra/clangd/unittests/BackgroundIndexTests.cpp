@@ -1993,6 +1993,7 @@ TEST_F(BackgroundIndexTest, GraphIdentitiesStayStableAndScoped) {
   FS.Files[First] = R"cpp(
 #define STABLE_MACRO(value) (value)
 namespace { struct AnonymousType {}; }
+struct { int member; } unnamed;
 static int twin() { return STABLE_MACRO(1); }
 int overload(int value) { return value; }
 double overload(double value) { return value; }
@@ -2001,6 +2002,7 @@ template <> struct Box<int> {};
 )cpp";
   FS.Files[Second] = R"cpp(
 namespace { struct AnonymousType {}; }
+struct { int member; } unnamed;
 static int twin() { return 2; }
 int second() { return twin(); }
 )cpp";
@@ -2038,6 +2040,21 @@ int second() { return twin(); }
         IDs.insert(Macro.ID);
     return IDs;
   };
+  auto AnonymousIDs = [](const GraphTU &Graph) {
+    std::set<std::string> IDs;
+    for (const auto &Symbol : Graph.Symbols)
+      if (Symbol.Anonymous)
+        IDs.insert(Symbol.ID);
+    return IDs;
+  };
+  auto BoxIDs = [](const GraphTU &Graph, index::SymbolProperty Property) {
+    std::set<std::string> IDs;
+    for (const auto &Symbol : Graph.Symbols)
+      if (Symbol.Name == "Box" &&
+          (Symbol.Properties & static_cast<uint32_t>(Property)))
+        IDs.insert(Symbol.ID);
+    return IDs;
+  };
 
   const auto InitialTwin = SymbolIDs(Initial, "twin");
   const auto OtherTwin = SymbolIDs(Other, "twin");
@@ -2049,9 +2066,21 @@ int second() { return twin(); }
   ASSERT_EQ(1u, InitialAnonymous.size());
   ASSERT_EQ(1u, OtherAnonymous.size());
   EXPECT_NE(*InitialAnonymous.begin(), *OtherAnonymous.begin());
+  const auto InitialUnnamed = AnonymousIDs(Initial);
+  const auto OtherUnnamed = AnonymousIDs(Other);
+  ASSERT_FALSE(InitialUnnamed.empty());
+  ASSERT_FALSE(OtherUnnamed.empty());
+  EXPECT_TRUE(llvm::none_of(InitialUnnamed, [&](const std::string &ID) {
+    return OtherUnnamed.count(ID) != 0;
+  }));
   const auto InitialOverloads = SymbolIDs(Initial, "overload");
   EXPECT_EQ(2u, InitialOverloads.size());
-  EXPECT_GE(SymbolIDs(Initial, "Box").size(), 2u);
+  const auto PrimaryBox = BoxIDs(Initial, index::SymbolProperty::Generic);
+  const auto SpecializedBox =
+      BoxIDs(Initial, index::SymbolProperty::TemplateSpecialization);
+  ASSERT_EQ(1u, PrimaryBox.size());
+  ASSERT_EQ(1u, SpecializedBox.size());
+  EXPECT_NE(*PrimaryBox.begin(), *SpecializedBox.begin());
   const auto InitialMacro = MacroIDs(Initial, "STABLE_MACRO");
   EXPECT_EQ(1u, InitialMacro.size());
 
@@ -2059,6 +2088,7 @@ int second() { return twin(); }
 
 #define STABLE_MACRO(value) (value)
 namespace { struct AnonymousType {}; }
+struct { int member; } unnamed;
 static int twin() { return STABLE_MACRO(3); }
 double overload(double value) { return value; }
 char overload(char value) { return value; }
@@ -2080,6 +2110,7 @@ template <> struct Box<int> {};
     return MovedOverloads.count(ID) != 0;
   }));
   EXPECT_EQ(SymbolIDs(Moved, "twin"), InitialTwin);
+  EXPECT_EQ(SymbolIDs(Moved, "AnonymousType"), InitialAnonymous);
   EXPECT_EQ(MacroIDs(Moved, "STABLE_MACRO"), InitialMacro);
 }
 

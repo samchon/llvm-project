@@ -189,6 +189,20 @@ std::vector<llvm::StringRef> FileShardedIndex::getAllSources() const {
   return Result;
 }
 
+std::vector<GraphTU> FileShardedIndex::claimGraphs(llvm::StringRef Uri) {
+  std::vector<GraphTU> Claimed;
+  std::vector<GraphTU> Kept;
+  Kept.reserve(Index.Graphs.size());
+  for (auto &Graph : Index.Graphs) {
+    if (Graph.MainFileURI == Uri)
+      Claimed.push_back(std::move(Graph));
+    else
+      Kept.push_back(std::move(Graph));
+  }
+  Index.Graphs = std::move(Kept);
+  return Claimed;
+}
+
 std::optional<IndexFileIn>
 FileShardedIndex::getShard(llvm::StringRef Uri) const {
   auto It = Shards.find(Uri);

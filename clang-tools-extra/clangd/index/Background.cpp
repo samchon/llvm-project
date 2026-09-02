@@ -47,6 +47,7 @@
 #include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/Error.h"
+#include "llvm/Support/FileSystem.h"
 #include "llvm/Support/FormatVariadic.h"
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/Path.h"
@@ -177,6 +178,90 @@ std::string graphMainKey(llvm::StringRef Path) {
   return maybeCaseFoldPath(llvm::sys::path::convert_to_slash(removeDots(Path)));
 }
 
+/**
+ * A lower bound on the heap one fact array actually holds.
+ *
+ * Counts are not the quantity that exhausts a host, and every trace so far has
+ * had only counts. A short string lives inside its object and is already paid
+ * for by `sizeof`, so only the longer ones are added here; allocator overhead
+ * is left out, which makes this an underestimate rather than a flattering one.
+ */
+static size_t graphStringBytes(llvm::StringRef Value) {
+  return Value.size() <= 15 ? 0 : Value.size() + 1;
+}
+
+static size_t graphRangeBytes(const GraphRange &Range) {
+  return graphStringBytes(Range.FileURI);
+}
+
+static size_t graphSymbolBytes(const GraphTU &Graph) {
+  size_t Bytes = Graph.Symbols.size() * sizeof(GraphSymbol);
+  for (const auto &Symbol : Graph.Symbols) {
+    Bytes += graphStringBytes(Symbol.USR) + graphStringBytes(Symbol.ID) +
+             graphStringBytes(Symbol.Name) +
+             graphStringBytes(Symbol.QualifiedName) +
+             graphStringBytes(Symbol.OwnerUSR) +
+             graphStringBytes(Symbol.Signature) +
+             graphRangeBytes(Symbol.Declaration) +
+             graphRangeBytes(Symbol.Definition) +
+             Symbol.Attributes.size() * sizeof(GraphAttribute);
+    for (const auto &Attribute : Symbol.Attributes)
+      Bytes += graphStringBytes(Attribute.Name) +
+               graphRangeBytes(Attribute.Range);
+  }
+  return Bytes;
+}
+
+static size_t graphOccurrenceBytes(const GraphTU &Graph) {
+  size_t Bytes = Graph.Occurrences.size() * sizeof(GraphOccurrence);
+  for (const auto &Occurrence : Graph.Occurrences)
+    Bytes += graphStringBytes(Occurrence.USR) +
+             graphStringBytes(Occurrence.ID) +
+             graphStringBytes(Occurrence.ContainerID) +
+             graphRangeBytes(Occurrence.Spelling) +
+             graphRangeBytes(Occurrence.Expansion);
+  return Bytes;
+}
+
+static size_t graphRelationBytes(const GraphTU &Graph) {
+  size_t Bytes = Graph.Relations.size() * sizeof(GraphRelation);
+  for (const auto &Relation : Graph.Relations)
+    Bytes += graphStringBytes(Relation.SubjectID) +
+             graphStringBytes(Relation.ObjectID) +
+             graphRangeBytes(Relation.Evidence);
+  return Bytes;
+}
+
+static size_t graphOtherBytes(const GraphTU &Graph) {
+  size_t Bytes = Graph.Sources.size() * sizeof(GraphSource) +
+                 Graph.Macros.size() * sizeof(GraphMacro) +
+                 Graph.Includes.size() * sizeof(GraphInclude) +
+                 Graph.Modules.size() * sizeof(GraphModule) +
+                 Graph.Diagnostics.size() * sizeof(GraphDiagnostic);
+  for (const auto &Source : Graph.Sources)
+    Bytes += graphStringBytes(Source.URI) + graphStringBytes(Source.Digest) +
+             graphStringBytes(Source.DiskDigest);
+  for (const auto &Macro : Graph.Macros)
+    Bytes += graphStringBytes(Macro.USR) + graphStringBytes(Macro.ID) +
+             graphStringBytes(Macro.Name) +
+             graphRangeBytes(Macro.Definition) +
+             graphRangeBytes(Macro.Spelling) +
+             graphRangeBytes(Macro.Expansion);
+  for (const auto &Include : Graph.Includes)
+    Bytes += graphStringBytes(Include.SourceURI) +
+             graphStringBytes(Include.TargetURI) +
+             graphStringBytes(Include.Spelling) +
+             graphRangeBytes(Include.Evidence);
+  for (const auto &Module : Graph.Modules)
+    Bytes += graphStringBytes(Module.Name) + graphRangeBytes(Module.Evidence);
+  for (const auto &Diagnostic : Graph.Diagnostics)
+    Bytes += graphStringBytes(Diagnostic.Message) +
+             graphStringBytes(Diagnostic.Code) +
+             graphStringBytes(Diagnostic.Severity) +
+             graphRangeBytes(Diagnostic.Range);
+  return Bytes;
+}
+
 uint64_t elapsedMillis(std::chrono::steady_clock::time_point Started) {
   auto Elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
                      std::chrono::steady_clock::now() - Started)
@@ -284,7 +369,14 @@ void BackgroundIndex::enqueue(const std::vector<std::string> &ChangedFiles) {
   {
     std::lock_guard<std::mutex> Lock(GraphMu);
     ++GraphDiscoveryPending;
+    GraphDiscoveryStarted = std::chrono::steady_clock::now();
   }
+  // Said here, not only when the task begins. A snapshot refuses while any
+  // discovery is outstanding, and a consumer waited twenty minutes on that
+  // refusal with nothing in the log between the compilation database being
+  // reloaded and the task finally running. Whether the wait is this queue or
+  // what put work into it cannot be told from the task's own first line.
+  log("Graph discovery queued for {0} commands", ChangedFiles.size());
   Queue.push(changedFilesTask(ChangedFiles));
 }
 
@@ -306,13 +398,55 @@ BackgroundQueue::Task BackgroundIndex::changedFilesTask(
     SystemIncludeExtractorScope SystemIncludes(/*RefreshQueries=*/false,
                                                DriverFingerprints);
     auto NeedsReIndexing = loadProject(std::move(ChangedFiles));
+    // Forget the units the database no longer names.
+    //
+    // A unit that fails to index makes the whole generation unpublishable,
+    // which is right while the database still asks for it and wrong the
+    // moment it stops. A source that is created, renamed and then removed
+    // leaves a failure behind for a path nothing compiles any more, and every
+    // snapshot after that is refused for a file the project does not have.
+    //
+    // Asked of the filesystem, not of the database: a compilation database
+    // that does not know a file infers a command for it from a sibling, so
+    // every path it is asked about looks like one it names. A main file that
+    // is no longer there is a unit that is no longer there, and that is what
+    // the failure itself says -- no such file or directory. Only what this
+    // index already holds is asked about, so the cost is what it holds.
+    std::vector<std::pair<std::string, std::string>> Held;
+    {
+      std::lock_guard<std::mutex> Lock(GraphMu);
+      for (const auto &Entry : GraphFailureTUs)
+        Held.emplace_back(Entry.getKey().str(), Entry.getValue());
+      for (const auto &Entry : Graphs)
+        if (!Entry.getValue().empty())
+          Held.emplace_back(Entry.getKey().str(),
+                            Entry.getValue().begin()->second.MainFile);
+    }
+    std::vector<std::string> Forgotten;
+    auto DiscoveryFS = TFS.view(/*CWD=*/std::nullopt);
+    for (const auto &Entry : Held)
+      if (!DiscoveryFS->exists(Entry.second))
+        Forgotten.push_back(Entry.first);
     {
       std::lock_guard<std::mutex> Lock(GraphMu);
       assert(GraphDiscoveryPending > 0);
       --GraphDiscoveryPending;
+      for (const auto &Key : Forgotten) {
+        Graphs.erase(Key);
+        GraphSemanticMillis.erase(Key);
+        GraphFailures.erase(Key);
+        GraphFailureTUs.erase(Key);
+        GraphFailureInputs.erase(Key);
+        GraphPending.erase(Key);
+      }
+      if (!Forgotten.empty())
+        ++GraphRevision;
       for (const auto &File : NeedsReIndexing)
         GraphPending.insert(graphMainKey(File));
     }
+    if (!Forgotten.empty())
+      log("Forgot {0} translation units the database no longer names",
+          Forgotten.size());
     // Run indexing for files that need to be updated.
     std::shuffle(NeedsReIndexing.begin(), NeedsReIndexing.end(),
                  std::mt19937(std::random_device{}()));
@@ -387,6 +521,26 @@ BackgroundQueue::Task BackgroundIndex::indexFileTask(
         Configurations.try_emplace(graphCommandDigest(Command),
                                    std::move(Command));
     const std::string GraphKey = graphMainKey(Path);
+
+    // A file that is gone is not a unit that failed.
+    //
+    // Discovery forgets the units the filesystem no longer has, but the tasks
+    // queued for them are already in flight: one runs a moment later, cannot
+    // open the source, and records the failure again -- and a single failure
+    // makes every snapshot after it unpublishable. A task that finds its own
+    // main file missing withdraws instead, leaving nothing behind for the
+    // next discovery to have to clean up twice.
+    if (!TFS.view(/*CWD=*/std::nullopt)->exists(Path)) {
+      std::lock_guard<std::mutex> Lock(GraphMu);
+      Graphs.erase(GraphKey);
+      GraphSemanticMillis.erase(GraphKey);
+      GraphPending.erase(GraphKey);
+      GraphFailures.erase(GraphKey);
+      GraphFailureTUs.erase(GraphKey);
+      GraphFailureInputs.erase(GraphKey);
+      ++GraphRevision;
+      return;
+    }
 
     {
       std::lock_guard<std::mutex> Lock(GraphMu);
@@ -482,27 +636,90 @@ BackgroundQueue::Task BackgroundIndex::indexFileTask(
               MissingInputs.insert(std::move(Candidate));
         }
 
+    // One resident copy of a translation unit's body, not three.
+    //
+    // A unit's graph body is the largest object this indexer ever holds: an
+    // occurrence per reference, each carrying its own USR, endpoint key,
+    // container key and two file URIs. Lifting it out of Results by copy and
+    // then handing the shard writer a second copy made the peak three bodies
+    // per worker rather than one, which is what exhausted a 16 GiB host in
+    // fifteen seconds with most of the compilation database still to index.
+    // Nothing needs a copy: the bodies leave Results by move, and the resident
+    // metadata is derived while they are still in hand.
     std::vector<GraphTU> CompleteGraphs;
     std::map<std::string, uint64_t> CompleteTimings;
     if (!Failure) {
       CompleteGraphs.reserve(Results.size());
-      for (const auto &Result : Results) {
+      for (auto &Result : Results) {
         assert(Result.Index.Graphs.size() <= 1);
         if (!Result.Index.Graphs.empty()) {
-          CompleteGraphs.push_back(Result.Index.Graphs.front());
           CompleteTimings[Result.Index.Graphs.front().CommandDigest] =
               Result.SemanticMillis;
+          CompleteGraphs.push_back(std::move(Result.Index.Graphs.front()));
+          Result.Index.Graphs.clear();
         }
       }
     } else {
       // An erroneous or incomplete batch must not replace the last complete
-      // graph generation, including in the persisted main-file shard.
-      std::lock_guard<std::mutex> Lock(GraphMu);
-      auto Published = Graphs.find(GraphKey);
-      if (Published != Graphs.end())
-        for (const auto &Configuration : Published->second)
-          CompleteGraphs.push_back(Configuration.second);
+      // graph generation, including in the persisted main-file shard. The
+      // bodies are no longer resident, so the shard that published them is
+      // what restores them; if it cannot be read there is nothing complete to
+      // preserve and the shard is rewritten without views, exactly as it would
+      // have been before any complete generation existed.
+      CompleteGraphs = loadGraphBodies(Path);
     }
+
+    // Derived here because this is the last point at which the bodies are in
+    // hand. `update` persists them into the main-file shard and does not give
+    // them back, and the shard is what a later discovery reads to know what a
+    // unit is -- a shard without them is a unit without facts.
+    std::map<std::string, GraphView> Published;
+    size_t Occurrences = 0;
+    size_t Symbols = 0;
+    size_t Relations = 0;
+    size_t SymbolBytes = 0;
+    size_t OccurrenceBytes = 0;
+    size_t RelationBytes = 0;
+    size_t OtherBytes = 0;
+    if (!Failure)
+      for (auto &Graph : CompleteGraphs) {
+        Occurrences += Graph.Occurrences.size();
+        Symbols += Graph.Symbols.size();
+        Relations += Graph.Relations.size();
+        SymbolBytes += graphSymbolBytes(Graph);
+        OccurrenceBytes += graphOccurrenceBytes(Graph);
+        RelationBytes += graphRelationBytes(Graph);
+        OtherBytes += graphOtherBytes(Graph);
+        auto View = graphViewOf(Graph, IndexStorageFactory(Path));
+        // Written down before the facts go, because a view cannot recompute
+        // them without the facts and the shard is what rebuilds the view.
+        if (!View.BodyPaths.empty()) {
+          Graph.BodyPaths = View.BodyPaths;
+          Graph.PublishedInterfaceFingerprint = View.InterfaceFingerprint;
+          Graph.PublishedBodyDigest = View.BodyDigest;
+          // The shard now records where this unit's facts are rather than
+          // the facts. Carrying them twice is what made reading 243 shards
+          // back take seventeen minutes, and writing them twice is what took
+          // a sixteen gibibyte host from twelve free to one in ten seconds.
+          Graph.Symbols.clear();
+          Graph.Symbols.shrink_to_fit();
+          Graph.Occurrences.clear();
+          Graph.Occurrences.shrink_to_fit();
+          Graph.Relations.clear();
+          Graph.Relations.shrink_to_fit();
+          Graph.Macros.clear();
+          Graph.Macros.shrink_to_fit();
+          Graph.Includes.clear();
+          Graph.Includes.shrink_to_fit();
+          Graph.MissingIncludes.clear();
+          Graph.MissingIncludes.shrink_to_fit();
+          Graph.Modules.clear();
+          Graph.Modules.shrink_to_fit();
+          Graph.Diagnostics.clear();
+          Graph.Diagnostics.shrink_to_fit();
+        }
+        Published.emplace(Graph.CommandDigest, std::move(View));
+      }
 
     // Preserve clangd's pre-graph behavior: one representative command owns
     // the ordinary slabs, and even a diagnostic result updates them. All
@@ -512,7 +729,7 @@ BackgroundQueue::Task BackgroundIndex::indexFileTask(
              graphCommandDigest(*Result.Index.Cmd) == *LegacyCommandDigest;
     });
     if (Legacy != Results.end()) {
-      Legacy->Index.Graphs = CompleteGraphs;
+      Legacy->Index.Graphs = std::move(CompleteGraphs);
       update(Path, std::move(Legacy->Index), Legacy->ShardVersionsSnapshot,
              Legacy->HadErrors);
       Rebuilder.indexedTU();
@@ -528,13 +745,24 @@ BackgroundQueue::Task BackgroundIndex::indexFileTask(
       std::lock_guard<std::mutex> Lock(GraphMu);
       Graphs.erase(GraphKey);
       GraphSemanticMillis.erase(GraphKey);
-      if (!CompleteGraphs.empty()) {
-        auto &Published = Graphs[GraphKey];
+      if (!Published.empty()) {
         auto &Timings = GraphSemanticMillis[GraphKey];
-        for (auto &Graph : CompleteGraphs) {
-          Timings[Graph.CommandDigest] = CompleteTimings[Graph.CommandDigest];
-          Published.emplace(Graph.CommandDigest, std::move(Graph));
-        }
+        for (const auto &Entry : Published)
+          Timings[Entry.first] = CompleteTimings[Entry.first];
+        Graphs[GraphKey] = std::move(Published);
+      }
+      const size_t Bytes =
+          SymbolBytes + OccurrenceBytes + RelationBytes + OtherBytes;
+      if (Bytes > GraphPeakBytes) {
+        GraphPeakOccurrences = Occurrences;
+        GraphPeakSymbols = Symbols;
+        GraphPeakRelations = Relations;
+        GraphPeakBytes = Bytes;
+        GraphPeakSymbolBytes = SymbolBytes;
+        GraphPeakOccurrenceBytes = OccurrenceBytes;
+        GraphPeakRelationBytes = RelationBytes;
+        GraphPeakOtherBytes = OtherBytes;
+        GraphPeakFile = Path;
       }
       GraphPending.erase(GraphKey);
       GraphFailures.erase(GraphKey);
@@ -595,8 +823,13 @@ void BackgroundIndex::update(
   // Build and store new slabs for each updated file.
   for (const auto &FileIt : FilesToUpdate) {
     auto Uri = FileIt.first();
+    // Claimed before the shard is built, so the copy inside `getShard` finds
+    // nothing left to duplicate. Exactly one shard owns each body, and a body
+    // is the largest object either object holds.
+    auto ClaimedGraphs = ShardedIndex.claimGraphs(Uri);
     auto IF = ShardedIndex.getShard(Uri);
     assert(IF && "no shard for file in Index.Sources?");
+    IF->Graphs = std::move(ClaimedGraphs);
     PathRef Path = FileIt.getValue().first;
 
     // Only store command line hash for main files of the TU, since our
@@ -794,7 +1027,10 @@ BackgroundIndex::loadProject(std::vector<std::string> MainFiles) {
   const std::vector<LoadedShard> Result =
       loadIndexShards(MainFiles, IndexStorageFactory, CDB);
   size_t LoadedShards = 0;
-  std::vector<GraphTU> LoadedGraphs;
+  // Views rather than bodies: these shards are the whole compilation
+  // database's graph, and carrying a second copy of every body across the
+  // load would put startup alone in reach of the host's memory.
+  std::vector<GraphView> LoadedViews;
   {
     // Update in-memory state.
     std::lock_guard<std::mutex> Lock(ShardVersionsMu);
@@ -804,7 +1040,8 @@ BackgroundIndex::loadProject(std::vector<std::string> MainFiles) {
       for (const auto &Graph : LS.Shard->Graphs)
         if (Graph.ProducerFingerprint == graphProducerFingerprint() &&
             (Graph.Language == "c" || Graph.Language == "cpp"))
-          LoadedGraphs.push_back(Graph);
+          LoadedViews.push_back(
+              graphViewOf(Graph, IndexStorageFactory(LS.AbsolutePath)));
       auto SS =
           LS.Shard->Symbols
               ? std::make_unique<SymbolSlab>(std::move(*LS.Shard->Symbols))
@@ -826,14 +1063,14 @@ BackgroundIndex::loadProject(std::vector<std::string> MainFiles) {
                             LS.CountReferences);
     }
   }
-  if (!LoadedGraphs.empty()) {
+  if (!LoadedViews.empty()) {
     std::lock_guard<std::mutex> Lock(GraphMu);
-    for (auto &Graph : LoadedGraphs) {
-      if (Graph.MainFile.empty() || Graph.CommandDigest.empty())
+    for (auto &View : LoadedViews) {
+      if (View.MainFile.empty() || View.CommandDigest.empty())
         continue;
-      const std::string MainKey = graphMainKey(Graph.MainFile);
-      const std::string CommandDigest = Graph.CommandDigest;
-      Graphs[MainKey][CommandDigest] = std::move(Graph);
+      const std::string MainKey = graphMainKey(View.MainFile);
+      const std::string CommandDigest = View.CommandDigest;
+      Graphs[MainKey][CommandDigest] = std::move(View);
       GraphSemanticMillis[MainKey][CommandDigest] = 0;
     }
     ++GraphRevision;
@@ -940,6 +1177,186 @@ void BackgroundIndex::enqueueGraphDependents(
     enqueue(Work);
 }
 
+// Identity of a published body, cheap enough to take on every translation
+// unit. It is deliberately not a digest of the body's contents: hashing those
+// meant copying the body and serializing it to JSON once per translation
+// unit, on top of the serialization that already writes the shard. A C++ unit
+// carries an occurrence for every reference, so that second pass starved
+// indexing on plain C and took a 16 GiB host from 5,831 MiB free to 209 MiB
+// in a single step on C++.
+//
+// A published body is only ever replaced by a reindex, and a reindex moves
+// the revision a snapshot plan is fenced against. So this has one job: catch
+// a shard that is not the one the plan was built from. Producer, command,
+// toolchain and every source digest already identify that, and the element
+// counts catch a shard rewritten or truncated under the same identity.
+static std::string graphBodyDigest(const GraphTU &Graph) {
+  std::string Material;
+  llvm::raw_string_ostream OS(Material);
+  auto Field = [&](llvm::StringRef Value) {
+    OS << Value.size() << ':' << Value;
+  };
+  Field(Graph.ProducerFingerprint);
+  Field(Graph.MainFileURI);
+  Field(Graph.CommandDigest);
+  Field(Graph.ToolchainFingerprint);
+  Field(Graph.TargetTriple);
+  Field(Graph.Language);
+  OS << (Graph.HadErrors ? '!' : '.');
+  // Disk digests are deliberately absent: they belong to the snapshot that
+  // validates a source, not to the body, and a body has to identify the same
+  // way whether it was just produced or just read back from its shard.
+  for (const auto &Source : Graph.Sources) {
+    Field(Source.URI);
+    Field(Source.Digest);
+  }
+  for (const size_t Count :
+       {Graph.Symbols.size(), Graph.Occurrences.size(), Graph.Relations.size(),
+        Graph.Macros.size(), Graph.Includes.size(),
+        Graph.MissingIncludes.size(), Graph.Modules.size(),
+        Graph.Diagnostics.size()})
+    OS << Count << ',';
+  return graphDigest(OS.str());
+}
+
+BackgroundIndex::GraphView
+BackgroundIndex::graphViewOf(const GraphTU &Graph,
+                            BackgroundIndexStorage *Storage) const {
+  GraphView View;
+  // A record that names its facts rather than holding them.
+  //
+  // This is a graph read back from a shard that was written after its body
+  // was published: the identity and the source list are here, the facts are
+  // on disk under the names below, and the two digests a view cannot
+  // recompute without the facts were written down when it still had them.
+  if (!Graph.BodyPaths.empty() && Graph.Symbols.empty() &&
+      Graph.Occurrences.empty()) {
+    View.MainFile = Graph.MainFile;
+    View.MainFileURI = Graph.MainFileURI;
+    View.Directory = Graph.Directory;
+    View.CommandDigest = Graph.CommandDigest;
+    View.ToolchainFingerprint = Graph.ToolchainFingerprint;
+    View.ProducerFingerprint = Graph.ProducerFingerprint;
+    View.TargetTriple = Graph.TargetTriple;
+    View.HadErrors = Graph.HadErrors;
+    View.Sources = Graph.Sources;
+    for (const auto &Source : Graph.Sources)
+      if (Source.URI == Graph.MainFileURI) {
+        View.CheckerDigest = Source.Digest;
+        break;
+      }
+    View.InterfaceFingerprint = Graph.PublishedInterfaceFingerprint;
+    View.BodyDigest = Graph.PublishedBodyDigest;
+    View.BodyPaths = Graph.BodyPaths;
+    return View;
+  }
+  View.MainFile = Graph.MainFile;
+  View.MainFileURI = Graph.MainFileURI;
+  View.Directory = Graph.Directory;
+  View.CommandDigest = Graph.CommandDigest;
+  View.ToolchainFingerprint = Graph.ToolchainFingerprint;
+  View.ProducerFingerprint = Graph.ProducerFingerprint;
+  View.TargetTriple = Graph.TargetTriple;
+  View.HadErrors = Graph.HadErrors;
+  View.Sources = Graph.Sources;
+  for (const auto &Source : Graph.Sources)
+    if (Source.URI == Graph.MainFileURI) {
+      View.CheckerDigest = Source.Digest;
+      break;
+    }
+  // Ordered, because an interface is what a unit exports and not the order
+  // this index happened to walk it in. A published body is split by file and
+  // reassembled by whoever reads it, which returns the symbols in a different
+  // order than they left -- and a consumer recomputing this over the
+  // reassembled body has to arrive at the same fingerprint.
+  std::vector<std::string> Exports;
+  for (const auto &Symbol : Graph.Symbols)
+    if (Symbol.Exported) {
+      std::string Entry;
+      llvm::raw_string_ostream EntryOS(Entry);
+      EntryOS << Symbol.ID.size() << ':' << Symbol.ID << Symbol.Signature.size()
+              << ':' << Symbol.Signature;
+      Exports.push_back(std::move(Entry));
+    }
+  llvm::sort(Exports);
+  std::string Interface;
+  llvm::raw_string_ostream InterfaceOS(Interface);
+  for (const auto &Entry : Exports)
+    InterfaceOS << Entry;
+  View.InterfaceFingerprint = graphDigest(InterfaceOS.str());
+  View.BodyDigest = graphBodyDigest(Graph);
+  // Published here, while the body is in hand and already being digested, so
+  // a snapshot can name it instead of carrying it. A body is the largest
+  // thing this index makes; putting it through the language-server pipe means
+  // building a `json::Value` tree, serializing it and parsing it again on the
+  // far side, once per request that carries it -- and a consumer walking a
+  // compilation database asks for every one of them.
+  if (Storage != nullptr) {
+    // Split before it is written. A header's facts appear in every unit that
+    // includes it, so publishing whole bodies stores the same facts once per
+    // including unit -- on a project whose headers are included everywhere,
+    // that is the same megabytes hundreds of times. Pieces are named by their
+    // own content, so a header's piece is written once and read once.
+    //
+    // The main file's piece is named first, because it carries the unit's
+    // source set and reassembly starts from it.
+    bool Published = true;
+    std::vector<std::string> Paths;
+    auto Pieces = graphPiecesByFile(Graph);
+    auto Publish = [&](const GraphPiece &Piece) {
+      // Streamed into the store rather than built and handed over. The store
+      // names a body by the digest of the bytes it wrote, which is the only
+      // name that separates two pieces: the body digest a shard carries is a
+      // summary of a unit's fields and counts, and two different pieces can
+      // share one.
+      std::string Path = Storage->storeGraphBody([&](llvm::raw_ostream &OS) {
+        llvm::json::OStream JSON(OS);
+        streamPieceJSON(JSON, Graph, Piece);
+      });
+      if (Path.empty())
+        Published = false;
+      else
+        Paths.push_back(std::move(Path));
+    };
+    auto Main = Pieces.find(Graph.MainFileURI);
+    if (Main == Pieces.end()) {
+      // Without the main file's piece there is nothing to reassemble from:
+      // it alone carries the unit's identity and source set. Carry the body
+      // instead of naming pieces that cannot be put back together.
+      Published = false;
+    } else {
+      Publish(Main->getValue());
+      for (const auto &Entry : Pieces)
+        if (Entry.getKey() != Graph.MainFileURI)
+          Publish(Entry.getValue());
+    }
+    // All or nothing: a generation that named some of its pieces and carried
+    // the rest would be two shapes at once, and a reader could not tell a
+    // missing piece from one that was never meant to be there.
+    if (Published)
+      View.BodyPaths = std::move(Paths);
+  }
+  return View;
+}
+
+std::vector<GraphTU>
+BackgroundIndex::loadGraphBodies(llvm::StringRef MainFile) {
+  auto *Storage = IndexStorageFactory(MainFile);
+  if (!Storage)
+    return {};
+  auto Shard = Storage->loadShard(MainFile);
+  if (!Shard)
+    return {};
+  std::vector<GraphTU> Bodies;
+  // The same admission rule the shard load applies, so a body can only come
+  // back under the identity that published it.
+  for (auto &Graph : Shard->Graphs)
+    if (Graph.ProducerFingerprint == graphProducerFingerprint() &&
+        (Graph.Language == "c" || Graph.Language == "cpp"))
+      Bodies.push_back(std::move(Graph));
+  return Bodies;
+}
+
 llvm::Expected<llvm::json::Value>
 BackgroundIndex::graphSnapshot(const GraphSnapshotParams &Params) {
   const auto RequestStarted = std::chrono::steady_clock::now();
@@ -995,12 +1412,6 @@ BackgroundIndex::graphSnapshot(const GraphSnapshotParams &Params) {
       {"renders", "unsupported"}, {"tests", "unsupported"},
       {"references", "complete"}};
 
-  auto JSONText = [](const llvm::json::Value &Value) {
-    std::string Text;
-    llvm::raw_string_ostream OS(Text);
-    OS << Value;
-    return OS.str();
-  };
   auto NativeDiskDigest = [](llvm::StringRef File) {
     auto Buffer = llvm::MemoryBuffer::getFile(File);
     return Buffer ? graphDigest((*Buffer)->getBuffer()) : std::string();
@@ -1013,15 +1424,42 @@ BackgroundIndex::graphSnapshot(const GraphSnapshotParams &Params) {
     const size_t End = std::min(Plan.Upserts.size(), Offset + PageSize);
     std::vector<GraphTU> Page;
     Page.reserve(End - Offset);
+    // One main file owns every configuration's view, so a page that spans
+    // several configurations of the same file reads its shard once.
+    llvm::StringMap<std::vector<GraphTU>> Loaded;
     for (size_t I = Offset; I < End; ++I) {
       const auto &Shard = Cache.Shards[Plan.Upserts[I]];
+      // A shard whose body is already published needs nothing read here. The
+      // page names the file; the client reads it. Loading it to hand it back
+      // would be this process reading a body off disk so it can put the same
+      // bytes through a pipe -- which on a real compilation database was the
+      // largest single cost of answering a generation.
+      if (!Shard.BodyPaths.empty())
+        continue;
       auto Main = Graphs.find(Shard.MainKey);
       if (Main == Graphs.end())
         return contentModified("graph snapshot changed between pages");
       auto Configuration = Main->getValue().find(Shard.CommandDigest);
       if (Configuration == Main->getValue().end())
         return contentModified("graph snapshot changed between pages");
-      Page.push_back(Configuration->second);
+      auto Bodies = Loaded.find(Shard.MainFile);
+      if (Bodies == Loaded.end())
+        Bodies =
+            Loaded.try_emplace(Shard.MainFile, loadGraphBodies(Shard.MainFile))
+                .first;
+      auto Body = llvm::find_if(Bodies->getValue(), [&](const GraphTU &Graph) {
+        return Graph.CommandDigest == Shard.CommandDigest;
+      });
+      if (Body == Bodies->getValue().end())
+        return contentModified(
+            "graph snapshot shard no longer publishes a view for {0}",
+            Shard.Key);
+      // A body is immutable once published, so a shard that no longer digests
+      // to what was published was replaced underneath this cursor.
+      if (graphBodyDigest(*Body) != Shard.BodyDigest)
+        return contentModified("graph snapshot shard changed while paging: {0}",
+                               Shard.Key);
+      Page.push_back(std::move(*Body));
       Page.back().Sources = Shard.Sources;
     }
     return Page;
@@ -1034,36 +1472,58 @@ BackgroundIndex::graphSnapshot(const GraphSnapshotParams &Params) {
     if (llvm::Error Err = CheckCancellation())
       return std::move(Err);
     const size_t End = std::min(Plan.Upserts.size(), Offset + PageSize);
-    if (PageGraphs.size() != End - Offset)
-      return error("graph snapshot page does not match its plan");
+    // Only the shards without a published body were read, so the bodies in
+    // hand are a subset of the page and are consumed in the page's own order.
+    size_t NextGraph = 0;
     llvm::json::Array Upserts;
     for (size_t I = Offset; I < End; ++I) {
       if (llvm::Error Err = CheckCancellation())
         return std::move(Err);
       const auto &Shard = Cache.Shards[Plan.Upserts[I]];
-      const auto &Graph = PageGraphs[I - Offset];
-      llvm::json::Value GraphJSON = toJSON(Graph);
-      std::string ShardDigest =
-          graphDigest(Shard.Key + "\n" + Shard.CheckerDigest + "\n" +
-                      Shard.InterfaceFingerprint + "\n" + JSONText(GraphJSON));
-      if (ShardDigest != Shard.Digest)
-        return contentModified("graph snapshot shard changed while paging: {0}",
-                               Shard.Key);
+      // The shard this page carries was proved against its published digest
+      // while it was being read, before its sources were given the disk state
+      // this snapshot validated. Everything else in Shard.Digest is metadata
+      // that came from the same frozen cache, so recomputing it here could
+      // only restate what CopyPage already established.
       llvm::json::Array CoverageJSON;
       for (const auto &Row : Coverage)
         CoverageJSON.push_back(
             llvm::json::Object{{"family", Row.first}, {"state", Row.second}});
-      Upserts.push_back(llvm::json::Object{
+      // Named, not carried, whenever the body was published to a path this
+      // client can read. A body is the largest thing this index makes, and
+      // sending it means building a `json::Value` tree, serializing it, and
+      // parsing it again on the far side -- once per shard, and a consumer
+      // walking a compilation database asks for every shard there is. The
+      // path is content-addressed by `bodyDigest`, so a header two hundred
+      // units included resolves to one file rather than two hundred copies.
+      //
+      // `graph` is still carried when there is no path, which is the case for
+      // a project with nowhere to persist: a client must be able to read a
+      // generation either way, and it is the same body under either key.
+      llvm::json::Object Upsert{
           {"key", Shard.Key},
-          {"source", Graph.MainFile},
-          {"configuration", Graph.CommandDigest},
+          {"source", Shard.MainFile},
+          {"configuration", Shard.CommandDigest},
           {"checkerDigest", Shard.CheckerDigest},
           {"interfaceFingerprint", Shard.InterfaceFingerprint},
           {"digest", Shard.Digest},
-          {"graph", std::move(GraphJSON)},
-          {"coverage", std::move(CoverageJSON)}});
+          {"bodyDigest", Shard.BodyDigest},
+          {"coverage", std::move(CoverageJSON)}};
+      if (Shard.BodyPaths.empty()) {
+        if (NextGraph >= PageGraphs.size())
+          return error("graph snapshot page is missing a body it must carry");
+        Upsert["graph"] = toJSON(PageGraphs[NextGraph++]);
+      } else {
+        llvm::json::Array Paths;
+        for (const auto &Path : Shard.BodyPaths)
+          Paths.push_back(Path);
+        Upsert["graphPaths"] = std::move(Paths);
+      }
+      Upserts.push_back(std::move(Upsert));
     }
 
+    if (NextGraph != PageGraphs.size())
+      return error("graph snapshot page carried bodies it did not name");
     llvm::json::Array Manifest;
     if (Offset == 0 && !Plan.CacheHit)
       for (const auto &Shard : Cache.Shards)
@@ -1185,7 +1645,8 @@ BackgroundIndex::graphSnapshot(const GraphSnapshotParams &Params) {
     ActiveGraphSnapshotPlans[Plan.Token] = Plan;
   };
   auto ValidateCachedSnapshot = [&](const GraphSnapshotCache &Cache,
-                                    bool &DiskDigestsMoved) -> llvm::Error {
+                                    bool &DiskDigestsMoved,
+                                    bool ValidateSourceInputs) -> llvm::Error {
     std::map<std::string, llvm::StringMap<std::string>> ActualConfigurations;
     for (const auto &Shard : Cache.Shards)
       ActualConfigurations[Shard.MainFile][Shard.CommandDigest] =
@@ -1223,6 +1684,8 @@ BackgroundIndex::graphSnapshot(const GraphSnapshotParams &Params) {
           "compile commands/toolchains",
           Mismatched.size());
     }
+    if (!ValidateSourceInputs)
+      return llvm::Error::success();
     struct CheckedSource {
       std::string CheckerDigest;
       std::string DiskDigest;
@@ -1271,7 +1734,7 @@ BackgroundIndex::graphSnapshot(const GraphSnapshotParams &Params) {
         Split.second.getAsInteger(10, ParsedOffset))
       return error("graph snapshot cursor is malformed");
     Offset = static_cast<size_t>(ParsedOffset);
-    GraphSnapshotCache Cache;
+    std::shared_ptr<const GraphSnapshotCache> Cache;
     GraphSnapshotPlan Plan;
     std::vector<GraphTU> PageGraphs;
     {
@@ -1285,30 +1748,42 @@ BackgroundIndex::graphSnapshot(const GraphSnapshotParams &Params) {
       if (GraphDiscoveryPending != 0 || !GraphPending.empty() ||
           !GraphFailures.empty())
         return contentModified("graph snapshot state moved between pages");
-      Cache = *CachedGraphSnapshot;
+      Cache = CachedGraphSnapshot;
       Plan = Active->getValue();
-      auto Page = CopyPageLocked(Cache, Plan, Offset);
+      auto Page = CopyPageLocked(*Cache, Plan, Offset);
       if (!Page)
         return Page.takeError();
       PageGraphs = std::move(*Page);
     }
-    return EncodePage(Cache, Plan, Offset, std::move(PageGraphs),
+    return EncodePage(*Cache, Plan, Offset, std::move(PageGraphs),
                       elapsedMillis(RequestStarted));
   }
 
   {
-    GraphSnapshotCache Cache;
+    std::shared_ptr<const GraphSnapshotCache> Cache;
     bool Reused = false;
     {
       std::lock_guard<std::mutex> Lock(GraphMu);
       if (GraphDiscoveryPending != 0)
         return contentModified(
             "graph snapshot is not ready: project changes are still being "
-            "discovered");
+            "discovered ({0} outstanding, the oldest for {1} ms)",
+            GraphDiscoveryPending,
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - GraphDiscoveryStarted)
+                .count());
       if (!GraphPending.empty())
-        return contentModified("graph snapshot is not ready: {0} translation "
-                               "units are still indexing",
-                               GraphPending.size());
+        return contentModified(
+            "graph snapshot is not ready: {0} translation units are still "
+            "indexing; the largest body built so far holds {1} occurrences, "
+            "{2} symbols and {3} relations, {4} MiB in all ({5} symbols, {6} "
+            "occurrences, {7} relations, {8} rest), from {9}",
+            GraphPending.size(), GraphPeakOccurrences, GraphPeakSymbols,
+            GraphPeakRelations, GraphPeakBytes >> 20,
+            GraphPeakSymbolBytes >> 20, GraphPeakOccurrenceBytes >> 20,
+            GraphPeakRelationBytes >> 20, GraphPeakOtherBytes >> 20,
+            GraphPeakFile.empty() ? llvm::StringRef("no unit has completed")
+                                  : llvm::StringRef(GraphPeakFile));
       if (!GraphFailures.empty()) {
         const auto &Failure = *GraphFailures.begin();
         return error("graph snapshot is not publishable: {0}: {1}",
@@ -1319,15 +1794,19 @@ BackgroundIndex::graphSnapshot(const GraphSnapshotParams &Params) {
             "graph snapshot is not ready: initial indexing has not completed");
       if (CachedGraphSnapshot &&
           CachedGraphSnapshot->Revision == GraphRevision) {
-        Cache = *CachedGraphSnapshot;
+        Cache = CachedGraphSnapshot;
         Reused = true;
       }
     }
     if (Reused) {
+      const bool KnownGenerationIsCurrent =
+          Params.KnownGeneration &&
+          *Params.KnownGeneration == Cache->Generation;
       bool DiskDigestsMoved = false;
-      if (llvm::Error Err = ValidateCachedSnapshot(Cache, DiskDigestsMoved))
+      if (llvm::Error Err = ValidateCachedSnapshot(
+              *Cache, DiskDigestsMoved, !KnownGenerationIsCurrent))
         return std::move(Err);
-      if (!DiskDigestsMoved) {
+      if (KnownGenerationIsCurrent || !DiskDigestsMoved) {
         GraphSnapshotPlan Plan;
         std::vector<GraphTU> PageGraphs;
         {
@@ -1338,13 +1817,13 @@ BackgroundIndex::graphSnapshot(const GraphSnapshotParams &Params) {
               !GraphFailures.empty())
             return contentModified(
                 "graph snapshot state moved while its cache was validated");
-          Plan = CreatePlanLocked(Cache, false);
-          auto Page = CopyPageLocked(Cache, Plan, 0);
+          Plan = CreatePlanLocked(*Cache, false);
+          auto Page = CopyPageLocked(*Cache, Plan, 0);
           if (!Page)
             return Page.takeError();
           PageGraphs = std::move(*Page);
         }
-        auto Encoded = EncodePage(Cache, Plan, 0, std::move(PageGraphs),
+        auto Encoded = EncodePage(*Cache, Plan, 0, std::move(PageGraphs),
                                   elapsedMillis(RequestStarted));
         if (!Encoded)
           return Encoded.takeError();
@@ -1353,21 +1832,24 @@ BackgroundIndex::graphSnapshot(const GraphSnapshotParams &Params) {
         {
           std::lock_guard<std::mutex> Lock(GraphMu);
           if (!CachedGraphSnapshot ||
-              CachedGraphSnapshot->Revision != Cache.Revision ||
-              CachedGraphSnapshot->Generation != Cache.Generation ||
+              CachedGraphSnapshot->Revision != Cache->Revision ||
+              CachedGraphSnapshot->Generation != Cache->Generation ||
               GraphDiscoveryPending != 0 || !GraphPending.empty() ||
               !GraphFailures.empty())
             return contentModified(
                 "graph snapshot state moved before publication");
-          PublishPlanLocked(Cache, Plan);
+          PublishPlanLocked(*Cache, Plan);
         }
         return Encoded;
       }
     }
   }
 
+  // Freezing copies views, never bodies. Copying every body here doubled the
+  // whole compilation database's graph in memory for the duration of a
+  // snapshot, on top of the copy the index already held.
   struct FrozenGraph {
-    GraphTU Graph;
+    GraphView Graph;
     std::string MainKey;
     uint64_t SemanticMillis = 0;
   };
@@ -1493,26 +1975,21 @@ BackgroundIndex::graphSnapshot(const GraphSnapshotParams &Params) {
       return std::move(Err);
     const auto &Graph = Entry.Graph;
     std::string Key = Graph.MainFileURI + "#" + Graph.CommandDigest;
-    std::string CheckerDigest;
-    for (const auto &Source : Graph.Sources)
-      if (Source.URI == Graph.MainFileURI) {
-        CheckerDigest = Source.Digest;
-        break;
-      }
-    if (CheckerDigest.empty())
+    if (Graph.CheckerDigest.empty())
       return error("graph snapshot has no main-file checker: {0}",
                    Graph.MainFile);
-    std::string Interface;
-    llvm::raw_string_ostream InterfaceOS(Interface);
-    for (const auto &Symbol : Graph.Symbols)
-      if (Symbol.Exported)
-        InterfaceOS << Symbol.ID.size() << ':' << Symbol.ID
-                    << Symbol.Signature.size() << ':' << Symbol.Signature;
-    std::string InterfaceFingerprint = graphDigest(InterfaceOS.str());
-    llvm::json::Value GraphJSON = toJSON(Graph);
+    // The body's own contribution was digested when the view was published,
+    // because a published body never changes. What a snapshot adds is the disk
+    // state each source was just validated against.
+    std::string DiskMaterial;
+    llvm::raw_string_ostream DiskOS(DiskMaterial);
+    for (const auto &Source : Graph.Sources)
+      DiskOS << Source.URI.size() << ':' << Source.URI
+             << Source.DiskDigest.size() << ':' << Source.DiskDigest;
     std::string ShardDigest =
-        graphDigest(Key + "\n" + CheckerDigest + "\n" + InterfaceFingerprint +
-                    "\n" + JSONText(GraphJSON));
+        graphDigest(Key + "\n" + Graph.CheckerDigest + "\n" +
+                    Graph.InterfaceFingerprint + "\n" + Graph.BodyDigest +
+                    "\n" + DiskOS.str());
     GraphSnapshotShardCache Cached;
     Cached.MainKey = Entry.MainKey;
     Cached.MainFile = Graph.MainFile;
@@ -1521,8 +1998,10 @@ BackgroundIndex::graphSnapshot(const GraphSnapshotParams &Params) {
     Cached.ToolchainFingerprint = Graph.ToolchainFingerprint;
     Cached.Key = std::move(Key);
     Cached.Digest = std::move(ShardDigest);
-    Cached.CheckerDigest = std::move(CheckerDigest);
-    Cached.InterfaceFingerprint = std::move(InterfaceFingerprint);
+    Cached.CheckerDigest = Graph.CheckerDigest;
+    Cached.InterfaceFingerprint = Graph.InterfaceFingerprint;
+    Cached.BodyDigest = Graph.BodyDigest;
+    Cached.BodyPaths = Graph.BodyPaths;
     Cached.Sources = Graph.Sources;
     Cached.SemanticMillis = Entry.SemanticMillis;
     Built.Shards.push_back(std::move(Cached));
@@ -1559,7 +2038,7 @@ BackgroundIndex::graphSnapshot(const GraphSnapshotParams &Params) {
   Built.Generation = graphDigest(Built.UniverseDigest + GenerationOS.str());
   Built.ShardMillis = elapsedMillis(ShardStarted);
 
-  GraphSnapshotCache Cache;
+  std::shared_ptr<const GraphSnapshotCache> Cache;
   GraphSnapshotPlan Plan;
   std::vector<GraphTU> PageGraphs;
   if (llvm::Error Err = CheckCancellation())
@@ -1570,16 +2049,17 @@ BackgroundIndex::graphSnapshot(const GraphSnapshotParams &Params) {
         !GraphPending.empty() || !GraphFailures.empty())
       return contentModified(
           "graph snapshot state moved while it was being frozen");
-    CachedGraphSnapshot = std::move(Built);
-    Cache = *CachedGraphSnapshot;
-    Plan = CreatePlanLocked(Cache, true);
-    auto Page = CopyPageLocked(Cache, Plan, 0);
+    CachedGraphSnapshot =
+        std::make_shared<const GraphSnapshotCache>(std::move(Built));
+    Cache = CachedGraphSnapshot;
+    Plan = CreatePlanLocked(*Cache, true);
+    auto Page = CopyPageLocked(*Cache, Plan, 0);
     if (!Page)
       return Page.takeError();
     PageGraphs = std::move(*Page);
   }
   auto Encoded =
-      EncodePage(Cache, Plan, 0, std::move(PageGraphs), ValidationMillis);
+      EncodePage(*Cache, Plan, 0, std::move(PageGraphs), ValidationMillis);
   if (!Encoded)
     return Encoded.takeError();
   if (llvm::Error Err = CheckCancellation())
@@ -1587,12 +2067,12 @@ BackgroundIndex::graphSnapshot(const GraphSnapshotParams &Params) {
   {
     std::lock_guard<std::mutex> Lock(GraphMu);
     if (!CachedGraphSnapshot ||
-        CachedGraphSnapshot->Revision != Cache.Revision ||
-        CachedGraphSnapshot->Generation != Cache.Generation ||
+        CachedGraphSnapshot->Revision != Cache->Revision ||
+        CachedGraphSnapshot->Generation != Cache->Generation ||
         GraphDiscoveryPending != 0 || !GraphPending.empty() ||
         !GraphFailures.empty())
       return contentModified("graph snapshot state moved before publication");
-    PublishPlanLocked(Cache, Plan);
+    PublishPlanLocked(*Cache, Plan);
   }
   return Encoded;
 }

@@ -135,6 +135,13 @@ public:
     return std::make_unique<IndexFileIn>(std::move(*IndexFile));
   }
 
+  // In-memory storage has no path a separate process could read, so it never
+  // offers one and every snapshot it serves carries its bodies inline.
+  std::string storeGraphBody(
+      llvm::function_ref<void(llvm::raw_ostream &)>) const override {
+    return std::string();
+  }
+
   mutable llvm::StringSet<> AccessedPaths;
 };
 
@@ -1210,7 +1217,9 @@ TEST_F(BackgroundIndexTest, ReplacedCompilerDriverStartsANewUniverse) {
     ASSERT_FALSE(EC);
     OS << "second wrapper";
   }
-  expectContentModified(Idx.graphSnapshot({}));
+  GraphSnapshotParams Params;
+  Params.KnownGeneration = InitialGeneration;
+  expectContentModified(Idx.graphSnapshot(Params));
   ASSERT_TRUE(Idx.blockUntilIdleForTest());
   auto Reindexed = Idx.graphSnapshot({});
   ASSERT_TRUE(bool(Reindexed)) << llvm::toString(Reindexed.takeError());
@@ -1568,8 +1577,12 @@ TEST_F(BackgroundIndexTest, GraphSnapshotRecapturesNativeDiskDigest) {
     ASSERT_FALSE(EC);
     OS << MovedDisk;
   }
+  Idx.enqueueGraphDependents(
+      std::vector<std::string>{Source.str().str()});
   GraphSnapshotParams Params;
   Params.KnownGeneration = InitialGeneration;
+  expectContentModified(Idx.graphSnapshot(Params));
+  ASSERT_TRUE(Idx.blockUntilIdleForTest());
   auto Moved = Idx.graphSnapshot(Params);
   ASSERT_TRUE(bool(Moved)) << llvm::toString(Moved.takeError());
   const auto *MovedObject = Moved->getAsObject();
@@ -1967,6 +1980,141 @@ TEST_F(BackgroundIndexTest, HeaderViewsStayOwnedByTheirTranslationUnits) {
             Views);
   EXPECT_EQ(2u, Configurations.size());
   EXPECT_EQ(2u, ShardKeys.size());
+}
+
+TEST_F(BackgroundIndexTest, GraphIdentitiesStayStableAndScoped) {
+  MockFS FS;
+  llvm::StringMap<std::string> Storage;
+  size_t CacheHits = 0;
+  MemoryShardStorage MSS(Storage, CacheHits);
+  MultiCommandCDB CDB;
+  const std::string First = testPath("first.cpp");
+  const std::string Second = testPath("second.cpp");
+  FS.Files[First] = R"cpp(
+#define STABLE_MACRO(value) (value)
+namespace { struct AnonymousType {}; }
+struct { int member; } unnamed;
+static int twin() { return STABLE_MACRO(1); }
+int overload(int value) { return value; }
+double overload(double value) { return value; }
+template <class T> struct Box {};
+template <> struct Box<int> {};
+)cpp";
+  FS.Files[Second] = R"cpp(
+namespace { struct AnonymousType {}; }
+struct { int member; } unnamed;
+static int twin() { return 2; }
+int second() { return twin(); }
+)cpp";
+  for (const auto &File : {First, Second}) {
+    tooling::CompileCommand Command;
+    Command.Filename = File;
+    Command.Directory = testRoot();
+    Command.CommandLine = {"clang++", "-std=c++11", "-fsyntax-only", File};
+    CDB.Commands[File] = {Command};
+  }
+
+  BackgroundIndex Idx(FS, CDB, [&](llvm::StringRef) { return &MSS; }, {});
+  Idx.enqueue({First, Second});
+  ASSERT_TRUE(Idx.blockUntilIdleForTest());
+
+  auto FirstShard = MSS.loadShard(First);
+  auto SecondShard = MSS.loadShard(Second);
+  ASSERT_TRUE(FirstShard);
+  ASSERT_TRUE(SecondShard);
+  ASSERT_EQ(1u, FirstShard->Graphs.size());
+  ASSERT_EQ(1u, SecondShard->Graphs.size());
+  const GraphTU Initial = FirstShard->Graphs.front();
+  const GraphTU Other = SecondShard->Graphs.front();
+  auto SymbolIDs = [](const GraphTU &Graph, llvm::StringRef Name) {
+    std::set<std::string> IDs;
+    for (const auto &Symbol : Graph.Symbols)
+      if (Symbol.Name == Name)
+        IDs.insert(Symbol.ID);
+    return IDs;
+  };
+  auto MacroIDs = [](const GraphTU &Graph, llvm::StringRef Name) {
+    std::set<std::string> IDs;
+    for (const auto &Macro : Graph.Macros)
+      if (Macro.Name == Name)
+        IDs.insert(Macro.ID);
+    return IDs;
+  };
+  auto UnnamedRecordIDs = [](const GraphTU &Graph) {
+    std::set<std::string> IDs;
+    for (const auto &Symbol : Graph.Symbols)
+      if (Symbol.Anonymous && Symbol.Name != "AnonymousType" &&
+          Symbol.Kind == static_cast<uint32_t>(index::SymbolKind::Struct))
+        IDs.insert(Symbol.ID);
+    return IDs;
+  };
+  auto BoxIDs = [](const GraphTU &Graph, index::SymbolProperty Property) {
+    std::set<std::string> IDs;
+    for (const auto &Symbol : Graph.Symbols)
+      if (Symbol.Name == "Box" &&
+          (Symbol.Properties & static_cast<uint32_t>(Property)))
+        IDs.insert(Symbol.ID);
+    return IDs;
+  };
+
+  const auto InitialTwin = SymbolIDs(Initial, "twin");
+  const auto OtherTwin = SymbolIDs(Other, "twin");
+  ASSERT_EQ(1u, InitialTwin.size());
+  ASSERT_EQ(1u, OtherTwin.size());
+  EXPECT_NE(*InitialTwin.begin(), *OtherTwin.begin());
+  const auto InitialAnonymous = SymbolIDs(Initial, "AnonymousType");
+  const auto OtherAnonymous = SymbolIDs(Other, "AnonymousType");
+  ASSERT_EQ(1u, InitialAnonymous.size());
+  ASSERT_EQ(1u, OtherAnonymous.size());
+  EXPECT_NE(*InitialAnonymous.begin(), *OtherAnonymous.begin());
+  const auto InitialUnnamed = UnnamedRecordIDs(Initial);
+  const auto OtherUnnamed = UnnamedRecordIDs(Other);
+  ASSERT_EQ(1u, InitialUnnamed.size());
+  ASSERT_EQ(1u, OtherUnnamed.size());
+  EXPECT_FALSE(InitialUnnamed.begin()->empty());
+  EXPECT_FALSE(OtherUnnamed.begin()->empty());
+  EXPECT_TRUE(llvm::none_of(InitialUnnamed, [&](const std::string &ID) {
+    return OtherUnnamed.count(ID) != 0;
+  }));
+  const auto InitialOverloads = SymbolIDs(Initial, "overload");
+  EXPECT_EQ(2u, InitialOverloads.size());
+  const auto PrimaryBox = BoxIDs(Initial, index::SymbolProperty::Generic);
+  const auto SpecializedBox =
+      BoxIDs(Initial, index::SymbolProperty::TemplateSpecialization);
+  ASSERT_EQ(1u, PrimaryBox.size());
+  ASSERT_EQ(1u, SpecializedBox.size());
+  EXPECT_NE(*PrimaryBox.begin(), *SpecializedBox.begin());
+  const auto InitialMacro = MacroIDs(Initial, "STABLE_MACRO");
+  EXPECT_EQ(1u, InitialMacro.size());
+
+  FS.Files[First] = R"cpp(
+
+#define STABLE_MACRO(value) (value)
+namespace { struct AnonymousType {}; }
+struct { int member; } unnamed;
+static int twin() { return STABLE_MACRO(3); }
+double overload(double value) { return value; }
+char overload(char value) { return value; }
+int overload(int value) { return value; }
+template <class T> struct Box {};
+template <> struct Box<int> {};
+)cpp";
+  Idx.enqueueGraphDependents(std::vector<std::string>{First});
+  expectContentModified(Idx.graphSnapshot({}));
+  ASSERT_TRUE(Idx.blockUntilIdleForTest());
+
+  auto MovedShard = MSS.loadShard(First);
+  ASSERT_TRUE(MovedShard);
+  ASSERT_EQ(1u, MovedShard->Graphs.size());
+  const GraphTU &Moved = MovedShard->Graphs.front();
+  const auto MovedOverloads = SymbolIDs(Moved, "overload");
+  EXPECT_EQ(3u, MovedOverloads.size());
+  EXPECT_TRUE(llvm::all_of(InitialOverloads, [&](const std::string &ID) {
+    return MovedOverloads.count(ID) != 0;
+  }));
+  EXPECT_EQ(SymbolIDs(Moved, "twin"), InitialTwin);
+  EXPECT_EQ(SymbolIDs(Moved, "AnonymousType"), InitialAnonymous);
+  EXPECT_EQ(MacroIDs(Moved, "STABLE_MACRO"), InitialMacro);
 }
 
 TEST_F(BackgroundIndexTest, GraphSnapshotDeletesAreCanonical) {

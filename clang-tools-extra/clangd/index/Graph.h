@@ -11,6 +11,7 @@
 
 #include "clang/Index/IndexSymbol.h"
 #include "clang/Tooling/CompilationDatabase.h"
+#include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/JSON.h"
 #include <cstdint>
@@ -164,6 +165,25 @@ struct GraphTU {
   std::string TargetTriple;
   std::string Language;
   bool HadErrors = false;
+
+  /// Where this unit's facts were published, main file piece first.
+  ///
+  /// A body that has been written to disk is not written into the shard a
+  /// second time. A shard is what a later discovery reads to learn what every
+  /// unit is, and reading 243 of them back with their facts in them took
+  /// seventeen minutes on libuv -- during which the index answered every
+  /// request with 'project changes are still being discovered', truthfully
+  /// and uselessly. What the shard carries instead is where the facts are.
+  std::vector<std::string> BodyPaths;
+
+  /// The two digests a view cannot recompute once the facts are elsewhere.
+  ///
+  /// Everything else a view needs is still here -- the identity, the source
+  /// list, and the main file's own digest inside it -- but the interface
+  /// fingerprint is taken over exported symbols and the body digest counts
+  /// facts, and a record that names its facts does not hold them.
+  std::string PublishedInterfaceFingerprint;
+  std::string PublishedBodyDigest;
   std::vector<GraphSource> Sources;
   std::vector<GraphSymbol> Symbols;
   std::vector<GraphOccurrence> Occurrences;
@@ -176,6 +196,8 @@ struct GraphTU {
 };
 
 llvm::json::Value toJSON(const GraphTU &Graph);
+
+
 bool fromJSON(const llvm::json::Value &Value, GraphRange &Range,
               llvm::json::Path Path);
 bool fromJSON(const llvm::json::Value &Value, GraphAttribute &Attribute,
@@ -203,6 +225,62 @@ bool fromJSON(const llvm::json::Value &Value, GraphTU &Graph,
 
 /// SHA-256 used by graph protocol identities and manifests.
 std::string graphDigest(llvm::StringRef Bytes);
+
+/// One file's share of a translation unit's facts, as indices into it.
+///
+/// A view rather than a copy. One C++ unit's body holds 342 MiB of facts, and
+/// splitting it by copying them into per-file bodies held that twice; two
+/// workers doing it at once exhausted a sixteen gibibyte host while the last
+/// units were still indexing. Four bytes a fact says the same thing.
+struct GraphPiece {
+  /// Whether this is the main file's piece, which alone carries the unit's
+  /// identity and its whole source list, and which reassembly starts from.
+  bool Main = false;
+  std::vector<uint32_t> Symbols;
+  std::vector<uint32_t> Occurrences;
+  std::vector<uint32_t> Relations;
+  std::vector<uint32_t> Macros;
+  std::vector<uint32_t> Includes;
+  std::vector<uint32_t> MissingIncludes;
+  std::vector<uint32_t> Modules;
+  std::vector<uint32_t> Diagnostics;
+};
+
+/// Splits one translation unit's facts into the files they were found in.
+///
+/// A translation unit sees every header it includes, so a header's facts are
+/// in the body of every unit that includes it. Published by content digest,
+/// a header's piece is then written once however many units saw it, instead
+/// of once per unit.
+///
+/// The pieces partition the unit: every fact belongs to exactly one of them,
+/// and reassembling all of them gives the unit back fact for fact. A body's
+/// digest counts the facts it was made from, so a fact filed twice or filed
+/// nowhere makes a body that no longer answers to its own name.
+///
+/// Only the main file's piece carries the unit's identity and source list,
+/// which is what lets two units that include one header agree byte for byte.
+/// Keyed by file URI.
+llvm::StringMap<GraphPiece> graphPiecesByFile(const GraphTU &Graph);
+
+/// Writes one piece as JSON straight to a stream.
+///
+/// `toJSON` builds the whole answer first: a `json::Value` tree of every fact
+/// and then the text of that tree, each a multiple of the facts again. This
+/// writes one fact at a time and lets it go, so publishing a body costs the
+/// body and a buffer.
+/// Writes one whole unit as JSON straight to a stream.
+///
+/// `toJSON` builds the answer first: a `json::Value` tree of every fact and
+/// then the text of that tree, each a multiple of the facts again. A shard
+/// records every configuration of a file, so one C++ file compiled five ways
+/// built five of those trees and five texts at once -- which is what took a
+/// sixteen gibibyte host from twelve gibibytes free to one in ten seconds,
+/// with a single worker. Streaming writes one fact at a time and lets it go.
+void streamJSON(llvm::json::OStream &JSON, const GraphTU &Graph);
+
+void streamPieceJSON(llvm::json::OStream &JSON, const GraphTU &Graph,
+                     const GraphPiece &Piece);
 std::string graphCommandDigest(const tooling::CompileCommand &Command);
 std::string graphProducerFingerprint();
 bool graphCommandIsCOrCXX(const tooling::CompileCommand &Command);

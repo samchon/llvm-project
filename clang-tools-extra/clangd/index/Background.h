@@ -24,9 +24,12 @@
 #include "clang/Tooling/CompilationDatabase.h"
 #include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/StringSet.h"
+#include "llvm/ADT/STLFunctionalExtras.h"
 #include "llvm/Support/Error.h"
+#include "llvm/Support/raw_ostream.h"
 #include "llvm/Support/Threading.h"
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <deque>
 #include <map>
@@ -58,6 +61,28 @@ public:
   // couldn't be loaded.
   virtual std::unique_ptr<IndexFileIn>
   loadShard(llvm::StringRef ShardIdentifier) const = 0;
+
+  // Writes one graph body and returns the absolute path it can be read from,
+  // or an empty string when this storage cannot serve bodies by path.
+  //
+  // A graph body is the largest thing this index produces and the only part a
+  // consumer wants whole. Sending it through the language-server pipe means
+  // building it as a `json::Value` tree, serializing that, and parsing it
+  // again on the other side, for every request that carries it -- and a
+  // consumer walking a whole compilation database asks for all of them.
+  //
+  // The body is written by `Write` rather than handed over, and the name is
+  // the digest of the bytes it wrote, so the name is the content: two
+  // translation units that saw the same header the same way write the same
+  // file, and the second write is a no-op. A header included by two hundred
+  // units is stored once rather than two hundred times.
+  //
+  // Written rather than handed over because a body handed over is a body that
+  // exists twice. One C++ unit's body holds 342 MiB of facts; building the
+  // text of it beside the facts themselves, in two workers at once, is what
+  // exhausted a 16 GiB host while the last units were still indexing.
+  virtual std::string storeGraphBody(
+      llvm::function_ref<void(llvm::raw_ostream &)> Write) const = 0;
 
   // The factory provides storage for each File.
   // It keeps ownership of the storage instances, and should manage caching
@@ -237,12 +262,61 @@ private:
   llvm::StringMap<ShardVersion> ShardVersions; // Key is absolute file path.
   std::mutex ShardVersionsMu;
 
+  // Resident metadata of one complete TU/configuration view. The view's body
+  // is not held here: it is already persisted in the main-file shard, which
+  // update() stores whenever that shard owns a complete view, and a snapshot
+  // loads it one page at a time.
+  //
+  // Retaining every body made resident memory a function of the whole
+  // compilation database rather than of the indexer's width, which exhausted a
+  // 16 GiB host even at -j=1. CheckerDigest, InterfaceFingerprint and
+  // BodyDigest are derived once while the body is in hand, because a published
+  // body never changes: only a reindex replaces it, and that replaces this
+  // record too.
+  struct GraphView {
+    std::string MainFile;
+    std::string MainFileURI;
+    std::string Directory;
+    std::string CommandDigest;
+    std::string ToolchainFingerprint;
+    std::string ProducerFingerprint;
+    std::string TargetTriple;
+    bool HadErrors = false;
+    std::vector<GraphSource> Sources;
+    std::string CheckerDigest;
+    std::string InterfaceFingerprint;
+    std::string BodyDigest;
+    /// Absolute paths the body's pieces were published to, in the order they
+    /// must be reassembled. Empty when nothing was published.
+    ///
+    /// A body is split by the file each fact was found in before it is
+    /// written, because a header's facts are in every unit that includes it
+    /// and the pieces are named by content: the header's piece is written once
+    /// however many units saw it, and read once however many name it.
+    std::vector<std::string> BodyPaths;
+  };
+
+  /// Derives the resident metadata of a complete view from its body. A body
+  /// carrying no checker for its own main file yields an empty CheckerDigest,
+  /// which a snapshot rejects: dropping the view here would instead leave the
+  /// main file permanently short of a configuration and reindexing forever.
+  /// Derives the resident view of a completed body, publishing the body to
+  /// \p Storage first when it can.
+  GraphView graphViewOf(const GraphTU &Graph,
+                        BackgroundIndexStorage *Storage) const;
+
+  /// Loads the complete views persisted in one main file's shard.
+  std::vector<GraphTU> loadGraphBodies(llvm::StringRef MainFile);
+
   // Complete TU/configuration views. The outer key is the absolute main file,
   // the inner key is graphCommandDigest(). A batch replaces all views for one
   // main file atomically, so snapshots cannot mix old and new configurations.
   mutable std::mutex GraphMu;
-  llvm::StringMap<std::map<std::string, GraphTU>> Graphs;
+  llvm::StringMap<std::map<std::string, GraphView>> Graphs;
   size_t GraphDiscoveryPending = 0;
+  /// When the oldest outstanding discovery was queued, so a refusal can say
+  /// whether it is reporting progress or a stall.
+  std::chrono::steady_clock::time_point GraphDiscoveryStarted;
   llvm::StringSet<> GraphPending;
   llvm::StringMap<std::string> GraphFailures;
   llvm::StringMap<std::string> GraphFailureTUs;
@@ -250,6 +324,27 @@ private:
   llvm::StringMap<std::map<std::string, uint64_t>> GraphSemanticMillis;
   uint64_t GraphRevision = 0;
   mutable uint64_t GraphSequence = 0;
+  // The largest complete body this index has built, and the unit it came from.
+  //
+  // A translation unit's body is by far the largest object the indexer holds,
+  // and its size is what decides whether an indexing width fits in a host. It
+  // is reported in the not-ready answer because that is the only thing a
+  // reader has while indexing is in flight: a host that dies during the
+  // countdown otherwise leaves no way to tell an oversized unit from an
+  // unbounded one.
+  size_t GraphPeakOccurrences = 0;
+  size_t GraphPeakSymbols = 0;
+  size_t GraphPeakRelations = 0;
+  // Bytes, because counts were never the quantity that exhausts a host, and
+  // split per family because the next question after "how much" is "which
+  // array". The peak is selected on total bytes rather than on occurrence
+  // count for the same reason.
+  size_t GraphPeakBytes = 0;
+  size_t GraphPeakSymbolBytes = 0;
+  size_t GraphPeakOccurrenceBytes = 0;
+  size_t GraphPeakRelationBytes = 0;
+  size_t GraphPeakOtherBytes = 0;
+  std::string GraphPeakFile;
   mutable std::string PublishedGeneration;
   mutable llvm::StringMap<std::string> PublishedManifest;
   struct GraphSnapshotShardCache {
@@ -262,6 +357,10 @@ private:
     std::string Digest;
     std::string CheckerDigest;
     std::string InterfaceFingerprint;
+    // Digest of the published body, carried so that a page can prove the shard
+    // it loads is still the one this cache was planned against.
+    std::string BodyDigest;
+    std::vector<std::string> BodyPaths;
     std::vector<GraphSource> Sources;
     uint64_t SemanticMillis = 0;
   };
@@ -288,7 +387,17 @@ private:
     uint64_t ShardMillis = 0;
     bool CacheHit = false;
   };
-  mutable std::optional<GraphSnapshotCache> CachedGraphSnapshot;
+  // Shared, and const because it is shared.
+  //
+  // A page took a copy of this while holding the mutex, so that the reads and
+  // encoding after it happened outside the lock. That is O(shards) per page --
+  // every shard's metadata and its source list -- paid O(shards) times. On a
+  // 242 translation-unit project it came to nine seconds a page and
+  // seventy-three minutes to walk one generation, against a job that is killed
+  // at 150; the indexing it was waiting on took seven. A generation is
+  // immutable once built, so a page can hold a reference to it and let the
+  // lock go just the same.
+  mutable std::shared_ptr<const GraphSnapshotCache> CachedGraphSnapshot;
   // Several clients may page through the same immutable cache concurrently.
   // Plans are bounded by sequence and invalidated by graph revision changes.
   mutable llvm::StringMap<GraphSnapshotPlan> ActiveGraphSnapshotPlans;

@@ -17,6 +17,7 @@
 #include "clang/Basic/SourceManager.h"
 #include "clang/Tooling/Tooling.h"
 #include "llvm/Support/FileSystem.h"
+#include "llvm/ADT/ScopeExit.h"
 #include "llvm/Support/FileUtilities.h"
 #include "llvm/Support/raw_ostream.h"
 #include "gmock/gmock.h"
@@ -85,10 +86,18 @@ public:
 
   IndexFileIn
   runIndexingAction(llvm::StringRef MainFilePath,
-                    const std::vector<std::string> &ExtraArgs = {}) {
+                    const std::vector<std::string> &ExtraArgs = {},
+                    bool OverlayRealFileSystem = false) {
     IndexFileIn IndexFile;
+    llvm::IntrusiveRefCntPtr<llvm::vfs::FileSystem> FS = InMemoryFileSystem;
+    if (OverlayRealFileSystem) {
+      auto Overlay = llvm::makeIntrusiveRefCnt<llvm::vfs::OverlayFileSystem>(
+          llvm::vfs::getRealFileSystem());
+      Overlay->pushOverlay(InMemoryFileSystem);
+      FS = std::move(Overlay);
+    }
     llvm::IntrusiveRefCntPtr<FileManager> Files(
-        new FileManager(FileSystemOptions(), InMemoryFileSystem));
+        new FileManager(FileSystemOptions(), FS));
 
     auto Action = createStaticIndexingAction(
         Opts, [&](SymbolSlab S) { IndexFile.Symbols = std::move(S); },
@@ -160,16 +169,24 @@ TEST_F(IndexActionTest, CollectCompleteGraphFacts) {
   addFile(Header, R"cpp(
 #define GRAPH_WRAP(x) x
 struct Base { virtual void run(); };
-struct Derived : Base { void run() override; };
+struct Derived : Base {
+  int field;
+  explicit Derived(int value) : field(value) {}
+  void run() override;
+};
 )cpp");
   addFile(Main, R"cpp(
 #include "graph.h"
 static int hidden;
-void Derived::run() { int local = GRAPH_WRAP(hidden); }
-Derived make() { return Derived{}; }
+void Derived::run() {
+  int local = GRAPH_WRAP(hidden);
+  field = local;
+}
+[[nodiscard]] Derived make() { return Derived{1}; }
+void dispatch(Base &value) { value.run(); }
 )cpp");
 
-  IndexFileIn Indexed = runIndexingAction(Main);
+  IndexFileIn Indexed = runIndexingAction(Main, {"-std=c++17"});
   ASSERT_EQ(1u, Indexed.Graphs.size());
   const GraphTU &Graph = Indexed.Graphs.front();
   EXPECT_EQ("cpp", Graph.Language);
@@ -213,9 +230,74 @@ Derived make() { return Derived{}; }
         return Occurrence.Roles &
                static_cast<uint32_t>(index::SymbolRole::Read);
       }));
+  EXPECT_TRUE(llvm::any_of(Graph.Symbols, [](const GraphSymbol &Symbol) {
+    return Symbol.Name == "field" &&
+           Symbol.Kind == static_cast<uint32_t>(index::SymbolKind::Field);
+  }));
+  EXPECT_TRUE(llvm::any_of(Graph.Symbols, [](const GraphSymbol &Symbol) {
+    return Symbol.Name == "make" &&
+           llvm::any_of(Symbol.Attributes, [](const GraphAttribute &Attribute) {
+             return Attribute.Name == "nodiscard";
+           });
+  }));
+  EXPECT_TRUE(
+      llvm::any_of(Graph.Occurrences, [](const GraphOccurrence &Occurrence) {
+        return Occurrence.Roles &
+               static_cast<uint32_t>(index::SymbolRole::Write);
+      }));
+  EXPECT_TRUE(
+      llvm::any_of(Graph.Occurrences, [](const GraphOccurrence &Occurrence) {
+        return (Occurrence.Roles &
+                static_cast<uint32_t>(index::SymbolRole::Call)) &&
+               Occurrence.TargetKind ==
+                   static_cast<uint32_t>(index::SymbolKind::Constructor);
+      }));
+  EXPECT_TRUE(
+      llvm::any_of(Graph.Occurrences, [](const GraphOccurrence &Occurrence) {
+        return Occurrence.Roles &
+               static_cast<uint32_t>(index::SymbolRole::Dynamic);
+      }));
   EXPECT_TRUE(llvm::all_of(Graph.Symbols, [](const GraphSymbol &Symbol) {
     return !Symbol.Declaration.valid() ||
            Symbol.Declaration.EndColumn >= Symbol.Declaration.StartColumn;
+  }));
+}
+
+TEST_F(IndexActionTest, CollectGraphModuleFacts) {
+  Opts.CollectGraph = true;
+  const std::string Header = testPath("module.h");
+  const std::string ModuleMap = testPath("module.modulemap");
+  const std::string Main = testPath("module-user.cpp");
+  addFile(Header, "inline int modular() { return 7; }");
+  addFile(Main, "#include \"module.h\"\nint use() { return modular(); }");
+  ASSERT_TRUE(InMemoryFileSystem->addFile(
+      ModuleMap, 0,
+      llvm::MemoryBuffer::getMemBufferCopy(
+          "module GraphFixture { header \"module.h\" export * }")));
+
+  llvm::SmallString<128> ModuleCache;
+  ASSERT_FALSE(
+      llvm::sys::fs::createUniqueDirectory("clangd-graph-modules", ModuleCache));
+  auto RemoveModuleCache = llvm::make_scope_exit(
+      [&] { llvm::sys::fs::remove_directories(ModuleCache); });
+  IndexFileIn Indexed = runIndexingAction(
+      Main,
+      {"-fmodules", "-fimplicit-modules",
+       "-fmodule-map-file=" + ModuleMap,
+       "-fmodules-cache-path=" + ModuleCache.str().str()},
+      /*OverlayRealFileSystem=*/true);
+
+  ASSERT_EQ(1u, Indexed.Graphs.size());
+  const GraphTU &Graph = Indexed.Graphs.front();
+  EXPECT_TRUE(llvm::any_of(Graph.Modules, [](const GraphModule &Module) {
+    return Module.Name == "GraphFixture" &&
+           (Module.Roles &
+            static_cast<uint32_t>(index::SymbolRole::Reference)) &&
+           Module.Evidence.valid();
+  }));
+  EXPECT_TRUE(llvm::any_of(Graph.Includes, [&](const GraphInclude &Include) {
+    return Include.TargetURI == toUri(Header) && Include.ModuleImported &&
+           Include.Evidence.valid();
   }));
 }
 

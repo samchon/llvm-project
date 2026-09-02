@@ -680,12 +680,17 @@ void writeRIFF(const IndexFileOut &Data, llvm::raw_ostream &OS) {
 
   std::string GraphSection;
   if (Data.Graphs) {
+    // Streamed, not built. A shard records every configuration of a file, so
+    // a tree of every fact and then the text of that tree stood at once, once
+    // per configuration: one C++ file compiled five ways is five of them,
+    // each a multiple of a body that is already hundreds of megabytes. The
+    // section is the same bytes either way.
     llvm::raw_string_ostream GraphOS(GraphSection);
-    llvm::json::Array Graphs;
-    Graphs.reserve(Data.Graphs->size());
-    for (const auto &Graph : *Data.Graphs)
-      Graphs.push_back(toJSON(Graph));
-    GraphOS << llvm::json::Value(std::move(Graphs));
+    llvm::json::OStream JSON(GraphOS);
+    JSON.array([&] {
+      for (const auto &Graph : *Data.Graphs)
+        streamJSON(JSON, Graph);
+    });
     RIFF.Chunks.push_back({riff::fourCC("grph"), GraphSection});
   }
 

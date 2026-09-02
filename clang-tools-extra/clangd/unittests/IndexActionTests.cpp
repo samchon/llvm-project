@@ -160,16 +160,24 @@ TEST_F(IndexActionTest, CollectCompleteGraphFacts) {
   addFile(Header, R"cpp(
 #define GRAPH_WRAP(x) x
 struct Base { virtual void run(); };
-struct Derived : Base { void run() override; };
+struct Derived : Base {
+  int field;
+  explicit Derived(int value) : field(value) {}
+  void run() override;
+};
 )cpp");
   addFile(Main, R"cpp(
 #include "graph.h"
 static int hidden;
-void Derived::run() { int local = GRAPH_WRAP(hidden); }
-Derived make() { return Derived{}; }
+void Derived::run() {
+  int local = GRAPH_WRAP(hidden);
+  field = local;
+}
+[[nodiscard]] Derived make() { return Derived{1}; }
+void dispatch(Base &value) { value.run(); }
 )cpp");
 
-  IndexFileIn Indexed = runIndexingAction(Main);
+  IndexFileIn Indexed = runIndexingAction(Main, {"-std=c++17"});
   ASSERT_EQ(1u, Indexed.Graphs.size());
   const GraphTU &Graph = Indexed.Graphs.front();
   EXPECT_EQ("cpp", Graph.Language);
@@ -212,6 +220,33 @@ Derived make() { return Derived{}; }
       llvm::any_of(Graph.Occurrences, [](const GraphOccurrence &Occurrence) {
         return Occurrence.Roles &
                static_cast<uint32_t>(index::SymbolRole::Read);
+      }));
+  EXPECT_TRUE(llvm::any_of(Graph.Symbols, [](const GraphSymbol &Symbol) {
+    return Symbol.Name == "field" &&
+           Symbol.Kind == static_cast<uint32_t>(index::SymbolKind::Field);
+  }));
+  EXPECT_TRUE(llvm::any_of(Graph.Symbols, [](const GraphSymbol &Symbol) {
+    return Symbol.Name == "make" &&
+           llvm::any_of(Symbol.Attributes, [](const GraphAttribute &Attribute) {
+             return Attribute.Name == "nodiscard";
+           });
+  }));
+  EXPECT_TRUE(
+      llvm::any_of(Graph.Occurrences, [](const GraphOccurrence &Occurrence) {
+        return Occurrence.Roles &
+               static_cast<uint32_t>(index::SymbolRole::Write);
+      }));
+  EXPECT_TRUE(
+      llvm::any_of(Graph.Occurrences, [](const GraphOccurrence &Occurrence) {
+        return (Occurrence.Roles &
+                static_cast<uint32_t>(index::SymbolRole::Call)) &&
+               Occurrence.TargetKind ==
+                   static_cast<uint32_t>(index::SymbolKind::Constructor);
+      }));
+  EXPECT_TRUE(
+      llvm::any_of(Graph.Occurrences, [](const GraphOccurrence &Occurrence) {
+        return Occurrence.Roles &
+               static_cast<uint32_t>(index::SymbolRole::Dynamic);
       }));
   EXPECT_TRUE(llvm::all_of(Graph.Symbols, [](const GraphSymbol &Symbol) {
     return !Symbol.Declaration.valid() ||
